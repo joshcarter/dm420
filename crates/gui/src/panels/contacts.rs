@@ -35,6 +35,7 @@ impl Panel for Contacts {
     fn ui(&mut self, ctx: &mut PanelCtx, block: Rect) {
         let painter = ctx.painter;
         let pal = ctx.pal;
+        let spots = ctx.bus.worked_spots();
 
         let header = Rect::from_min_max(
             block.min,
@@ -44,7 +45,7 @@ impl Panel for Contacts {
         painter.text(
             Pos2::new(header.right() - 2.0, header.center().y),
             Align2::RIGHT_CENTER,
-            &format!("{} spots", pd::WORKED.len()),
+            format!("{} spots", spots.len()),
             mono(8.5),
             pal.sub,
         );
@@ -58,7 +59,7 @@ impl Panel for Contacts {
             Pos2::new(block.right(), footer.top() - pd::GAP),
         );
         recessed_screen(painter, screen, pal);
-        draw_map(painter, screen, pal, ctx.relief);
+        draw_map(painter, screen, pal, ctx.relief, &spots);
         self.draw_footer(ctx.ui, painter, footer, pal);
     }
 }
@@ -162,7 +163,13 @@ fn ellipse_pts(center: Pos2, rx: f32, ry: f32, n: usize) -> Vec<Pos2> {
         .collect()
 }
 
-fn draw_map(painter: &egui::Painter, screen: Rect, pal: &Palette, relief: &TextureHandle) {
+fn draw_map(
+    painter: &egui::Painter,
+    screen: Rect,
+    pal: &Palette,
+    relief: &TextureHandle,
+    spots: &[(String, String)],
+) {
     if screen.width() < 24.0 || screen.height() < 24.0 {
         return;
     }
@@ -175,9 +182,9 @@ fn draw_map(painter: &egui::Painter, screen: Rect, pal: &Palette, relief: &Textu
     // Dynamic bounds: fit the box (in world/SVG units) spanning every plotted
     // station plus home. Home is included but not centered, so it lands wherever
     // the worked cluster puts it (e.g. contacts to the west → home biased right).
-    let mut pts: Vec<Vec2> = pd::WORKED
+    let mut pts: Vec<Vec2> = spots
         .iter()
-        .filter_map(|s| pd::station_lonlat(s.call, s.grid))
+        .filter_map(|(call, grid)| pd::station_lonlat(call, grid))
         .map(|(lon, lat)| Vec2::new(pd::map_x(lon), pd::map_y(lat)))
         .collect();
     pts.push(Vec2::new(pd::map_x(pd::HOME_LON), pd::map_y(pd::HOME_LAT)));
@@ -292,8 +299,8 @@ fn draw_map(painter: &egui::Painter, screen: Rect, pal: &Palette, relief: &Textu
     // Marker/label sized in px (with clamp) so they stay readable at any zoom.
     let spot_r = sl(2.4).clamp(2.0, 3.6);
     let label_font = mono(sl(4.8).clamp(5.0, 8.0));
-    for s in pd::WORKED {
-        let Some((lon, lat)) = pd::station_lonlat(s.call, s.grid) else { continue };
+    for (call, grid) in spots {
+        let Some((lon, lat)) = pd::station_lonlat(call, grid) else { continue };
         let pos = proj(lon, lat);
         painter.circle_filled(pos, spot_r, pal.accent);
         // Flip the label to the inboard side near the right/top edges so it stays on-screen.
@@ -304,7 +311,7 @@ fn draw_map(painter: &egui::Painter, screen: Rect, pal: &Palette, relief: &Textu
             if near_top { spot_r + 5.0 } else { -(spot_r + 1.0) },
         );
         let align = if right { Align2::RIGHT_BOTTOM } else { Align2::LEFT_BOTTOM };
-        painter.text(pos + off, align, s.call, label_font.clone(), pal.body);
+        painter.text(pos + off, align, call, label_font.clone(), pal.body);
     }
 
     // 6) home / QTH marker — the strongest indicator, drawn last so it sits on top.

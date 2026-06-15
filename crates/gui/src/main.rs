@@ -12,6 +12,7 @@
 //! helpers live in `chrome`; all colour/chrome flows through a `theme::Palette`.
 
 mod app;
+mod bus_view;
 mod chrome;
 mod geo_data;
 mod panel_data;
@@ -27,6 +28,7 @@ use egui::{
 use egui_tiles::{Behavior, Container, Tile, TileId, Tiles, Tree, UiResponse};
 
 use app::App;
+use bus_view::BusView;
 use chrome::{key_cell, lcd_panel, make_brushed, make_relief, measure, paint_chassis, shadow};
 use panel_data as pd;
 use panels::{BandScan, Contacts, LogBook, Panel, PanelCtx, Waterfall};
@@ -45,7 +47,7 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| {
             install_fonts(&cc.egui_ctx);
-            Ok(Box::new(App::new()))
+            Ok(Box::new(App::new(&cc.egui_ctx)))
         }),
     )
 }
@@ -120,6 +122,7 @@ struct Tactical<'a> {
     pal: &'a Palette,
     relief: &'a egui::TextureHandle,
     dt: f64,
+    bus: &'a BusView,
 }
 
 impl<'a> Behavior<Box<dyn Panel>> for Tactical<'a> {
@@ -135,6 +138,7 @@ impl<'a> Behavior<Box<dyn Panel>> for Tactical<'a> {
             pal: self.pal,
             relief: self.relief,
             dt: self.dt,
+            bus: self.bus,
         };
         pane.ui(&mut ctx, block);
         UiResponse::None
@@ -331,6 +335,7 @@ impl eframe::App for App {
                     pal: &pal,
                     relief: &relief,
                     dt: dt as f64,
+                    bus: &self.view,
                 };
                 enforce_min_width(&mut self.tree, self.tree_ids.root, pd::MIN_PANEL_W, pd::VGROOVE_W);
                 pin_band_height(&mut self.tree, &self.tree_ids, pd::VGROOVE_W);

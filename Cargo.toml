@@ -23,6 +23,7 @@ modes = { path = "crates/modes" }
 qso = { path = "crates/qso" }
 logbook = { path = "crates/logbook" }
 scanner = { path = "crates/scanner" }
+mocks = { path = "crates/mocks" }
 
 # --- GUI stack (pinned exactly per docs/FEASIBILITY.md; the spike validated these) ---
 eframe = "0.34.3"

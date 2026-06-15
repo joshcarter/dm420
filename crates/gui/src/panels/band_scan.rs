@@ -1,15 +1,33 @@
-//! Band Scan panel: two-column band blocks + a Scan/Cancel lit key. Owns the
-//! scan state and self-advances each frame from the frame delta.
+//! Band Scan panel: two-column band blocks + a Scan/Cancel lit key. The band list
+//! and its heard/unworked counts come live from the bus (`scanner/candidates`);
+//! the scan-sweep animation is panel-owned view state that self-advances each
+//! frame from the frame delta.
 
 use eframe::egui;
 use egui::{Align2, CornerRadius, Pos2, Rect, Stroke};
+use types::{Band, BandActivity};
 
 use super::{Panel, PanelCtx};
 use crate::chrome::{key_cell, lcd_panel, measure, panel_header, split_block};
-use crate::panel_data as pd;
 use crate::theme::*;
 
 const SCAN_DWELL: f32 = 2.5; // seconds per band
+
+/// Short display label for a band, e.g. `"40m"`.
+fn band_label(b: Band) -> &'static str {
+    match b {
+        Band::B160m => "160m",
+        Band::B80m => "80m",
+        Band::B40m => "40m",
+        Band::B30m => "30m",
+        Band::B20m => "20m",
+        Band::B17m => "17m",
+        Band::B15m => "15m",
+        Band::B12m => "12m",
+        Band::B10m => "10m",
+        Band::B6m => "6m",
+    }
+}
 
 pub struct BandScan {
     running: bool,
@@ -29,16 +47,16 @@ impl BandScan {
     }
 
     /// Advance the scan clock, stepping bands every `SCAN_DWELL` and stopping
-    /// after the last band.
-    fn tick(&mut self, dt: f32) {
-        if !self.running {
+    /// after the last band. `n` is the live band count from the bus.
+    fn tick(&mut self, dt: f32, n: usize) {
+        if !self.running || n == 0 {
             return;
         }
         self.accum += dt;
         while self.accum >= SCAN_DWELL {
             self.accum -= SCAN_DWELL;
             self.active_band += 1;
-            if self.active_band >= pd::BANDS.len() {
+            if self.active_band >= n {
                 self.running = false;
                 self.active_band = 0;
                 self.accum = 0.0;
@@ -55,14 +73,19 @@ impl Panel for BandScan {
     }
 
     fn ui(&mut self, ctx: &mut PanelCtx, block: Rect) {
-        self.tick(ctx.dt as f32);
+        let bands = ctx.bus.band_activity();
+        self.tick(ctx.dt as f32, bands.len());
 
         let pal = ctx.pal;
         let painter = ctx.painter;
         let (header, screen) = split_block(block);
 
+        let active_label = bands
+            .get(self.active_band)
+            .map(|b| band_label(b.band))
+            .unwrap_or("");
         let status = if self.running {
-            format!("Scanning {} …", pd::BANDS[self.active_band].0)
+            format!("Scanning {active_label} …")
         } else if self.last_min == 0 {
             "Last scan: just now".to_string()
         } else {
@@ -109,13 +132,20 @@ impl Panel for BandScan {
         );
         let left_half = Rect::from_min_max(screen.min, Pos2::new(mid, screen.bottom()));
         let right_half = Rect::from_min_max(Pos2::new(mid, screen.top()), screen.max);
-        self.draw_column(painter, left_half, pal, &[0, 1]);
-        self.draw_column(painter, right_half, pal, &[2, 3]);
+        self.draw_column(painter, left_half, pal, &bands, &[0, 1]);
+        self.draw_column(painter, right_half, pal, &bands, &[2, 3]);
     }
 }
 
 impl BandScan {
-    fn draw_column(&self, painter: &egui::Painter, half: Rect, pal: &Palette, idxs: &[usize; 2]) {
+    fn draw_column(
+        &self,
+        painter: &egui::Painter,
+        half: Rect,
+        pal: &Palette,
+        bands: &[BandActivity],
+        idxs: &[usize; 2],
+    ) {
         const BLOCK_H: f32 = 30.0;
         const BLOCK_GAP: f32 = 7.0;
         let total = BLOCK_H * 2.0 + BLOCK_GAP;
@@ -123,7 +153,12 @@ impl BandScan {
         let content_left = half.left() + 12.0;
 
         for (slot, &bi) in idxs.iter().enumerate() {
-            let (band, heard, unworked) = pd::BANDS[bi];
+            let Some(activity) = bands.get(bi) else {
+                continue;
+            };
+            let band = band_label(activity.band);
+            let heard = activity.stations_seen;
+            let unworked = activity.unworked;
             let active = self.running && self.active_band == bi;
             let by = top + slot as f32 * (BLOCK_H + BLOCK_GAP);
             let bcy = by + BLOCK_H / 2.0;

@@ -7,6 +7,7 @@
 use eframe::egui;
 use egui::{Rect, TextureHandle};
 
+use crate::bus_view::BusView;
 use crate::theme::Palette;
 
 mod band_scan;
@@ -20,14 +21,16 @@ pub use log_book::LogBook;
 pub use waterfall::Waterfall;
 
 /// Per-frame inputs handed to a panel: the egui `Ui` + a cloned `Painter` for
-/// hand-laid chrome, the active palette, the shared relief texture, and the
-/// frame delta. Panels use the subset they need.
+/// hand-laid chrome, the active palette, the shared relief texture, the frame
+/// delta, and the live bus view panels read their data from. Panels use the
+/// subset they need.
 pub struct PanelCtx<'a> {
     pub ui: &'a mut egui::Ui,
     pub painter: &'a egui::Painter,
     pub pal: &'a Palette,
     pub relief: &'a TextureHandle,
     pub dt: f64,
+    pub bus: &'a BusView,
 }
 
 /// A drawable instrument. Implementors own their view state and render into the

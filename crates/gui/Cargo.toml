@@ -19,7 +19,12 @@ egui_tiles.workspace = true
 image.workspace = true
 chrono.workspace = true
 
-# The bus spine + shared message vocabulary. Wired now so panels can move from
-# the spike's `panel_data` placeholders to live bus subscriptions in place.
+# The bus spine + shared message vocabulary. Panels read live bus data through
+# the `BusView` bridge (`bus_view.rs`) instead of the spike's `panel_data`.
 bus.workspace = true
 types.workspace = true
+
+# Background async runtime for the bus bridge, and the mock producers that feed
+# it until the real rig/dsp/scanner/logbook crates take over.
+tokio.workspace = true
+mocks.workspace = true

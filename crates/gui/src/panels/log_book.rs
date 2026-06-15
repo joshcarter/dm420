@@ -1,12 +1,19 @@
-//! Log Book panel: a 4-row QSO table read from `panel_data::LOGS`. No view state.
+//! Log Book panel: a 4-row QSO table of the most recent contacts, read live from
+//! the bus (`logbook/entries`). No view state.
 
 use eframe::egui;
 use egui::{Align2, Pos2, Stroke};
 
 use super::{Panel, PanelCtx};
 use crate::chrome::{panel_header, split_block};
-use crate::panel_data as pd;
 use crate::theme::*;
+
+/// Format a UTC millisecond timestamp as the `HHMM` the table shows.
+fn hhmm(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms)
+        .map(|t| t.format("%H%M").to_string())
+        .unwrap_or_else(|| "----".into())
+}
 
 pub struct LogBook;
 
@@ -24,12 +31,13 @@ impl Panel for LogBook {
     fn ui(&mut self, ctx: &mut PanelCtx, block: egui::Rect) {
         let painter = ctx.painter;
         let pal = ctx.pal;
+        let logs = ctx.bus.recent_logs(4);
         let (header, screen) = split_block(block);
         panel_header(painter, header, pal, "Log Book", "last 4 · FT8");
         painter.text(
             Pos2::new(header.right() - 2.0, header.center().y),
             Align2::RIGHT_CENTER,
-            "312 QSO",
+            format!("{} QSO", ctx.bus.log_count()),
             heading(9.0),
             pal.legend,
         );
@@ -54,7 +62,7 @@ impl Panel for LogBook {
             ("SNT", x_snt, Align2::RIGHT_CENTER),
             ("RCV", x_rcv, Align2::RIGHT_CENTER),
         ] {
-            painter.text(Pos2::new(x, hy), align, &tracked(text), dimf.clone(), pal.dim);
+            painter.text(Pos2::new(x, hy), align, tracked(text), dimf.clone(), pal.dim);
         }
         let sep_y = screen.top() + 19.0;
         painter.line_segment(
@@ -62,20 +70,39 @@ impl Panel for LogBook {
             Stroke::new(1.0, pal.dim.gamma_multiply(0.4)),
         );
 
-        for (i, (utc, call, grid, snt, rcv)) in pd::LOGS.iter().enumerate() {
+        for (i, e) in logs.iter().enumerate() {
             let ry = sep_y + 11.0 + i as f32 * 22.0;
-            painter.text(Pos2::new(l, ry), Align2::LEFT_CENTER, utc, mono(10.0), pal.dim);
+            let grid = e.grid.as_ref().map(|g| g.0.as_str()).unwrap_or("----");
+            painter.text(
+                Pos2::new(l, ry),
+                Align2::LEFT_CENTER,
+                hhmm(e.time.0),
+                mono(10.0),
+                pal.dim,
+            );
             painter.text(
                 Pos2::new(x_call, ry),
                 Align2::LEFT_CENTER,
-                &tracked(call),
+                tracked(&e.call.0),
                 heading(10.0),
                 pal.body,
             );
             painter.text(Pos2::new(x_grid, ry), Align2::LEFT_CENTER, grid, mono(10.0), pal.dim);
-            painter.text(Pos2::new(x_snt, ry), Align2::RIGHT_CENTER, snt, mono(10.0), pal.body);
-            painter.text(Pos2::new(x_rcv, ry), Align2::RIGHT_CENTER, rcv, mono(10.0), pal.accent);
-            if i + 1 < pd::LOGS.len() {
+            painter.text(
+                Pos2::new(x_snt, ry),
+                Align2::RIGHT_CENTER,
+                &e.exchange_sent,
+                mono(10.0),
+                pal.body,
+            );
+            painter.text(
+                Pos2::new(x_rcv, ry),
+                Align2::RIGHT_CENTER,
+                &e.exchange_rcvd,
+                mono(10.0),
+                pal.accent,
+            );
+            if i + 1 < logs.len() {
                 let ly = ry + 11.0;
                 painter.line_segment(
                     [Pos2::new(l, ly), Pos2::new(r, ly)],

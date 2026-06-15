@@ -7,6 +7,7 @@ use eframe::egui;
 use egui::TextureHandle;
 use egui_tiles::Tree;
 
+use crate::bus_view::BusView;
 use crate::panels::Panel;
 use crate::theme::{Palette, GRAPHITE, SILVER};
 use crate::{build_tree, TreeIds};
@@ -23,10 +24,14 @@ pub struct App {
     /// If set (via MARTIAN_SHOT=path), render a few frames, save a PNG, exit.
     pub shot_path: Option<String>,
     pub frame: u64,
+    /// Live bus state the panels render from (mock-fed for now).
+    pub view: BusView,
 }
 
 impl App {
-    pub fn new() -> Self {
+    /// Build the app. `egui_ctx` is handed to the bus bridge so background data
+    /// arriving off-frame can wake the UI.
+    pub fn new(egui_ctx: &egui::Context) -> Self {
         let dark = std::env::var("MARTIAN_LIGHT").is_err();
         let (tree, tree_ids) = build_tree();
         Self {
@@ -40,6 +45,7 @@ impl App {
             visuals_set_for: None,
             shot_path: std::env::var("MARTIAN_SHOT").ok(),
             frame: 0,
+            view: BusView::start(egui_ctx.clone()),
         }
     }
 
