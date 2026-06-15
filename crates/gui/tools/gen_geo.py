@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
 """Generate src/geo_data.rs (land + lake basemap) from Natural Earth 50m.
 
-Clips features to a North America box, simplifies (Douglas-Peucker), and
-pre-triangulates each ring with mapbox_earcut so the Rust side only projects
-vertices and draws a static mesh (robust + cheap, no runtime triangulation).
+Covers the WHOLE WORLD: keeps every ring (Natural Earth is dateline-split, so no
+antimeridian smearing), simplifies (Douglas-Peucker), and pre-triangulates each
+ring with mapbox_earcut so the Rust side only projects vertices and draws a
+static mesh (robust + cheap, no runtime triangulation). The map auto-fits its
+bounds to the plotted spots, so this geometry must span the globe — contacts
+anywhere on Earth land on real coastline.
+
+Tolerances are tuned so the emitted Rust stays a few hundred KB: small islands
+below MIN_AREA are dropped from the *backdrop* (a station there still gets its
+own marker), and coarse DP keeps the vertex count sane at world scale.
 
 Setup:
     pip install mapbox_earcut numpy
@@ -13,8 +20,6 @@ Run:
     python3 tools/gen_geo.py && cp /tmp/geo_out.rs src/geo_data.rs
 """
 import json, mapbox_earcut as earcut, numpy as np
-
-KX0, KX1, KY0, KY1 = -128.0, -60.0, 12.0, 58.0   # view-intersection box (rings kept whole)
 
 def rings_of(geom):
     t=geom["type"]; c=geom["coordinates"]
@@ -54,13 +59,11 @@ def dp(pts, tol):
     a=dp_open(pts[:far+1],tol); b=dp_open(pts[far:]+[pts[0]],tol)
     return a+b[1:-1]
 
-def intersects(r): return any(KX0<=p[0]<=KX1 and KY0<=p[1]<=KY1 for p in r)
-
 def collect(path, min_area, tol):
     data=json.load(open(path)); rings=[]
     for feat in data["features"]:
         for r in rings_of(feat["geometry"]):
-            if len(r)<4 or not intersects(r) or area(r)<min_area: continue
+            if len(r)<4 or area(r)<min_area: continue
             s=dp(r,tol)
             if len(s)>=4: rings.append(s)
     rings.sort(key=area, reverse=True)
@@ -89,13 +92,15 @@ def emit(name, verts, ringspans, tris):
     out.append(f"pub const {name}_IDX: &[u32] = &[{ibody}];")
     return "\n".join(out)
 
-land=collect("/tmp/ne_50m_land.geojson", 0.4, 0.06)
-lakes=collect("/tmp/ne_50m_lakes.geojson", 1.0, 0.03)
+# World scale: coarser DP than the old NA crop, and drop sub-MIN_AREA islands
+# from the backdrop so the emitted source stays manageable.
+land=collect("/tmp/ne_50m_land.geojson", 0.5, 0.15)
+lakes=collect("/tmp/ne_50m_lakes.geojson", 3.0, 0.08)
 lv,lr,lt=build(land,"LAND")
 kv,kr,kt=build(lakes,"LAKES")
 with open("/tmp/geo_out.rs","w") as f:
-    f.write("// Generated from Natural Earth 50m (land + lakes), clipped to North America\n")
-    f.write("// and pre-triangulated (mapbox_earcut). Regenerate via /tmp/gen_geo.py.\n")
+    f.write("// Generated from Natural Earth 50m (land + lakes), WHOLE WORLD,\n")
+    f.write("// pre-triangulated (mapbox_earcut). Regenerate via tools/gen_geo.py.\n")
     f.write("// VERTS are (lat, lon); RINGS are (start, len) spans for outline strokes;\n")
     f.write("// IDX are triangle indices (groups of 3) into VERTS for the fill mesh.\n\n")
     f.write(emit("LAND",lv,lr,lt)+"\n\n")

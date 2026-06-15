@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Bake a shaded-relief texture (assets/relief.png) from a global GEBCO heightmap.
 
-Crops to a North America box, computes a NW-lit hillshade, and concentrates the
-shading on steep terrain (ruggedness mask) so plains stay flat. Output is a
-grayscale multiplier (255 = unshaded) that the land mesh modulates at runtime.
+Covers the WHOLE WORLD (matches the world basemap geometry), computes a NW-lit
+hillshade, and concentrates the shading on steep terrain (ruggedness mask) so
+plains stay flat. Output is a grayscale multiplier (255 = unshaded) that the land
+mesh modulates at runtime.
 
 Setup: pip install pillow scipy numpy ; fetch a global equirectangular gray DEM:
   curl -sLo /tmp/gebco.png https://eoimages.gsfc.nasa.gov/images/imagerecords/73000/73934/gebco_08_rev_elev_21600x10800.png
@@ -14,12 +15,12 @@ import numpy as np
 from PIL import Image
 from scipy.ndimage import gaussian_filter
 
-# Relief box (must match RELIEF_* constants in Rust for UV mapping).
-LON0, LON1, LAT0, LAT1 = -130.0, -58.0, 8.0, 62.0
-OUT_W = 900
+# Relief box (must match RELIEF_* constants in Rust for UV mapping). Whole world.
+LON0, LON1, LAT0, LAT1 = -180.0, 180.0, -90.0, 90.0
+OUT_W = 1440         # 2:1 world → 720 tall; enough for continental terrain
 STRENGTH = 0.475     # how dark the deepest shadow gets
 EXAG = 8.0           # vertical exaggeration of the gradient
-EDGE_BAND = 0.08     # outer fraction faded to flat so off-box land doesn't smear
+EDGE_BAND = 0.02     # light feather of the pole/dateline edges only
 
 Image.MAX_IMAGE_PIXELS = None
 g = Image.open("/tmp/gebco.png").convert("L")

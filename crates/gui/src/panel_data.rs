@@ -55,13 +55,16 @@ pub const TICKER_H: f32 = 30.0;
 //        IBM Plex Mono (all data/body, 400–600). Both OFL — vendor the TTFs.
 
 // ============================================================ MAP PROJECTION
-// Equirectangular. SVG viewBox is 393×190; latitude window 16°..54°N.
-pub const LON0: f32 = -150.0;   // left edge longitude
-pub const LAT_TOP: f32 = 54.0;  // top edge latitude
-pub const KX: f32 = 0.819;      // cos(midlat) longitude compression
-pub const S: f32 = 5.0;         // units per degree of latitude
-pub const MAP_W: f32 = 393.0;   // (= (−54 − LON0) * KX * S)
-pub const MAP_H: f32 = 190.0;   // (= (LAT_TOP − 16) * S)
+// Plate carrée (equirectangular, no longitude compression) over the WHOLE WORLD,
+// so the map can auto-fit any cluster of contacts on Earth. `map_x`/`map_y` give
+// world units; `draw_map` recomputes scale + offset each frame to fit the
+// plotted points, so these full-globe constants are just the unit system.
+pub const LON0: f32 = -180.0;   // left edge longitude
+pub const LAT_TOP: f32 = 90.0;  // top edge latitude
+pub const KX: f32 = 1.0;        // no longitude compression (true plate carrée)
+pub const S: f32 = 5.0;         // units per degree
+pub const MAP_W: f32 = 1800.0;  // (= (180 − LON0) * KX * S)
+pub const MAP_H: f32 = 900.0;   // (= (LAT_TOP − (−90)) * S)
 
 #[inline] pub fn map_x(lon: f32) -> f32 { (lon - LON0) * KX * S }
 #[inline] pub fn map_y(lat: f32) -> f32 { (LAT_TOP - lat) * S }
@@ -69,24 +72,22 @@ pub const MAP_H: f32 = 190.0;   // (= (LAT_TOP − 16) * S)
 pub const HOME_LAT: f32 = 40.00; // Lafayette, CO (QTH) — N0JDC, grid DN70KA
 pub const HOME_LON: f32 = -105.10;
 
-// Graticule
-pub const MERIDIANS: &[f32] = &[-140.0,-130.0,-120.0,-110.0,-100.0,-90.0,-80.0,-70.0,-60.0];
-pub const PARALLELS: &[f32] = &[20.0, 30.0, 40.0, 50.0];
-// US/Canada border: dashed line at 49°N from left edge to lon −95 (lakes start).
-pub const BORDER_LAT: f32 = 49.0;
-pub const BORDER_LON_END: f32 = -95.0;
-// Home range rings (great-circle approx as ellipses): for km d,
-//   rx = (d / 85.0) * KX * S ,  ry = (d / 111.0) * S
+// Graticule: world meridians/parallels every 30° (edges ±180/±90 omitted).
+pub const MERIDIANS: &[f32] = &[-150.0,-120.0,-90.0,-60.0,-30.0,0.0,30.0,60.0,90.0,120.0,150.0];
+pub const PARALLELS: &[f32] = &[-60.0,-30.0,0.0,30.0,60.0];
+// Home range rings (great-circle approx as ellipses); the 85 km/° is lon spacing
+// at the home latitude (111·cos 40°): for km d, rx = (d / 85.0) * KX * S,
+//   ry = (d / 111.0) * S.
 pub const RING_KM: &[f32] = &[750.0, 1500.0];
 
 // ============================================================ TERRAIN (shaded relief)
 // The map's depth comes from a baked shaded-relief texture (assets/relief.png,
 // see tools/gen_relief.py) sampled by the land mesh. These bounds must match the
 // crop box in gen_relief.py so land lon/lat maps to the right texel.
-pub const RELIEF_LON0: f32 = -130.0;
-pub const RELIEF_LON1: f32 = -58.0;
-pub const RELIEF_LAT0: f32 = 8.0;
-pub const RELIEF_LAT1: f32 = 62.0;
+pub const RELIEF_LON0: f32 = -180.0;
+pub const RELIEF_LON1: f32 = 180.0;
+pub const RELIEF_LAT0: f32 = -90.0;
+pub const RELIEF_LAT1: f32 = 90.0;
 
 // ============================================================ MAIDENHEAD GRID → LON/LAT
 /// A decoded Maidenhead locator: cell CENTER plus the size of the smallest cell

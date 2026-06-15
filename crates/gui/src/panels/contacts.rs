@@ -1,5 +1,7 @@
-//! Contacts panel: a North-America map (relief-shaded land mesh + graticule +
+//! Contacts panel: a world map (relief-shaded land mesh + graticule +
 //! range rings + worked spots) over a flat tactical footer (toggles + SNR bars).
+//! Bounds auto-fit the plotted spots, so it reads as a regional map when contacts
+//! cluster and zooms out to the globe when DX comes in.
 //! Owns the four footer toggle states. The map/footer drawing helpers
 //! (`over`, `dashed_polyline`, `ellipse_pts`) are single-consumer and live here.
 
@@ -41,7 +43,7 @@ impl Panel for Contacts {
             block.min,
             Pos2::new(block.right(), block.top() + pd::HEADER_ROW_H),
         );
-        panel_header(painter, header, pal, "Contacts", "N. America · DN70KA");
+        panel_header(painter, header, pal, "Contacts", "World · DN70KA");
         painter.text(
             Pos2::new(header.right() - 2.0, header.center().y),
             Align2::RIGHT_CENTER,
@@ -261,8 +263,10 @@ fn draw_map(
     for &lat in pd::PARALLELS {
         let y = pd::map_y(lat);
         painter.line_segment([p(0.0, y), p(pd::MAP_W, y)], Stroke::new(0.4, grat));
+        // Pin the label to the visible left edge: at world zoom the map's own left
+        // edge (lon −180) is usually off-screen, so anchor in screen space instead.
         painter.text(
-            p(2.0, y - 1.5),
+            Pos2::new(content.left() + 2.0, p(0.0, y).y - 1.5),
             Align2::LEFT_BOTTOM,
             &format!("{lat:.0}°"),
             font(4.6),
@@ -270,17 +274,7 @@ fn draw_map(
         );
     }
 
-    // 3) 49°N border (dashed accent), left edge → lon −95
-    let by = pd::map_y(pd::BORDER_LAT);
-    dashed_polyline(
-        painter,
-        &[p(0.0, by), p(pd::map_x(pd::BORDER_LON_END), by)],
-        Stroke::new(sl(0.5).max(0.6), pal.accent.gamma_multiply(0.5)),
-        sl(3.0),
-        sl(2.0),
-    );
-
-    // 4) range rings (dashed ellipses about home)
+    // 3) range rings (dashed ellipses about home)
     let home = proj(pd::HOME_LON, pd::HOME_LAT);
     for &km in pd::RING_KM {
         let rx = sl((km / 85.0) * pd::KX * pd::S);
@@ -295,7 +289,7 @@ fn draw_map(
         );
     }
 
-    // 5) worked spots (filled) — position inferred from each station's grid.
+    // 4) worked spots (filled) — position inferred from each station's grid.
     // Marker/label sized in px (with clamp) so they stay readable at any zoom.
     let spot_r = sl(2.4).clamp(2.0, 3.6);
     let label_font = mono(sl(4.8).clamp(5.0, 8.0));
@@ -314,7 +308,7 @@ fn draw_map(
         painter.text(pos + off, align, call, label_font.clone(), pal.body);
     }
 
-    // 6) home / QTH marker — the strongest indicator, drawn last so it sits on top.
+    // 5) home / QTH marker — the strongest indicator, drawn last so it sits on top.
     let ring_r = sl(4.6).clamp(5.0, 7.0);
     let arm = ring_r + 2.5;
     painter.circle(home, ring_r, Color32::TRANSPARENT, Stroke::new(1.4, pal.accent));

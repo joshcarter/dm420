@@ -1,5 +1,7 @@
-//! Log Book panel: a 4-row QSO table of the most recent contacts, read live from
-//! the bus (`logbook/entries`). No view state.
+//! Log Book panel: a QSO table of the most recent contacts, read live from the
+//! bus (`logbook/entries`). The row count is not fixed — it grows to fill the
+//! panel's vertical space, showing as many newest-first entries as fit. No view
+//! state.
 
 use eframe::egui;
 use egui::{Align2, Pos2, Stroke};
@@ -31,9 +33,23 @@ impl Panel for LogBook {
     fn ui(&mut self, ctx: &mut PanelCtx, block: egui::Rect) {
         let painter = ctx.painter;
         let pal = ctx.pal;
-        let logs = ctx.bus.recent_logs(4);
+        const ROW_H: f32 = 22.0;
+        const BOTTOM_PAD: f32 = 8.0; // keep the last row clear of the screen bezel
         let (header, screen) = split_block(block);
-        panel_header(painter, header, pal, "Log Book", "last 4 · FT8");
+
+        // The table fills the panel: rows start just below the column-header rule
+        // and step every ROW_H, so the screen's height decides how many recent
+        // QSOs fit. Size to that, then pull exactly that many newest entries — the
+        // count tracks the user's split drag instead of being pinned at 4.
+        let sep_y = screen.top() + 19.0; // column-header underline
+        let first_row_y = sep_y + 11.0; // center of the first data row
+        let capacity = if screen.bottom() - BOTTOM_PAD >= first_row_y {
+            (((screen.bottom() - BOTTOM_PAD - first_row_y) / ROW_H).floor() as usize) + 1
+        } else {
+            0
+        };
+        let logs = ctx.bus.recent_logs(capacity);
+        panel_header(painter, header, pal, "Log Book", &format!("last {} · FT8", logs.len()));
         painter.text(
             Pos2::new(header.right() - 2.0, header.center().y),
             Align2::RIGHT_CENTER,
@@ -64,14 +80,13 @@ impl Panel for LogBook {
         ] {
             painter.text(Pos2::new(x, hy), align, tracked(text), dimf.clone(), pal.dim);
         }
-        let sep_y = screen.top() + 19.0;
         painter.line_segment(
             [Pos2::new(l, sep_y), Pos2::new(r, sep_y)],
             Stroke::new(1.0, pal.dim.gamma_multiply(0.4)),
         );
 
         for (i, e) in logs.iter().enumerate() {
-            let ry = sep_y + 11.0 + i as f32 * 22.0;
+            let ry = first_row_y + i as f32 * ROW_H;
             let grid = e.grid.as_ref().map(|g| g.0.as_str()).unwrap_or("----");
             painter.text(
                 Pos2::new(l, ry),
