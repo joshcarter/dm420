@@ -2,7 +2,6 @@
 name = "rig"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "Radio back-end: the RadioBackend trait plus the Kenwood TS-480SAT/TS-590S CAT driver. Serves radio/{id}/command, publishes rig_state."

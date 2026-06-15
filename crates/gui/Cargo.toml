@@ -2,7 +2,6 @@
 name = "gui"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "Martian Hybrid egui front-end: waterslide, log, map, and band-scanner panels."

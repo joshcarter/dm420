@@ -6,7 +6,6 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-license = "MIT OR Apache-2.0"
 authors = ["Josh Carter (N0JDC)", "Joel Odom (W4LL)"]
 repository = "https://github.com/joshcarter/dm420"
 

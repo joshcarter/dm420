@@ -1,11 +1,11 @@
-# dm420
+# Dingus Mangler 420
 
 A desktop application for operating **digital-mode amateur radio** (FT8/FT4 first),
 with a rotated-waterfall "waterslide" display, first-class multi-band monitoring, and
 local-network collaboration between operators. See **[`OVERVIEW.md`](OVERVIEW.md)** for
 the design objectives and **[`docs/`](docs/)** for the per-component specs.
 
-> `dm420` is an internal codename (a nod to DM780). A public product name is an open
+> `DM420` is an internal codename (a nod to DM780). A public product name is an open
 > decision (`OVERVIEW.md` §7.6).
 
 ## Layout
@@ -40,10 +40,3 @@ cargo run -p gui             # run the app (binary: dm420)
 ```
 
 The GUI requires the system clock within ~1 s of UTC (NTP) for FT8/FT4 slot timing.
-
-## Contributors
-
-- Josh Carter — **N0JDC** — UI, message bus, scanner, cross-station gossip
-- Joel Odom — **W4LL** — radio control, FT4/FT8 encode/decode
-
-Dual-licensed under MIT OR Apache-2.0.

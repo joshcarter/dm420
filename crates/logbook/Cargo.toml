@@ -2,7 +2,6 @@
 name = "logbook"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "Log store: in-memory + on-disk persistence, ADIF import/export, and the G-set merge that folds in gossiped peer contacts."

@@ -2,7 +2,6 @@
 name = "types"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "Shared, serde-serializable message vocabulary (the message catalog payloads + scalar newtypes). No async, no I/O — depended on by every crate."
