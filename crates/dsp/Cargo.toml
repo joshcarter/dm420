@@ -1,0 +1,12 @@
+[package]
+name = "dsp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Signal processing: FFT/spectrum-row generation for the waterslide. Pure compute, off the UI thread."
+
+[dependencies]
+bus.workspace = true
+types.workspace = true

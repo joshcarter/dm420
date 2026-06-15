@@ -1,0 +1,26 @@
+[package]
+name = "gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Martian Hybrid egui front-end: waterslide, log, map, and band-scanner panels."
+
+# The application binary. Package is `gui` (the handoff's member name); the
+# shipped binary is `dm420`. Build/run with `cargo run -p gui`.
+[[bin]]
+name = "dm420"
+path = "src/main.rs"
+
+[dependencies]
+eframe.workspace = true
+egui.workspace = true
+egui_tiles.workspace = true
+image.workspace = true
+chrono.workspace = true
+
+# The bus spine + shared message vocabulary. Wired now so panels can move from
+# the spike's `panel_data` placeholders to live bus subscriptions in place.
+bus.workspace = true
+types.workspace = true

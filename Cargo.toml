@@ -1,0 +1,51 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+# Shared metadata — every member crate inherits these via `xxx.workspace = true`.
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["Josh Carter (N0JDC)", "Joel Odom (W4LL)"]
+repository = "https://github.com/joshcarter/dm420"
+
+# Centralized, pinned dependency versions. Member crates opt in with
+# `<crate>.workspace = true` so versions never drift between components.
+[workspace.dependencies]
+# --- internal crates (the bus is the spine; types is the shared vocabulary) ---
+types = { path = "crates/types" }
+bus = { path = "crates/bus" }
+core = { path = "crates/core" }
+rig = { path = "crates/rig" }
+audio = { path = "crates/audio" }
+dsp = { path = "crates/dsp" }
+modes = { path = "crates/modes" }
+qso = { path = "crates/qso" }
+logbook = { path = "crates/logbook" }
+scanner = { path = "crates/scanner" }
+
+# --- GUI stack (pinned exactly per docs/FEASIBILITY.md; the spike validated these) ---
+eframe = "0.34.3"
+egui = "0.34.3"
+egui_tiles = "0.15.0"
+egui_extras = "0.34.3"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+
+# --- async / bus transport ---
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"] }
+
+# --- serialization (message catalog payloads, recorder, ADIF/JSON) ---
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# --- hardware I/O (component owners enable when implementing) ---
+serialport = "4"   # Kenwood CAT (rig)
+cpal = "0.15"      # cross-platform audio capture/playback (audio)
+
+# --- misc ---
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+thiserror = "1"
+
+[profile.release]
+opt-level = 3

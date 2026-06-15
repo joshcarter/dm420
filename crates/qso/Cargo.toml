@@ -1,0 +1,12 @@
+[package]
+name = "qso"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Contact state machine / QSO engine: computes the next message to send, advances on slot boundaries, emits completed contacts."
+
+[dependencies]
+bus.workspace = true
+types.workspace = true

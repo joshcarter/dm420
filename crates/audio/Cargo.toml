@@ -1,0 +1,12 @@
+[package]
+name = "audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Cross-platform audio capture/playback (cpal): delivers interval-aligned RX audio to the decoder; renders TX audio for the rig."
+
+[dependencies]
+bus.workspace = true
+types.workspace = true
