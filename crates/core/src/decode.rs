@@ -14,6 +14,9 @@ use bus::types as t;
 use bus::{BusHandle, Topic};
 use modes::{Decode as ModeDecode, Protocol, decode};
 
+use std::sync::Arc;
+
+use crate::control::{AudioControl, StopReason, sleep_or_changed};
 use crate::health;
 use crate::parse::parse_message;
 
@@ -192,28 +195,48 @@ pub fn spawn_wav(bus: &BusHandle, radio: t::RadioId, path: PathBuf, proto: Proto
 /// capture stream is rebuilt with backoff and the fault is reported on
 /// `health/audio`, so decoding resumes when the device returns without taking the
 /// app down. Each session starts from a clean spectrogram/slot state.
-pub fn spawn_live(bus: &BusHandle, radio: t::RadioId, input: Option<String>, proto: Protocol) {
+pub fn spawn_live(bus: &BusHandle, radio: t::RadioId, control: Arc<AudioControl>) {
     let bus = bus.clone();
     std::thread::spawn(move || {
         let mut last_health: Option<t::HealthState> = None;
         let mut backoff = AUDIO_BACKOFF_START;
 
         loop {
-            match audio::capture_stream(input.clone()) {
+            // Snapshot the live settings (and their generation) for this session.
+            let cfg_gen = control.generation();
+            let (input, proto) = control.snapshot();
+
+            match audio::capture_stream(input) {
                 Ok(stream) => {
-                    // A session runs until the device stops delivering samples.
-                    let was_healthy = run_stream(&bus, &radio, proto, &stream, &mut last_health);
+                    // A session runs until the device stops delivering samples or
+                    // the config changes.
+                    let end = run_stream(
+                        &bus,
+                        &radio,
+                        proto,
+                        &stream,
+                        &mut last_health,
+                        &control,
+                        cfg_gen,
+                    );
                     drop(stream);
                     // A session that actually delivered audio earns a prompt retry;
                     // one that never started keeps backing off.
-                    if was_healthy {
+                    if end.ever_healthy {
                         backoff = AUDIO_BACKOFF_START;
                     }
-                    set_audio_health(
-                        &bus,
-                        &mut last_health,
-                        t::HealthState::Down("audio capture stopped — reconnecting".into()),
-                    );
+                    match end.reason {
+                        StopReason::LinkLost => set_audio_health(
+                            &bus,
+                            &mut last_health,
+                            t::HealthState::Down("audio capture stopped — reconnecting".into()),
+                        ),
+                        StopReason::Reconfigured => set_audio_health(
+                            &bus,
+                            &mut last_health,
+                            t::HealthState::Degraded("applying new settings…".into()),
+                        ),
+                    }
                 }
                 Err(e) => {
                     tracing::warn!("audio capture failed to start: {e}");
@@ -225,10 +248,18 @@ pub fn spawn_live(bus: &BusHandle, radio: t::RadioId, input: Option<String>, pro
                 }
             }
 
-            std::thread::sleep(backoff);
+            // Back off before retrying, cut short if the operator changed settings.
+            sleep_or_changed(backoff, || control.generation(), cfg_gen);
             backoff = (backoff * 2).min(AUDIO_BACKOFF_MAX);
         }
     });
+}
+
+/// Outcome of one capture session: whether it ever delivered audio (for backoff)
+/// and why it ended (device lost vs. a config change).
+struct SessionEnd {
+    ever_healthy: bool,
+    reason: StopReason,
 }
 
 /// Publish an audio health transition (deduplicated; see [`health::set`]).
@@ -237,17 +268,19 @@ fn set_audio_health(bus: &BusHandle, last: &mut Option<t::HealthState>, state: t
 }
 
 /// Run one capture session: pump samples into the spectrogram + slot decoder
-/// until the device delivers nothing for [`AUDIO_SILENCE_TIMEOUT`]. Returns
-/// whether the device was ever healthy (delivered audio), so the supervisor can
-/// pick the right backoff. All per-session state is local, so a reconnect starts
-/// the spectrogram and slot alignment fresh.
+/// until the device delivers nothing for [`AUDIO_SILENCE_TIMEOUT`] (device lost)
+/// or the config generation moves off `start_gen` (reconfigured). Returns whether
+/// the device was ever healthy and why it stopped. All per-session state is
+/// local, so a reconnect starts the spectrogram and slot alignment fresh.
 fn run_stream(
     bus: &BusHandle,
     radio: &t::RadioId,
     proto: Protocol,
     stream: &audio::CaptureStream,
     last_health: &mut Option<t::HealthState>,
-) -> bool {
+    control: &AudioControl,
+    start_gen: u64,
+) -> SessionEnd {
     let rate = stream.sample_rate;
     let mut resampler = audio::Resampler::new(rate, DECODE_RATE);
 
@@ -267,6 +300,13 @@ fn run_stream(
     let tick = Duration::from_millis(500);
 
     loop {
+        // A config edit ends the session so the next one opens the new device/mode.
+        if control.generation() != start_gen {
+            return SessionEnd {
+                ever_healthy,
+                reason: StopReason::Reconfigured,
+            };
+        }
         let chunk = match stream.recv_timeout(tick) {
             Some(c) => c,
             None => {
@@ -278,7 +318,10 @@ fn run_stream(
                         "audio: no samples for {:?}; treating device as lost",
                         AUDIO_SILENCE_TIMEOUT
                     );
-                    return ever_healthy;
+                    return SessionEnd {
+                        ever_healthy,
+                        reason: StopReason::LinkLost,
+                    };
                 }
                 continue;
             }

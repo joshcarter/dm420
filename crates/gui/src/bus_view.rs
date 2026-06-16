@@ -82,6 +82,13 @@ pub struct BusView {
     /// they were live radio data.
     real: bool,
 
+    /// Handle for live reconfiguration of the running producers (real mode only;
+    /// empty otherwise).
+    control: app_core::CoreControl,
+    /// The currently-applied hardware config — the settings form's source of
+    /// truth. Updated on apply alongside pushing to `control`.
+    applied: Arc<Mutex<crate::settings::HardwareConfig>>,
+
     /// The bus, kept for issuing commands later (TX, tuning, scanner control).
     #[allow(dead_code)]
     bus: BusHandle,
@@ -116,17 +123,20 @@ impl BusView {
         // active runtime context; hold the guard while we wire everything up.
         let settings = crate::settings::Settings::from_env();
         let real = settings.is_real();
+        let applied = Arc::new(Mutex::new(settings.hardware()));
         let _guard = rt.enter();
-        if real {
+        let control = if real {
             // Real rig + decode producers; mocks still drive the topics `core`
             // doesn't cover yet (clock, logbook, scanner). Note: decodes are NOT
             // among them — `spawn_support` deliberately omits `run_decodes`, so the
             // decode stream is the real decoder's alone.
-            app_core::spawn(&bus, settings.core_config());
+            let control = app_core::spawn(&bus, settings.core_config());
             mocks::spawn_support(&bus);
+            control
         } else {
             mocks::spawn(&bus);
-        }
+            app_core::CoreControl::default()
+        };
 
         pump_state(
             &bus,
@@ -174,6 +184,8 @@ impl BusView {
             decodes,
             health,
             real,
+            control,
+            applied,
             bus,
             _rt: rt,
         }
@@ -239,6 +251,34 @@ impl BusView {
             }
         }
         out
+    }
+
+    /// The currently-applied hardware config (the settings form's starting point).
+    pub fn current_config(&self) -> crate::settings::HardwareConfig {
+        self.applied.lock().unwrap().clone()
+    }
+
+    /// Apply edited hardware settings: push them to the running rig/audio
+    /// producers (which reconnect with them) and record them as applied. A no-op
+    /// on subsystems that aren't running (mock mode, WAV replay).
+    pub fn apply_config(&self, cfg: crate::settings::HardwareConfig) {
+        if let Some(rig) = &self.control.rig {
+            rig.set(cfg.serial.clone());
+        }
+        if let Some(audio) = &self.control.audio {
+            audio.set(cfg.audio_input.clone(), cfg.protocol);
+        }
+        *self.applied.lock().unwrap() = cfg;
+    }
+
+    /// Input-capable audio device names, for the settings picker.
+    pub fn audio_inputs(&self) -> Vec<String> {
+        app_core::list_audio_inputs()
+    }
+
+    /// Available serial port names (likely-radio first), for the settings picker.
+    pub fn serial_ports(&self) -> Vec<String> {
+        app_core::list_serial_ports()
     }
 
     /// The latest health for a subsystem, if it has reported (real mode only).

@@ -39,8 +39,8 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([pd::PANEL_W, pd::PANEL_H])
-            .with_min_inner_size([720.0, 460.0])
-            .with_title("Martian Hybrid — FT8 Console"),
+            .with_min_inner_size([900.0, 650.0])
+            .with_title("Dingus Mangler 420"),
         ..Default::default()
     };
     eframe::run_native(
@@ -124,6 +124,7 @@ struct Tactical<'a> {
     relief: &'a egui::TextureHandle,
     dt: f64,
     bus: &'a BusView,
+    unlocked: bool,
 }
 
 impl<'a> Behavior<Box<dyn Panel>> for Tactical<'a> {
@@ -140,6 +141,7 @@ impl<'a> Behavior<Box<dyn Panel>> for Tactical<'a> {
             relief: self.relief,
             dt: self.dt,
             bus: self.bus,
+            unlocked: self.unlocked,
         };
         pane.ui(&mut ctx, block);
         UiResponse::None
@@ -337,6 +339,7 @@ impl eframe::App for App {
                     relief: &relief,
                     dt: dt as f64,
                     bus: &self.view,
+                    unlocked: self.edit_mode,
                 };
                 enforce_min_width(&mut self.tree, self.tree_ids.root, pd::MIN_PANEL_W, pd::VGROOVE_W);
                 pin_band_height(&mut self.tree, &self.tree_ids, pd::VGROOVE_W);

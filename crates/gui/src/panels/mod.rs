@@ -31,6 +31,11 @@ pub struct PanelCtx<'a> {
     pub relief: &'a TextureHandle,
     pub dt: f64,
     pub bus: &'a BusView,
+    /// True when the GUI is unlocked (the top-bar GUI switch is on EDIT). Panels
+    /// use this to reveal their edit/settings affordances; the default (locked)
+    /// is the normal operating view. Each panel decides what unlocking means for
+    /// it — most ignore it.
+    pub unlocked: bool,
 }
 
 /// A drawable instrument. Implementors own their view state and render into the

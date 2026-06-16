@@ -7,9 +7,13 @@ use types::{
     Decode, DecodeContent, HealthState, ParsedMessage, SpectrumRow, SubsystemHealth, SubsystemId,
 };
 
+use app_core::{KENWOOD_BAUDS, LineProfile, Protocol, SerialConfig};
+
 use super::{Panel, PanelCtx};
+use crate::bus_view::BusView;
 use crate::chrome::{measure, panel_header, shadow};
 use crate::panel_data as pd;
+use crate::settings::HardwareConfig;
 use crate::theme::*;
 use crate::waterslide_panel::{WaterslidePanel, WaterslideTheme};
 
@@ -45,6 +49,7 @@ fn decode_text(d: &Decode) -> String {
 pub struct Waterfall {
     slide: WaterslidePanel,
     spectro: Spectrogram,
+    form: ConfigForm,
 }
 
 impl Waterfall {
@@ -52,6 +57,7 @@ impl Waterfall {
         Self {
             slide: WaterslidePanel::new(7200.0),
             spectro: Spectrogram::new(),
+            form: ConfigForm::default(),
         }
     }
 }
@@ -110,57 +116,89 @@ impl Panel for Waterfall {
         );
         recessed_screen(painter, screen, pal);
 
-        // When the capture device is missing or disconnected, the spectrogram and
-        // decode rail have no live data — show the fault here instead of a frozen
-        // or empty screen. The supervisor keeps reconnecting in the background.
-        let audio_fault = ctx
-            .bus
-            .is_real()
-            .then(|| ctx.bus.health(SubsystemId::Audio))
-            .flatten()
-            .filter(SubsystemHealth::is_faulted);
+        let body_big = screen.width() > 24.0 && screen.height() > 24.0;
 
-        if let Some(health) = audio_fault {
-            if screen.width() > 24.0 && screen.height() > 24.0 {
-                draw_fault_body(painter, screen, pal, &health);
-            }
-        } else if ctx.bus.is_real() {
-            // Real mode: no FFT/spectrum producer is wired yet (the decoder
-            // publishes `Decode`s, not `SpectrumRow`s), so we render the decodes
-            // themselves in waterslide form — placed by audio offset (vertical)
-            // and age (horizontal), NOW at centre, the FFT (right) half left blank.
-            if screen.width() > 24.0 && screen.height() > 24.0 {
-                let body = screen.shrink(8.0);
-                let now_ms = chrono::Utc::now().timestamp_millis();
-                // Right half: real scrolling spectrogram (brightness = intensity),
-                // flowing right as the decode text flows left. Equal-width halves
-                // each spanning WS_HISTORY_SECS, so the scroll rates match.
-                let now_x = body.center().x;
-                let right = Rect::from_min_max(Pos2::new(now_x, body.top()), body.max);
-                let cmap = if pal.is_dark {
-                    crate::waterslide_panel::martian_cmap()
+        if ctx.unlocked {
+            // Unlocked (GUI EDIT): the screen body becomes the radio/audio settings
+            // form. Real mode only — the form drives live hardware; under mocks
+            // there's nothing to configure.
+            if body_big {
+                if ctx.bus.is_real() {
+                    let body = screen.shrink(10.0);
+                    let mut child = ctx.ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(body)
+                            .layout(egui::Layout::top_down(egui::Align::Min)),
+                    );
+                    child.set_clip_rect(screen.shrink(2.0));
+                    self.form.ui(&mut child, ctx.bus, pal);
                 } else {
-                    crate::waterslide_panel::martian_cmap_light()
-                };
-                self.spectro
-                    .update_and_paint(ctx.ui, right, ctx.dt, ctx.bus.spectrum().as_ref(), &cmap);
-                // Left half: decodes sliding left from centre, drawn over the
-                // spectrogram (graticule, NOW line, and Hz labels included).
-                draw_waterslide(painter, body, pal, &ctx.bus.recent_decodes(64), now_ms);
-                ctx.ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
+                    draw_centered_note(
+                        painter,
+                        screen,
+                        pal,
+                        "RADIO SETUP",
+                        "available in real mode — launch with DM420_REAL=1",
+                    );
+                }
             }
-        } else if screen.width() > 24.0 && screen.height() > 24.0 {
-            // Mock mode only: Live Waterslide simulation as the screen body
-            // (inset to keep brackets).
-            let body = screen.shrink(8.0);
-            let theme = WaterslideTheme::from_palette(pal);
-            let mut child = ctx.ui.new_child(
-                egui::UiBuilder::new()
-                    .max_rect(body)
-                    .layout(egui::Layout::top_down(egui::Align::Min)),
-            );
-            child.set_clip_rect(screen.shrink(2.0));
-            self.slide.ui(&mut child, body, ctx.dt, &theme);
+        } else {
+            // Locked: normal operating view. Re-sync the form to the applied config
+            // the next time it's opened.
+            self.form.loaded = false;
+
+            // When the capture device is missing or disconnected, the spectrogram
+            // and decode rail have no live data — show the fault here instead of a
+            // frozen or empty screen. The supervisor keeps reconnecting underneath.
+            let audio_fault = ctx
+                .bus
+                .is_real()
+                .then(|| ctx.bus.health(SubsystemId::Audio))
+                .flatten()
+                .filter(SubsystemHealth::is_faulted);
+
+            if let Some(health) = audio_fault {
+                if body_big {
+                    draw_fault_body(painter, screen, pal, &health);
+                }
+            } else if ctx.bus.is_real() {
+                // Real mode: no FFT/spectrum producer is wired yet (the decoder
+                // publishes `Decode`s, not `SpectrumRow`s), so we render the decodes
+                // themselves in waterslide form — placed by audio offset (vertical)
+                // and age (horizontal), NOW at centre, the FFT (right) half blank.
+                if body_big {
+                    let body = screen.shrink(8.0);
+                    let now_ms = chrono::Utc::now().timestamp_millis();
+                    // Right half: real scrolling spectrogram (brightness = intensity),
+                    // flowing right as the decode text flows left. Equal-width halves
+                    // each spanning WS_HISTORY_SECS, so the scroll rates match.
+                    let now_x = body.center().x;
+                    let right = Rect::from_min_max(Pos2::new(now_x, body.top()), body.max);
+                    let cmap = if pal.is_dark {
+                        crate::waterslide_panel::martian_cmap()
+                    } else {
+                        crate::waterslide_panel::martian_cmap_light()
+                    };
+                    self.spectro
+                        .update_and_paint(ctx.ui, right, ctx.dt, ctx.bus.spectrum().as_ref(), &cmap);
+                    // Left half: decodes sliding left from centre, drawn over the
+                    // spectrogram (graticule, NOW line, and Hz labels included).
+                    draw_waterslide(painter, body, pal, &ctx.bus.recent_decodes(64), now_ms);
+                    ctx.ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
+                }
+            } else if body_big {
+                // Mock mode only: Live Waterslide simulation as the screen body
+                // (inset to keep brackets).
+                let body = screen.shrink(8.0);
+                let theme = WaterslideTheme::from_palette(pal);
+                let mut child = ctx.ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(body)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                child.set_clip_rect(screen.shrink(2.0));
+                self.slide.ui(&mut child, body, ctx.dt, &theme);
+            }
         }
 
         draw_ticker(painter, ticker, pal, &ctx.bus.recent_decodes(4));
@@ -350,6 +388,221 @@ fn draw_waterslide(
     painter.line_segment(
         [Pos2::new(now_x, rect.top()), Pos2::new(now_x, rect.bottom())],
         egui::Stroke::new(2.0, pal.accent),
+    );
+}
+
+// =====================================================================
+// Radio / audio settings form (shown when the panel is unlocked)
+// =====================================================================
+
+/// Editable radio + audio settings shown in the unlocked FT8 panel body. Seeded
+/// from the currently-applied config the first time it opens (and on Revert);
+/// Apply pushes it to the live producers via [`BusView::apply_config`], which
+/// reconnect with the new settings.
+struct ConfigForm {
+    /// Whether the fields have been seeded from the applied config yet.
+    loaded: bool,
+    audio_input: Option<String>,
+    port: Option<String>,
+    baud: u32,
+    profile: LineProfile,
+    autodetect: bool,
+    protocol: Protocol,
+    /// Cached device/port lists for the pickers (refreshed on load / Refresh).
+    audio_devices: Vec<String>,
+    serial_ports: Vec<String>,
+}
+
+impl Default for ConfigForm {
+    fn default() -> Self {
+        Self {
+            loaded: false,
+            audio_input: None,
+            port: None,
+            baud: 19_200,
+            profile: LineProfile::Default,
+            autodetect: true,
+            protocol: Protocol::Ft8,
+            audio_devices: Vec::new(),
+            serial_ports: Vec::new(),
+        }
+    }
+}
+
+impl ConfigForm {
+    /// Seed the editable fields from the currently-applied config and refresh the
+    /// device/port lists.
+    fn load(&mut self, bus: &BusView) {
+        let cfg = bus.current_config();
+        self.audio_input = cfg.audio_input;
+        self.port = cfg.serial.port;
+        self.baud = cfg.serial.baud;
+        self.profile = cfg.serial.profile;
+        self.autodetect = cfg.serial.autodetect;
+        self.protocol = cfg.protocol;
+        self.audio_devices = bus.audio_inputs();
+        self.serial_ports = bus.serial_ports();
+        self.loaded = true;
+    }
+
+    /// The edited fields as a `HardwareConfig` ready to apply.
+    fn to_config(&self) -> HardwareConfig {
+        HardwareConfig {
+            audio_input: self.audio_input.clone(),
+            serial: SerialConfig {
+                port: self.port.clone(),
+                baud: self.baud,
+                profile: self.profile,
+                autodetect: self.autodetect,
+            },
+            protocol: self.protocol,
+        }
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, bus: &BusView, pal: &Palette) {
+        if !self.loaded {
+            self.load(bus);
+        }
+        ui.spacing_mut().item_spacing = egui::vec2(10.0, 8.0);
+        ui.label(egui::RichText::new("RADIO SETUP").color(pal.legend).strong());
+
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                egui::Grid::new("radio_setup_grid")
+                    .num_columns(2)
+                    .spacing([12.0, 8.0])
+                    .show(ui, |ui| {
+                        ui.label("Audio input");
+                        let sel = self
+                            .audio_input
+                            .clone()
+                            .unwrap_or_else(|| "(system default)".into());
+                        egui::ComboBox::from_id_salt("audio_input")
+                            .selected_text(sel)
+                            .width(240.0)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.audio_input, None, "(system default)");
+                                for d in &self.audio_devices {
+                                    ui.selectable_value(&mut self.audio_input, Some(d.clone()), d);
+                                }
+                            });
+                        ui.end_row();
+
+                        ui.label("Mode");
+                        egui::ComboBox::from_id_salt("mode")
+                            .selected_text(proto_label(self.protocol))
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.protocol, Protocol::Ft8, "FT8");
+                                ui.selectable_value(&mut self.protocol, Protocol::Ft4, "FT4");
+                            });
+                        ui.end_row();
+
+                        ui.label("Rig port");
+                        ui.checkbox(&mut self.autodetect, "Autodetect port / baud");
+                        ui.end_row();
+                    });
+
+                // Manual serial fields are disabled (greyed) while autodetect is on.
+                ui.add_enabled_ui(!self.autodetect, |ui| {
+                    egui::Grid::new("serial_grid")
+                        .num_columns(2)
+                        .spacing([12.0, 8.0])
+                        .show(ui, |ui| {
+                            ui.label("Port");
+                            let sel = self.port.clone().unwrap_or_else(|| {
+                                if self.serial_ports.is_empty() {
+                                    "(no ports found)".into()
+                                } else {
+                                    "(select port)".into()
+                                }
+                            });
+                            egui::ComboBox::from_id_salt("port")
+                                .selected_text(sel)
+                                .width(240.0)
+                                .show_ui(ui, |ui| {
+                                    for p in &self.serial_ports {
+                                        ui.selectable_value(&mut self.port, Some(p.clone()), p);
+                                    }
+                                });
+                            ui.end_row();
+
+                            ui.label("Baud");
+                            egui::ComboBox::from_id_salt("baud")
+                                .selected_text(self.baud.to_string())
+                                .show_ui(ui, |ui| {
+                                    for &b in KENWOOD_BAUDS {
+                                        ui.selectable_value(&mut self.baud, b, b.to_string());
+                                    }
+                                });
+                            ui.end_row();
+
+                            ui.label("Flow");
+                            egui::ComboBox::from_id_salt("flow")
+                                .selected_text(profile_label(self.profile))
+                                .show_ui(ui, |ui| {
+                                    for p in [
+                                        LineProfile::Default,
+                                        LineProfile::AssertDtrRts,
+                                        LineProfile::HardwareFlow,
+                                    ] {
+                                        ui.selectable_value(&mut self.profile, p, profile_label(p));
+                                    }
+                                });
+                            ui.end_row();
+                        });
+                });
+
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Apply").clicked() {
+                        bus.apply_config(self.to_config());
+                    }
+                    if ui.button("Refresh devices").clicked() {
+                        self.audio_devices = bus.audio_inputs();
+                        self.serial_ports = bus.serial_ports();
+                    }
+                    if ui.button("Revert").clicked() {
+                        self.loaded = false;
+                    }
+                });
+            });
+    }
+}
+
+fn proto_label(p: Protocol) -> &'static str {
+    match p {
+        Protocol::Ft8 => "FT8",
+        Protocol::Ft4 => "FT4",
+    }
+}
+
+fn profile_label(p: LineProfile) -> &'static str {
+    match p {
+        LineProfile::Default => "None (default)",
+        LineProfile::AssertDtrRts => "DTR/RTS",
+        LineProfile::HardwareFlow => "RTS/CTS (hardware)",
+    }
+}
+
+/// A simple two-line centred note in the screen body (used when the settings form
+/// has nothing to drive, e.g. mock mode).
+fn draw_centered_note(painter: &egui::Painter, screen: Rect, pal: &Palette, title: &str, detail: &str) {
+    let painter = painter.with_clip_rect(screen.shrink(6.0));
+    let c = screen.center();
+    painter.text(
+        Pos2::new(c.x, c.y - 8.0),
+        Align2::CENTER_CENTER,
+        title,
+        heading_bold(14.0),
+        pal.accent,
+    );
+    painter.text(
+        Pos2::new(c.x, c.y + 12.0),
+        Align2::CENTER_CENTER,
+        detail,
+        mono(9.5),
+        pal.sub,
     );
 }
 

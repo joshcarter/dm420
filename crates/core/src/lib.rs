@@ -18,20 +18,42 @@
 #![forbid(unsafe_code)]
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use bus::BusHandle;
 use bus::types::RadioId;
 
+mod control;
 mod decode;
 mod health;
 mod map;
 mod parse;
 mod rig_adapter;
 
+pub use control::{AudioControl, CoreControl, RigControl};
 pub use modes::Protocol;
 pub use parse::parse_message;
 pub use rig::LineProfile;
+pub use rig::probe::KENWOOD_BAUDS;
 pub use rig_adapter::CommandResult;
+
+/// Names of input-capable audio devices, for a UI device picker. Empty on error.
+pub fn list_audio_inputs() -> Vec<String> {
+    audio::list_devices()
+        .map(|ds| {
+            ds.into_iter()
+                .filter(|d| d.kind == audio::DeviceKind::Input)
+                .map(|d| d.name)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Names of available serial ports, likely-radio first, for a UI port picker.
+/// Empty on error.
+pub fn list_serial_ports() -> Vec<String> {
+    rig::probe::candidate_ports(true).unwrap_or_default()
+}
 
 /// The default radio id. Matches `mocks::radio_id()` so the GUI's existing topic
 /// subscriptions line up whether the data comes from `core` or `mocks`.
@@ -108,7 +130,11 @@ impl Default for CoreConfig {
 /// runtime context (like `mocks::spawn`); the rig state poller and live capture
 /// run on their own std threads, while command-serving and WAV replay run as
 /// tokio tasks.
-pub fn spawn(bus: &BusHandle, cfg: CoreConfig) {
+///
+/// Returns a [`CoreControl`] for live reconfiguration from the UI — the running
+/// rig/audio producers read their settings through it, so the operator can
+/// change device/port/baud/mode without a restart.
+pub fn spawn(bus: &BusHandle, cfg: CoreConfig) -> CoreControl {
     let CoreConfig {
         radio,
         allow_transmit,
@@ -116,11 +142,15 @@ pub fn spawn(bus: &BusHandle, cfg: CoreConfig) {
         serial,
     } = cfg;
 
+    let mut control = CoreControl::default();
+
     // The rig producer is optional: with no serial config there's simply no rig
     // on the bus (the GUI shows it as down). A present config never panics —
     // `rig_adapter` supervises the connection and reports health.
     if let Some(serial) = serial {
-        rig_adapter::spawn(bus, radio.clone(), allow_transmit, serial);
+        let rig = Arc::new(RigControl::new(serial));
+        rig_adapter::spawn(bus, radio.clone(), allow_transmit, rig.clone());
+        control.rig = Some(rig);
     }
 
     match decode {
@@ -129,7 +159,13 @@ pub fn spawn(bus: &BusHandle, cfg: CoreConfig) {
             protocol,
             looping,
         } => decode::spawn_wav(bus, radio, path, protocol, looping),
-        DecodeSource::Live { input, protocol } => decode::spawn_live(bus, radio, input, protocol),
+        DecodeSource::Live { input, protocol } => {
+            let audio = Arc::new(AudioControl::new(input, protocol));
+            decode::spawn_live(bus, radio, audio.clone());
+            control.audio = Some(audio);
+        }
         DecodeSource::None => {}
     }
+
+    control
 }

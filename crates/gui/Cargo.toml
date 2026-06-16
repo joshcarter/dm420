@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "Martian Hybrid egui front-end: waterslide, log, map, and band-scanner panels."
+description = "DM420 digital radio controller"
 
 # The application binary. Package is `gui` (the handoff's member name); the
 # shipped binary is `dm420`. Build/run with `cargo run -p gui`.

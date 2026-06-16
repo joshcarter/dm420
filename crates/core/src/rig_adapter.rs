@@ -19,6 +19,7 @@ use bus::{BusHandle, BusMessage, DeliveryClass, Topic};
 use rig::{RigHandle, Vfo};
 
 use crate::SerialConfig;
+use crate::control::{RigControl, StopReason, sleep_or_changed};
 use crate::health;
 use crate::map;
 
@@ -56,7 +57,7 @@ const AUTODETECT_WINDOW: Duration = Duration::from_millis(250);
 /// `None` while disconnected.
 type SharedHandle = Arc<Mutex<Option<RigHandle>>>;
 
-pub fn spawn(bus: &BusHandle, radio: t::RadioId, allow_transmit: bool, serial: SerialConfig) {
+pub fn spawn(bus: &BusHandle, radio: t::RadioId, allow_transmit: bool, control: Arc<RigControl>) {
     let shared: SharedHandle = Arc::new(Mutex::new(None));
     // The command server outlives any single connection; it reads `shared`.
     serve_commands(bus, radio.clone(), shared.clone());
@@ -66,7 +67,7 @@ pub fn spawn(bus: &BusHandle, radio: t::RadioId, allow_transmit: bool, serial: S
     let bus = bus.clone();
     std::thread::Builder::new()
         .name("rig-supervisor".into())
-        .spawn(move || supervise(bus, radio, allow_transmit, serial, shared))
+        .spawn(move || supervise(bus, radio, allow_transmit, control, shared))
         .expect("spawn rig supervisor");
 }
 
@@ -75,18 +76,23 @@ fn set_health(bus: &BusHandle, last: &mut Option<t::HealthState>, state: t::Heal
     health::set(bus, t::SubsystemId::Rig, last, state);
 }
 
-/// The supervisor loop: (re)connect, poll until the link is lost, back off, retry.
+/// The supervisor loop: (re)connect, poll until the link is lost or the config
+/// changes, back off, retry. Reads `control` for the live settings each round.
 fn supervise(
     bus: BusHandle,
     radio: t::RadioId,
     allow_transmit: bool,
-    serial: SerialConfig,
+    control: Arc<RigControl>,
     shared: SharedHandle,
 ) {
     let mut last_health: Option<t::HealthState> = None;
     let mut backoff = BACKOFF_START;
 
     loop {
+        // Snapshot the settings (and the generation they belong to) for this round.
+        let cfg_gen = control.generation();
+        let serial = control.snapshot();
+
         match open(&serial) {
             Ok((desc, dev)) => {
                 tracing::info!("rig connected: {desc}");
@@ -96,18 +102,25 @@ fn supervise(
                 publish_state(&bus, &radio, &handle);
                 backoff = BACKOFF_START; // a good connection resets the backoff
 
-                // Block here polling state until the link drops.
-                run_until_lost(&bus, &radio, &handle, &mut last_health);
+                // Block here polling state until the link drops or config changes.
+                let reason = run_until_lost(&bus, &radio, &handle, &mut last_health, &control, cfg_gen);
 
                 // Release the device before retrying: clear the shared handle and
                 // drop ours so the actor thread (and its serial port) shut down.
                 *shared.lock().unwrap() = None;
                 drop(handle);
-                set_health(
-                    &bus,
-                    &mut last_health,
-                    t::HealthState::Down("rig link lost — reconnecting".into()),
-                );
+                match reason {
+                    StopReason::LinkLost => set_health(
+                        &bus,
+                        &mut last_health,
+                        t::HealthState::Down("rig link lost — reconnecting".into()),
+                    ),
+                    StopReason::Reconfigured => set_health(
+                        &bus,
+                        &mut last_health,
+                        t::HealthState::Degraded("applying new settings…".into()),
+                    ),
+                }
             }
             Err(e) => {
                 tracing::warn!("rig connect failed: {e}");
@@ -115,22 +128,30 @@ fn supervise(
             }
         }
 
-        std::thread::sleep(backoff);
+        // Back off before the next attempt, but cut it short if the config changed
+        // so the operator's edit applies without waiting out the backoff.
+        sleep_or_changed(backoff, || control.generation(), cfg_gen);
         backoff = (backoff * 2).min(BACKOFF_MAX);
     }
 }
 
-/// Poll `IF;` snapshots until `FAILS_BEFORE_RECONNECT` consecutive failures, then
-/// return so the supervisor can reconnect. A first failure flips health to
-/// `Degraded`; a recovered poll restores `Healthy`.
+/// Poll `IF;` snapshots until `FAILS_BEFORE_RECONNECT` consecutive failures
+/// ([`StopReason::LinkLost`]) or the config generation moves off `start_gen`
+/// ([`StopReason::Reconfigured`]). A first failure flips health to `Degraded`; a
+/// recovered poll restores `Healthy`.
 fn run_until_lost(
     bus: &BusHandle,
     radio: &t::RadioId,
     handle: &RigHandle,
     last_health: &mut Option<t::HealthState>,
-) {
+    control: &RigControl,
+    start_gen: u64,
+) -> StopReason {
     let mut fails: u32 = 0;
     loop {
+        if control.generation() != start_gen {
+            return StopReason::Reconfigured;
+        }
         std::thread::sleep(POLL_INTERVAL);
         match handle.get_state() {
             Ok(s) => {
@@ -145,7 +166,7 @@ fn run_until_lost(
                 fails += 1;
                 tracing::warn!("rig poll failed ({fails}/{FAILS_BEFORE_RECONNECT}): {e}");
                 if fails >= FAILS_BEFORE_RECONNECT {
-                    return;
+                    return StopReason::LinkLost;
                 }
                 set_health(
                     bus,

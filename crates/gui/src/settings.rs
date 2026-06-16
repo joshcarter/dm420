@@ -28,6 +28,16 @@ use app_core::{CoreConfig, DecodeSource, LineProfile, Protocol, SerialConfig};
 /// Default rig baud when `DM420_SERIAL_BAUD` is unset or invalid.
 const DEFAULT_BAUD: u32 = 19_200;
 
+/// The subset of [`Settings`] the operator can edit live from the UI (the rig +
+/// audio hardware bindings). Held by `BusView` as the source of truth for the
+/// settings form, and pushed to the running producers on apply.
+#[derive(Clone)]
+pub struct HardwareConfig {
+    pub audio_input: Option<String>,
+    pub serial: SerialConfig,
+    pub protocol: Protocol,
+}
+
 /// Parsed startup configuration. Built once at launch by [`Settings::from_env`].
 pub struct Settings {
     /// Run the real producers (`DM420_REAL`) rather than the mocks.
@@ -58,6 +68,16 @@ impl Settings {
     /// Whether the real producers should drive the bus.
     pub fn is_real(&self) -> bool {
         self.real
+    }
+
+    /// The live-editable hardware bindings (rig + audio), as the UI first sees
+    /// them.
+    pub fn hardware(&self) -> HardwareConfig {
+        HardwareConfig {
+            audio_input: self.audio_input.clone(),
+            serial: self.serial.clone(),
+            protocol: self.protocol,
+        }
     }
 
     /// Build the `core` config for real mode: the configured rig, TX blocked, and
