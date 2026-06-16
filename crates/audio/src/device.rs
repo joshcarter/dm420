@@ -124,9 +124,12 @@ fn supports_kind(device: &cpal::Device, kind: DeviceKind) -> bool {
     }
 }
 
-/// Resolve a cpal input or output device by exact name (or the default when
-/// `name` is None). Name matches that lack the required capability are skipped,
-/// so a same-named output-only sibling can't shadow the input device.
+/// Resolve a cpal input or output device by name (or the default when `name` is
+/// None). Matching is forgiving so a config value need not be the device's exact
+/// OS string: an exact (case-insensitive) name wins, else the first
+/// case-insensitive substring match. Candidates that lack the required
+/// capability are skipped, so a same-named output-only sibling can't shadow the
+/// input device.
 pub(crate) fn open_cpal_device(
     kind: DeviceKind,
     name: Option<&str>,
@@ -134,24 +137,41 @@ pub(crate) fn open_cpal_device(
     let host = cpal::default_host();
     match name {
         Some(n) => {
+            let needle = n.to_lowercase();
             let mut name_matched = 0u32;
+            let mut substring: Option<cpal::Device> = None;
             for d in host
                 .devices()
                 .map_err(|e| AudioError::Device(e.to_string()))?
             {
-                if d.name().map(|dn| dn == n).unwrap_or(false) {
-                    name_matched += 1;
-                    if supports_kind(&d, kind) {
-                        return Ok(d);
-                    }
-                    debug!(name = %n, ?kind, "skipping same-named device without {kind:?} support");
+                let Some(dn) = d.name().ok() else { continue };
+                let dn_lc = dn.to_lowercase();
+                let exact = dn_lc == needle;
+                let contains = dn_lc.contains(&needle);
+                if !exact && !contains {
+                    continue;
+                }
+                name_matched += 1;
+                if !supports_kind(&d, kind) {
+                    debug!(name = %dn, ?kind, "skipping matched device without {kind:?} support");
+                    continue;
+                }
+                if exact {
+                    return Ok(d);
+                }
+                // Remember the first capable substring match; prefer an exact one
+                // if a later device provides it.
+                if substring.is_none() {
+                    substring = Some(d);
                 }
             }
-            Err(AudioError::Device(if name_matched > 0 {
-                format!("audio device '{n}' exists but has no {kind:?} streams")
-            } else {
-                format!("audio device '{n}' not found")
-            }))
+            substring.ok_or_else(|| {
+                AudioError::Device(if name_matched > 0 {
+                    format!("audio device matching '{n}' exists but has no {kind:?} streams")
+                } else {
+                    format!("audio device '{n}' not found")
+                })
+            })
         }
         None => match kind {
             DeviceKind::Input => host

@@ -17,6 +17,7 @@ mod chrome;
 mod geo_data;
 mod panel_data;
 mod panels;
+mod settings;
 mod theme;
 mod waterslide_panel;
 mod waterslide_sim;

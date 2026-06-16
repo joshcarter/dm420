@@ -14,6 +14,7 @@ use bus::types as t;
 use bus::{BusHandle, Topic};
 use modes::{Decode as ModeDecode, Protocol, decode};
 
+use crate::health;
 use crate::parse::parse_message;
 
 /// Decoder input rate (Joel's decoder is fixed at 12 kHz).
@@ -34,6 +35,17 @@ const SPECTRUM_MAX_HZ: f32 = 3000.0;
 /// Seconds between spectrogram columns (a column every 50 ms ≈ 20/s — well above
 /// the panel's pixel scroll rate, so the waterfall has no gaps).
 const SPECTRUM_HOP_S: f64 = 0.05;
+
+/// How long the capture can deliver no samples before we treat the device as
+/// gone and rebuild the stream. A live audio device delivers buffers
+/// continuously (silence is still frames), so a gap this long means it died or
+/// was unplugged. Generous enough to ride out device warm-up at session start.
+const AUDIO_SILENCE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Reconnect backoff for the capture stream: quick first retry (a momentary
+/// glitch recovers fast), capped so an absent device doesn't spin.
+const AUDIO_BACKOFF_START: Duration = Duration::from_secs(1);
+const AUDIO_BACKOFF_MAX: Duration = Duration::from_secs(15);
 
 fn now_ms() -> i64 {
     SystemTime::now()
@@ -175,90 +187,152 @@ pub fn spawn_wav(bus: &BusHandle, radio: t::RadioId, path: PathBuf, proto: Proto
 }
 
 /// Live cpal capture, one slot at a time, aligned to UTC slot boundaries.
+///
+/// Supervised: if the device is absent at startup or disappears mid-session, the
+/// capture stream is rebuilt with backoff and the fault is reported on
+/// `health/audio`, so decoding resumes when the device returns without taking the
+/// app down. Each session starts from a clean spectrogram/slot state.
 pub fn spawn_live(bus: &BusHandle, radio: t::RadioId, input: Option<String>, proto: Protocol) {
     let bus = bus.clone();
     std::thread::spawn(move || {
-        // One persistent capture stream feeds two consumers: a steady spectrogram
-        // column stream, and slot-aligned buffers for the decoder.
-        let stream = match audio::capture_stream(input) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!("decode live capture failed to start: {e}");
-                return;
-            }
-        };
-        let rate = stream.sample_rate;
-        let mut resampler = audio::Resampler::new(rate, DECODE_RATE);
-
-        let bin_hz = DECODE_RATE as f32 / FFT_SIZE as f32;
-        let max_bins = (SPECTRUM_MAX_HZ / bin_hz).ceil() as usize;
-        let hop = ((DECODE_RATE as f64) * SPECTRUM_HOP_S).max(1.0) as usize;
-
-        // Rolling FFT window (latest FFT_SIZE samples) + a hop counter.
-        let mut win: Vec<f32> = Vec::with_capacity(FFT_SIZE * 2);
-        let mut hop_acc: usize = 0;
-        // Audio for the slot currently in progress, plus the slot we're inside.
-        let mut slot_buf: Vec<f32> = Vec::new();
-        let mut slot_start = modes::current_slot_start(now_unix(), proto);
+        let mut last_health: Option<t::HealthState> = None;
+        let mut backoff = AUDIO_BACKOFF_START;
 
         loop {
-            let chunk = match stream.recv_timeout(Duration::from_millis(500)) {
-                Some(c) => c,
-                None => continue, // no audio this tick; the device may be warming up
-            };
-            // Resample the device's rate to the decoder's fixed 12 kHz.
-            let s12 = if rate == DECODE_RATE {
-                chunk
-            } else {
-                resampler.push(&chunk)
-            };
-            if s12.is_empty() {
-                continue;
-            }
-
-            // --- spectrogram columns: emit one every `hop` samples (~50 ms) ---
-            win.extend_from_slice(&s12);
-            if win.len() > FFT_SIZE {
-                let drop = win.len() - FFT_SIZE;
-                win.drain(0..drop);
-            }
-            hop_acc += s12.len();
-            if win.len() == FFT_SIZE && hop_acc >= hop {
-                hop_acc = 0;
-                publish_column(&bus, &radio, proto, &win, bin_hz, max_bins);
-            }
-
-            // --- slot-aligned decode: when wall-clock crosses a boundary, decode
-            // the slot that just ended (off-thread so it never stalls capture) ---
-            slot_buf.extend_from_slice(&s12);
-            let cur_slot = modes::current_slot_start(now_unix(), proto);
-            if cur_slot != slot_start {
-                // `slot_buf` holds the slot that just ended; stamp its decodes with
-                // that slot's *start* time (when its audio began arriving), so the
-                // text lands where its audio now sits on the scrolling spectrogram.
-                let slot_start_ms = (slot_start * 1000.0) as i64;
-                slot_start = cur_slot;
-                let audio = std::mem::take(&mut slot_buf);
-                let bus = bus.clone();
-                let radio = radio.clone();
-                std::thread::spawn(move || {
-                    let decs = decode(&audio, DECODE_RATE, proto);
-                    // Proof-of-life: real capture → real decoder → real bus publish.
-                    let summary: Vec<String> = decs
-                        .iter()
-                        .map(|d| format!("{} ({:+} dB)", d.message.trim(), d.snr_db.round() as i32))
-                        .collect();
-                    eprintln!(
-                        "[live decode] slot {} s of audio -> {} decode(s): {}",
-                        audio.len() / DECODE_RATE as usize,
-                        decs.len(),
-                        summary.join(", ")
+            match audio::capture_stream(input.clone()) {
+                Ok(stream) => {
+                    // A session runs until the device stops delivering samples.
+                    let was_healthy = run_stream(&bus, &radio, proto, &stream, &mut last_health);
+                    drop(stream);
+                    // A session that actually delivered audio earns a prompt retry;
+                    // one that never started keeps backing off.
+                    if was_healthy {
+                        backoff = AUDIO_BACKOFF_START;
+                    }
+                    set_audio_health(
+                        &bus,
+                        &mut last_health,
+                        t::HealthState::Down("audio capture stopped — reconnecting".into()),
                     );
-                    publish_slot(&bus, &radio, proto, slot_start_ms, decs);
-                });
+                }
+                Err(e) => {
+                    tracing::warn!("audio capture failed to start: {e}");
+                    set_audio_health(
+                        &bus,
+                        &mut last_health,
+                        t::HealthState::Down(format!("audio device unavailable: {e}")),
+                    );
+                }
             }
+
+            std::thread::sleep(backoff);
+            backoff = (backoff * 2).min(AUDIO_BACKOFF_MAX);
         }
     });
+}
+
+/// Publish an audio health transition (deduplicated; see [`health::set`]).
+fn set_audio_health(bus: &BusHandle, last: &mut Option<t::HealthState>, state: t::HealthState) {
+    health::set(bus, t::SubsystemId::Audio, last, state);
+}
+
+/// Run one capture session: pump samples into the spectrogram + slot decoder
+/// until the device delivers nothing for [`AUDIO_SILENCE_TIMEOUT`]. Returns
+/// whether the device was ever healthy (delivered audio), so the supervisor can
+/// pick the right backoff. All per-session state is local, so a reconnect starts
+/// the spectrogram and slot alignment fresh.
+fn run_stream(
+    bus: &BusHandle,
+    radio: &t::RadioId,
+    proto: Protocol,
+    stream: &audio::CaptureStream,
+    last_health: &mut Option<t::HealthState>,
+) -> bool {
+    let rate = stream.sample_rate;
+    let mut resampler = audio::Resampler::new(rate, DECODE_RATE);
+
+    let bin_hz = DECODE_RATE as f32 / FFT_SIZE as f32;
+    let max_bins = (SPECTRUM_MAX_HZ / bin_hz).ceil() as usize;
+    let hop = ((DECODE_RATE as f64) * SPECTRUM_HOP_S).max(1.0) as usize;
+
+    // Rolling FFT window (latest FFT_SIZE samples) + a hop counter.
+    let mut win: Vec<f32> = Vec::with_capacity(FFT_SIZE * 2);
+    let mut hop_acc: usize = 0;
+    // Audio for the slot currently in progress, plus the slot we're inside.
+    let mut slot_buf: Vec<f32> = Vec::new();
+    let mut slot_start = modes::current_slot_start(now_unix(), proto);
+
+    let mut ever_healthy = false;
+    let mut silent_for = Duration::ZERO;
+    let tick = Duration::from_millis(500);
+
+    loop {
+        let chunk = match stream.recv_timeout(tick) {
+            Some(c) => c,
+            None => {
+                // No audio this tick. A live device always delivers buffers, so a
+                // long gap means it's gone — end the session so we reconnect.
+                silent_for += tick;
+                if silent_for >= AUDIO_SILENCE_TIMEOUT {
+                    tracing::warn!(
+                        "audio: no samples for {:?}; treating device as lost",
+                        AUDIO_SILENCE_TIMEOUT
+                    );
+                    return ever_healthy;
+                }
+                continue;
+            }
+        };
+        silent_for = Duration::ZERO;
+        ever_healthy = true;
+        set_audio_health(bus, last_health, t::HealthState::Healthy);
+
+        // Resample the device's rate to the decoder's fixed 12 kHz.
+        let s12 = if rate == DECODE_RATE {
+            chunk
+        } else {
+            resampler.push(&chunk)
+        };
+        if s12.is_empty() {
+            continue;
+        }
+
+        // --- spectrogram columns: emit one every `hop` samples (~50 ms) ---
+        win.extend_from_slice(&s12);
+        if win.len() > FFT_SIZE {
+            let drop = win.len() - FFT_SIZE;
+            win.drain(0..drop);
+        }
+        hop_acc += s12.len();
+        if win.len() == FFT_SIZE && hop_acc >= hop {
+            hop_acc = 0;
+            publish_column(bus, radio, proto, &win, bin_hz, max_bins);
+        }
+
+        // --- slot-aligned decode: when wall-clock crosses a boundary, decode
+        // the slot that just ended (off-thread so it never stalls capture) ---
+        slot_buf.extend_from_slice(&s12);
+        let cur_slot = modes::current_slot_start(now_unix(), proto);
+        if cur_slot != slot_start {
+            // `slot_buf` holds the slot that just ended; stamp its decodes with
+            // that slot's *start* time (when its audio began arriving), so the
+            // text lands where its audio now sits on the scrolling spectrogram.
+            let slot_start_ms = (slot_start * 1000.0) as i64;
+            slot_start = cur_slot;
+            let audio = std::mem::take(&mut slot_buf);
+            let bus = bus.clone();
+            let radio = radio.clone();
+            std::thread::spawn(move || {
+                let decs = decode(&audio, DECODE_RATE, proto);
+                tracing::debug!(
+                    "live decode: {} s of audio -> {} decode(s)",
+                    audio.len() / DECODE_RATE as usize,
+                    decs.len()
+                );
+                publish_slot(&bus, &radio, proto, slot_start_ms, decs);
+            });
+        }
+    }
 }
 
 #[cfg(test)]

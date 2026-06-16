@@ -23,12 +23,14 @@ use bus::BusHandle;
 use bus::types::RadioId;
 
 mod decode;
+mod health;
 mod map;
 mod parse;
 mod rig_adapter;
 
 pub use modes::Protocol;
 pub use parse::parse_message;
+pub use rig::LineProfile;
 pub use rig_adapter::CommandResult;
 
 /// The default radio id. Matches `mocks::radio_id()` so the GUI's existing topic
@@ -56,12 +58,39 @@ pub enum DecodeSource {
     None,
 }
 
+/// How to reach the rig over CAT (Kenwood serial). An explicit `port` is opened
+/// first; with `autodetect` set, a failed/absent port falls back to sweeping the
+/// likely-radio ports × standard bauds to find the radio. `baud`/`profile` are
+/// the manual hints used when not autodetecting.
+#[derive(Clone, Debug)]
+pub struct SerialConfig {
+    /// Device path, e.g. `"/dev/cu.usbserial-120"`. `None` ⇒ autodetect only.
+    pub port: Option<String>,
+    pub baud: u32,
+    pub profile: LineProfile,
+    /// Sweep ports/bauds to find the radio when `port` is unset or fails to open.
+    pub autodetect: bool,
+}
+
+impl Default for SerialConfig {
+    fn default() -> Self {
+        Self {
+            port: None,
+            baud: 19_200,
+            profile: LineProfile::Default,
+            autodetect: true,
+        }
+    }
+}
+
 /// Configuration for [`spawn`].
 pub struct CoreConfig {
     pub radio: RadioId,
     /// Forwarded to Joel's rig actor; `false` hard-blocks TX (the default).
     pub allow_transmit: bool,
     pub decode: DecodeSource,
+    /// How to reach the rig. `None` ⇒ no rig producer (mock/headless).
+    pub serial: Option<SerialConfig>,
 }
 
 impl Default for CoreConfig {
@@ -70,6 +99,7 @@ impl Default for CoreConfig {
             radio: radio_id(),
             allow_transmit: false,
             decode: DecodeSource::None,
+            serial: None,
         }
     }
 }
@@ -83,9 +113,15 @@ pub fn spawn(bus: &BusHandle, cfg: CoreConfig) {
         radio,
         allow_transmit,
         decode,
+        serial,
     } = cfg;
 
-    rig_adapter::spawn(bus, radio.clone(), allow_transmit);
+    // The rig producer is optional: with no serial config there's simply no rig
+    // on the bus (the GUI shows it as down). A present config never panics —
+    // `rig_adapter` supervises the connection and reports health.
+    if let Some(serial) = serial {
+        rig_adapter::spawn(bus, radio.clone(), allow_transmit, serial);
+    }
 
     match decode {
         DecodeSource::Wav {
