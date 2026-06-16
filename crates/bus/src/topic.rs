@@ -3,7 +3,7 @@
 //! network layer; `TopicKind` is the same set without the scope id, used for
 //! wildcard subscription.
 
-use types::{RadioId, StationId};
+use types::{RadioId, StationId, SubsystemId};
 
 use crate::error::BusError;
 
@@ -48,6 +48,7 @@ pub enum Topic {
     ScannerCandidates,
     ClockStatus,
     StationSnapshot(StationId),
+    Health(SubsystemId),
 }
 
 /// The topic set without scope ids — the unit of wildcard subscription.
@@ -72,6 +73,7 @@ pub enum TopicKind {
     ScannerCandidates,
     ClockStatus,
     StationSnapshot,
+    Health,
 }
 
 /// What to subscribe to: one exact topic, or every scope id of a kind (including
@@ -105,6 +107,7 @@ impl Topic {
             Topic::ScannerCandidates => "scanner/candidates".to_string(),
             Topic::ClockStatus => "clock/status".to_string(),
             Topic::StationSnapshot(sid) => format!("station/{}/snapshot", sid.0),
+            Topic::Health(id) => format!("health/{}", id.as_str()),
         }
     }
 
@@ -131,6 +134,10 @@ impl Topic {
             ["scanner", "candidates"] => Topic::ScannerCandidates,
             ["clock", "status"] => Topic::ClockStatus,
             ["station", sid, "snapshot"] => Topic::StationSnapshot(StationId(sid.to_string())),
+            ["health", id] => {
+                let sid = SubsystemId::parse(id).ok_or_else(|| BusError::BadTopic(s.to_string()))?;
+                Topic::Health(sid)
+            }
             _ => return Err(BusError::BadTopic(s.to_string())),
         };
         Ok(topic)
@@ -158,6 +165,7 @@ impl Topic {
             Topic::ScannerCandidates => TopicKind::ScannerCandidates,
             Topic::ClockStatus => TopicKind::ClockStatus,
             Topic::StationSnapshot(_) => TopicKind::StationSnapshot,
+            Topic::Health(_) => TopicKind::Health,
         }
     }
 
@@ -186,6 +194,7 @@ impl TopicKind {
             TopicKind::ScannerCandidates => State,
             TopicKind::ClockStatus => State,
             TopicKind::StationSnapshot => State,
+            TopicKind::Health => State,
             TopicKind::RigCommand => Command,
             TopicKind::SessionCommand => Command,
             TopicKind::AudioTx => Command,
@@ -225,6 +234,8 @@ mod tests {
             (Topic::ScannerCandidates, DeliveryClass::State),
             (Topic::ClockStatus, DeliveryClass::State),
             (Topic::StationSnapshot(StationId("s1".into())), DeliveryClass::State),
+            (Topic::Health(SubsystemId::Rig), DeliveryClass::State),
+            (Topic::Health(SubsystemId::Audio), DeliveryClass::State),
         ];
         for (topic, class) in cases {
             let s = topic.canonical();

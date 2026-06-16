@@ -537,6 +537,81 @@ pub enum InterlockError {
 }
 
 // =====================================================================
+// §12  Subsystem health
+// =====================================================================
+//
+// Hardware-backed producers (rig, audio capture) report their liveness here so
+// the UI can surface a fault where live data would otherwise be — and so a
+// missing or disconnected device degrades gracefully instead of taking the app
+// down. Each subsystem owns one `health/{id}` State topic (latest-wins).
+
+/// A hardware-backed subsystem whose liveness the UI surfaces. One `health/{id}`
+/// topic per variant. The decode pipeline rides under [`SubsystemId::Audio`],
+/// since its health is the capture device's health.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SubsystemId {
+    Rig,
+    Audio,
+}
+
+impl SubsystemId {
+    /// The canonical topic-path segment, e.g. `"rig"`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SubsystemId::Rig => "rig",
+            SubsystemId::Audio => "audio",
+        }
+    }
+
+    /// Inverse of [`SubsystemId::as_str`].
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "rig" => Some(SubsystemId::Rig),
+            "audio" => Some(SubsystemId::Audio),
+            _ => None,
+        }
+    }
+}
+
+/// A subsystem's current liveness. `Degraded`/`Down` carry a short human reason
+/// for the UI to show (e.g. `"device 'USB PnP' not found"`).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum HealthState {
+    /// Connected and delivering data.
+    Healthy,
+    /// Running, but impaired (e.g. reconnecting, or a soft fault). The reason is
+    /// shown to the operator.
+    Degraded(String),
+    /// Not delivering data (device missing, open failed, disconnected). The
+    /// producer keeps retrying; the reason is shown to the operator.
+    Down(String),
+}
+
+/// `health/{id}` (State) — a subsystem's liveness for the UI's fault display.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SubsystemHealth {
+    pub id: SubsystemId,
+    pub state: HealthState,
+    /// When this state began (UTC ms). Lets the UI show "down for 12s".
+    pub since: Timestamp,
+}
+
+impl SubsystemHealth {
+    /// True when the subsystem is not delivering data (`Down` or `Degraded`).
+    pub fn is_faulted(&self) -> bool {
+        !matches!(self.state, HealthState::Healthy)
+    }
+
+    /// The operator-facing reason, if the subsystem is faulted.
+    pub fn reason(&self) -> Option<&str> {
+        match &self.state {
+            HealthState::Healthy => None,
+            HealthState::Degraded(m) | HealthState::Down(m) => Some(m.as_str()),
+        }
+    }
+}
+
+// =====================================================================
 // Tests — acceptance criterion #1: serde round-trip for every payload type.
 // =====================================================================
 
@@ -823,5 +898,24 @@ mod tests {
         ] {
             round_trip(e);
         }
+    }
+
+    #[test]
+    fn subsystem_health_round_trip() {
+        for id in [SubsystemId::Rig, SubsystemId::Audio] {
+            assert_eq!(SubsystemId::parse(id.as_str()), Some(id));
+            for state in [
+                HealthState::Healthy,
+                HealthState::Degraded("reconnecting".into()),
+                HealthState::Down("device not found".into()),
+            ] {
+                round_trip(SubsystemHealth {
+                    id,
+                    state,
+                    since: Timestamp(1_700_000_000_000),
+                });
+            }
+        }
+        assert_eq!(SubsystemId::parse("bogus"), None);
     }
 }
