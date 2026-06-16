@@ -56,6 +56,15 @@ pub fn spawn(bus: &BusHandle) {
     tokio::spawn(run_scanner(bus.clone()));
 }
 
+/// Launch only the producers the real `core` adapter does not yet cover (clock,
+/// logbook, scanner). Use this alongside `core::spawn` so the real rig/decode
+/// producers own their topics without a second writer fighting them.
+pub fn spawn_support(bus: &BusHandle) {
+    tokio::spawn(run_clock(bus.clone()));
+    tokio::spawn(run_logbook(bus.clone()));
+    tokio::spawn(run_scanner(bus.clone()));
+}
+
 // --------------------------------------------------------------------- rig
 
 fn publish_rig_state(bus: &BusHandle) {

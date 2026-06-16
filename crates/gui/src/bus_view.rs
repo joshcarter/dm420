@@ -19,6 +19,48 @@ use std::sync::{Arc, Mutex};
 use bus::types::*;
 use bus::{BusError, BusHandle, BusMessage, Topic, TopicSelector};
 
+/// Default location of the bundled FT8 sample recording, relative to the repo
+/// root (where `cargo run` is invoked). Overridable with `DM420_WAV`.
+const DEFAULT_SAMPLE_WAV: &str = "sample_data/ft8/rec_20260614_015943Z.wav";
+
+/// Whether to run the real rig/decode producers (`DM420_REAL=1`) instead of the
+/// mocks. Defaults to mocks so the GUI always runs with no hardware or sample
+/// data present.
+fn real_mode() -> bool {
+    std::env::var("DM420_REAL")
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false)
+}
+
+/// Resolve the WAV recording to feed the decode pipeline: `DM420_WAV` if set,
+/// else the bundled sample if it exists.
+fn sample_wav() -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("DM420_WAV") {
+        let p = std::path::PathBuf::from(p);
+        return p.exists().then_some(p);
+    }
+    let p = std::path::PathBuf::from(DEFAULT_SAMPLE_WAV);
+    p.exists().then_some(p)
+}
+
+/// Build the `core` config for real mode: mock rig (TX blocked) plus a looping
+/// decode of the sample recording when one is available.
+fn real_core_config() -> app_core::CoreConfig {
+    let decode = match sample_wav() {
+        Some(path) => app_core::DecodeSource::Wav {
+            path,
+            protocol: app_core::Protocol::Ft8,
+            looping: true,
+        },
+        None => app_core::DecodeSource::None,
+    };
+    app_core::CoreConfig {
+        radio: mocks::radio_id(),
+        allow_transmit: false,
+        decode,
+    }
+}
+
 /// A latest-value cell for a `State` topic. The pump overwrites; the GUI reads.
 type Cell<T> = Arc<Mutex<Option<T>>>;
 
@@ -99,10 +141,17 @@ impl BusView {
         let logs = Ring::new(512);
         let decodes = Ring::new(64);
 
-        // `tokio::spawn` (used by the mocks and the pump helpers) needs an active
-        // runtime context; hold the guard while we wire everything up.
+        // `tokio::spawn` (used by the producers and the pump helpers) needs an
+        // active runtime context; hold the guard while we wire everything up.
         let _guard = rt.enter();
-        mocks::spawn(&bus);
+        if real_mode() {
+            // Real rig + decode producers; mocks still drive the topics `core`
+            // doesn't cover yet (clock, logbook, scanner).
+            app_core::spawn(&bus, real_core_config());
+            mocks::spawn_support(&bus);
+        } else {
+            mocks::spawn(&bus);
+        }
 
         pump_state(
             &bus,

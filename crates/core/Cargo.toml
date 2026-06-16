@@ -2,10 +2,21 @@
 name = "core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "Radio-agnostic app core: clock/scheduler, interlock granter, decode enrichment, and app-state composition over the bus."
+description = "Radio-agnostic app core: bus adapters wiring the vendored rig/audio/modes producers onto the message bus (rig control + FT8/FT4 decode)."
 
 [dependencies]
 bus.workspace = true
 types.workspace = true
+rig.workspace = true
+audio.workspace = true
+modes.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

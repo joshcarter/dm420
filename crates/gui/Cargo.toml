@@ -28,3 +28,7 @@ types.workspace = true
 # it until the real rig/dsp/scanner/logbook crates take over.
 tokio.workspace = true
 mocks.workspace = true
+
+# The real rig/decode producers (vendored Joel + bus adapters). Renamed to avoid
+# shadowing the std `core` crate. Enabled at runtime via `DM420_REAL=1`.
+app_core = { package = "core", path = "../core" }
