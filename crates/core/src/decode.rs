@@ -23,6 +23,18 @@ const DECODE_RATE: u32 = 12_000;
 /// emitted on this cadence so the GUI's decode rail populates promptly.
 const REPLAY_INTERVAL: Duration = Duration::from_millis(1500);
 
+/// Headroom left at the end of each slot for live capture. The FT8/FT4
+/// transmission ends well before the slot boundary, so we capture `slot − this`
+/// and use the remainder to re-align to the *next* boundary. Without it, a
+/// full-slot capture overruns the boundary and only every other slot is grabbed.
+/// Spectrum (waterfall) parameters. At 12 kHz a 1024-pt FFT gives ~11.7 Hz bins;
+/// we keep the bins spanning ~0..3000 Hz to match the panel's audio-offset axis.
+const FFT_SIZE: usize = 1024;
+const SPECTRUM_MAX_HZ: f32 = 3000.0;
+/// Seconds between spectrogram columns (a column every 50 ms ≈ 20/s — well above
+/// the panel's pixel scroll rate, so the waterfall has no gaps).
+const SPECTRUM_HOP_S: f64 = 0.05;
+
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -72,10 +84,40 @@ fn load_slots(path: &Path, proto: Protocol) -> Result<Vec<Vec<f32>>, audio::Audi
         .collect())
 }
 
+/// Build and publish one scrolling-spectrogram column (a single-window FFT over
+/// the latest `FFT_SIZE` samples of `win`) onto the spectrum topic.
+fn publish_column(
+    bus: &BusHandle,
+    radio: &t::RadioId,
+    proto: Protocol,
+    win: &[f32],
+    bin_hz: f32,
+    max_bins: usize,
+) {
+    let row = t::SpectrumRow {
+        radio: radio.clone(),
+        mode: over_air(proto),
+        t: t::Timestamp(now_ms()),
+        bin0_offset: t::OffsetHz(0.0),
+        bin_hz,
+        mags: dsp::spectrum_column(win, FFT_SIZE, max_bins),
+        source: t::SignalSource::Received,
+    };
+    let _ = bus.publish(&Topic::Spectrum(radio.clone()), row);
+}
+
 /// Build dm420 `Decode`s from one slot's `modes::decode` output and publish them
-/// on the lossless decodes stream.
-fn publish_slot(bus: &BusHandle, radio: &t::RadioId, proto: Protocol, decs: Vec<ModeDecode>) {
-    let ms = now_ms();
+/// on the lossless decodes stream. `slot_start_ms` is when the slot's audio *began*
+/// arriving (not when decoding finished), so the GUI can place each decode at the
+/// horizontal position matching where its audio sits on the live spectrogram.
+fn publish_slot(
+    bus: &BusHandle,
+    radio: &t::RadioId,
+    proto: Protocol,
+    slot_start_ms: i64,
+    decs: Vec<ModeDecode>,
+) {
+    let ms = slot_start_ms;
     let slot_ms = (modes::slot_period(proto) * 1000.0) as i64;
     let slot = t::SlotId(ms.div_euclid(slot_ms.max(1)) as u64);
     let mode = over_air(proto);
@@ -123,7 +165,7 @@ pub fn spawn_wav(bus: &BusHandle, radio: t::RadioId, path: PathBuf, proto: Proto
                 let decs = tokio::task::spawn_blocking(move || decode(&samples, DECODE_RATE, proto))
                     .await
                     .unwrap_or_default();
-                publish_slot(&bus, &radio, proto, decs);
+                publish_slot(&bus, &radio, proto, now_ms(), decs);
             }
             if !looping {
                 break;
@@ -136,21 +178,84 @@ pub fn spawn_wav(bus: &BusHandle, radio: t::RadioId, path: PathBuf, proto: Proto
 pub fn spawn_live(bus: &BusHandle, radio: t::RadioId, input: Option<String>, proto: Protocol) {
     let bus = bus.clone();
     std::thread::spawn(move || {
-        let slot_dur = Duration::from_secs_f64(modes::slot_period(proto));
+        // One persistent capture stream feeds two consumers: a steady spectrogram
+        // column stream, and slot-aligned buffers for the decoder.
+        let stream = match audio::capture_stream(input) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("decode live capture failed to start: {e}");
+                return;
+            }
+        };
+        let rate = stream.sample_rate;
+        let mut resampler = audio::Resampler::new(rate, DECODE_RATE);
+
+        let bin_hz = DECODE_RATE as f32 / FFT_SIZE as f32;
+        let max_bins = (SPECTRUM_MAX_HZ / bin_hz).ceil() as usize;
+        let hop = ((DECODE_RATE as f64) * SPECTRUM_HOP_S).max(1.0) as usize;
+
+        // Rolling FFT window (latest FFT_SIZE samples) + a hop counter.
+        let mut win: Vec<f32> = Vec::with_capacity(FFT_SIZE * 2);
+        let mut hop_acc: usize = 0;
+        // Audio for the slot currently in progress, plus the slot we're inside.
+        let mut slot_buf: Vec<f32> = Vec::new();
+        let mut slot_start = modes::current_slot_start(now_unix(), proto);
+
         loop {
-            // Sleep to just past the next slot boundary, then capture a full slot.
-            let wait = modes::seconds_until_next_slot(now_unix(), proto);
-            std::thread::sleep(Duration::from_secs_f64(wait));
-            match audio::capture_window(input.clone(), slot_dur) {
-                Ok((samples, rate)) => {
-                    let mono12 = resample_to_12k(samples, rate);
-                    let decs = decode(&mono12, DECODE_RATE, proto);
-                    publish_slot(&bus, &radio, proto, decs);
-                }
-                Err(e) => {
-                    tracing::error!("decode live capture failed: {e}");
-                    std::thread::sleep(Duration::from_secs(1));
-                }
+            let chunk = match stream.recv_timeout(Duration::from_millis(500)) {
+                Some(c) => c,
+                None => continue, // no audio this tick; the device may be warming up
+            };
+            // Resample the device's rate to the decoder's fixed 12 kHz.
+            let s12 = if rate == DECODE_RATE {
+                chunk
+            } else {
+                resampler.push(&chunk)
+            };
+            if s12.is_empty() {
+                continue;
+            }
+
+            // --- spectrogram columns: emit one every `hop` samples (~50 ms) ---
+            win.extend_from_slice(&s12);
+            if win.len() > FFT_SIZE {
+                let drop = win.len() - FFT_SIZE;
+                win.drain(0..drop);
+            }
+            hop_acc += s12.len();
+            if win.len() == FFT_SIZE && hop_acc >= hop {
+                hop_acc = 0;
+                publish_column(&bus, &radio, proto, &win, bin_hz, max_bins);
+            }
+
+            // --- slot-aligned decode: when wall-clock crosses a boundary, decode
+            // the slot that just ended (off-thread so it never stalls capture) ---
+            slot_buf.extend_from_slice(&s12);
+            let cur_slot = modes::current_slot_start(now_unix(), proto);
+            if cur_slot != slot_start {
+                // `slot_buf` holds the slot that just ended; stamp its decodes with
+                // that slot's *start* time (when its audio began arriving), so the
+                // text lands where its audio now sits on the scrolling spectrogram.
+                let slot_start_ms = (slot_start * 1000.0) as i64;
+                slot_start = cur_slot;
+                let audio = std::mem::take(&mut slot_buf);
+                let bus = bus.clone();
+                let radio = radio.clone();
+                std::thread::spawn(move || {
+                    let decs = decode(&audio, DECODE_RATE, proto);
+                    // Proof-of-life: real capture → real decoder → real bus publish.
+                    let summary: Vec<String> = decs
+                        .iter()
+                        .map(|d| format!("{} ({:+} dB)", d.message.trim(), d.snr_db.round() as i32))
+                        .collect();
+                    eprintln!(
+                        "[live decode] slot {} s of audio -> {} decode(s): {}",
+                        audio.len() / DECODE_RATE as usize,
+                        decs.len(),
+                        summary.join(", ")
+                    );
+                    publish_slot(&bus, &radio, proto, slot_start_ms, decs);
+                });
             }
         }
     });

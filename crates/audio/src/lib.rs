@@ -23,7 +23,10 @@ pub use device::{list_devices, preferred_input, select, DeviceInfo, DeviceKind};
 pub use dsp::{dbfs, level_bar, Resampler};
 pub use meta::{default_recording_path, RadioSnapshot, RecordingMeta};
 pub use player::{load_wav_mono, play, Playback};
-pub use recorder::{capture_window, measure_level, LevelMeasurement, Recorder, RecordingSummary};
+pub use recorder::{
+    capture_stream, capture_window, measure_level, CaptureStream, LevelMeasurement, Recorder,
+    RecordingSummary,
+};
 
 /// Errors from audio operations.
 #[derive(Debug, thiserror::Error)]

@@ -32,15 +32,15 @@ impl BusMessage for CommandResult {
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 pub fn spawn(bus: &BusHandle, radio: t::RadioId, allow_transmit: bool) {
-    // The in-memory mock radio — swap for `rig::open_serial(..)` behind config to
-    // drive real hardware. The JoinHandle is detached; cloned handles keep the
-    // actor thread alive.
-    let (handle, _join) = rig::spawn(Box::new(rig::mock_rig()), allow_transmit);
-
-    // Seed the mock so the readout shows a sensible FT8 watering hole rather than
-    // the cold-start default.
-    let _ = handle.set_freq(Vfo::A, 14_074_000);
-    let _ = handle.set_mode(rig::Mode::Usb);
+    // Real Kenwood over CAT. If the rig stays silent, the baud is the usual
+    // culprit: set BAUD to your radio's COM-speed menu value (one of
+    // 115200/57600/38400/19200/9600/4800), then try `LineProfile::AssertDtrRts`.
+    // The JoinHandle is detached; cloned handles keep the actor thread alive.
+    const PORT: &str = "/dev/cu.usbserial-120";
+    const BAUD: u32 = 19_200;
+    let rig_dev = rig::open_serial(PORT, BAUD, rig::LineProfile::Default)
+        .unwrap_or_else(|e| panic!("open Kenwood on {PORT} @ {BAUD} baud: {e}"));
+    let (handle, _join) = rig::spawn(Box::new(rig_dev), allow_transmit);
 
     publish_state(bus, &radio, &handle);
     spawn_poller(bus.clone(), radio.clone(), handle.clone());

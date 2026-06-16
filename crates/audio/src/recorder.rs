@@ -339,6 +339,85 @@ fn build_input_stream(
     Ok(stream)
 }
 
+/// A live capture session delivering mono f32 chunks continuously until dropped.
+/// Unlike [`capture_window`], the device stays open for the session's life, so
+/// there are no per-call setup gaps — used for the real-time spectrogram + slot
+/// decode, which need an unbroken sample stream.
+pub struct CaptureStream {
+    pub sample_rate: u32,
+    rx: Receiver<Vec<f32>>,
+    stop_tx: Sender<()>,
+    capture_join: Option<JoinHandle<()>>,
+    drain_join: Option<JoinHandle<()>>,
+}
+
+impl CaptureStream {
+    /// Block up to `timeout` for the next mono chunk; `None` on timeout/disconnect.
+    pub fn recv_timeout(&self, timeout: std::time::Duration) -> Option<Vec<f32>> {
+        self.rx.recv_timeout(timeout).ok()
+    }
+}
+
+impl Drop for CaptureStream {
+    fn drop(&mut self) {
+        let _ = self.stop_tx.send(());
+        if let Some(j) = self.capture_join.take() {
+            let _ = j.join();
+        }
+        if let Some(j) = self.drain_join.take() {
+            let _ = j.join();
+        }
+    }
+}
+
+/// Open a continuous capture stream from `input_name` (None = preferred input).
+/// A drain thread downmixes each interleaved chunk to mono and forwards it; the
+/// caller polls [`CaptureStream::recv_timeout`].
+pub fn capture_stream(input_name: Option<String>) -> Result<CaptureStream, AudioError> {
+    let (stop_tx, stop_rx) = bounded::<()>(1);
+    let (sample_tx, sample_rx) = unbounded::<Chunk>();
+    let (ready_tx, ready_rx) = bounded(1);
+
+    let capture_join = std::thread::Builder::new()
+        .name("audio-capture-stream".into())
+        .spawn(move || capture_thread(input_name, sample_tx, stop_rx, ready_tx))
+        .expect("spawn audio-capture-stream");
+
+    let (_name, rate, channels) = match ready_rx.recv() {
+        Ok(Ok(cfg)) => cfg,
+        Ok(Err(e)) => {
+            let _ = capture_join.join();
+            return Err(e);
+        }
+        Err(_) => return Err(AudioError::Stream("capture stream died on startup".into())),
+    };
+
+    let (mono_tx, mono_rx) = unbounded::<Vec<f32>>();
+    let drain_join = std::thread::Builder::new()
+        .name("audio-stream-drain".into())
+        .spawn(move || {
+            for msg in sample_rx.iter() {
+                match msg {
+                    Chunk::Samples(s) => {
+                        if mono_tx.send(dsp::downmix_to_mono(&s, channels)).is_err() {
+                            break; // consumer gone
+                        }
+                    }
+                    Chunk::End => break,
+                }
+            }
+        })
+        .expect("spawn audio-stream-drain");
+
+    Ok(CaptureStream {
+        sample_rate: rate,
+        rx: mono_rx,
+        stop_tx,
+        capture_join: Some(capture_join),
+        drain_join: Some(drain_join),
+    })
+}
+
 /// One-shot level measurement: capture `duration` from the input and return
 /// (peak, rms, sample_rate). Used by the `level` command when not recording.
 /// Result of a one-shot level measurement.

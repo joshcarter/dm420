@@ -21,6 +21,8 @@ use bus::{BusError, BusHandle, BusMessage, Topic, TopicSelector};
 
 /// Default location of the bundled FT8 sample recording, relative to the repo
 /// root (where `cargo run` is invoked). Overridable with `DM420_WAV`.
+/// Unused while real mode runs live audio; kept for WAV-replay fallback.
+#[allow(dead_code)]
 const DEFAULT_SAMPLE_WAV: &str = "sample_data/ft8/rec_20260614_015943Z.wav";
 
 /// Whether to run the real rig/decode producers (`DM420_REAL=1`) instead of the
@@ -34,6 +36,7 @@ fn real_mode() -> bool {
 
 /// Resolve the WAV recording to feed the decode pipeline: `DM420_WAV` if set,
 /// else the bundled sample if it exists.
+#[allow(dead_code)]
 fn sample_wav() -> Option<std::path::PathBuf> {
     if let Ok(p) = std::env::var("DM420_WAV") {
         let p = std::path::PathBuf::from(p);
@@ -46,18 +49,13 @@ fn sample_wav() -> Option<std::path::PathBuf> {
 /// Build the `core` config for real mode: mock rig (TX blocked) plus a looping
 /// decode of the sample recording when one is available.
 fn real_core_config() -> app_core::CoreConfig {
-    let decode = match sample_wav() {
-        Some(path) => app_core::DecodeSource::Wav {
-            path,
-            protocol: app_core::Protocol::Ft8,
-            looping: true,
-        },
-        None => app_core::DecodeSource::None,
-    };
     app_core::CoreConfig {
         radio: mocks::radio_id(),
         allow_transmit: false,
-        decode,
+        decode: app_core::DecodeSource::Live {
+            input: Some("USB PnP Sound Device".into()),
+            protocol: app_core::Protocol::Ft8,
+        },
     }
 }
 
@@ -104,6 +102,8 @@ impl<T: Clone> Ring<T> {
 /// and pumps.
 pub struct BusView {
     rig: Cell<RigState>,
+    /// Latest waterfall column (real decoder only; published once per slot).
+    spectrum: Cell<SpectrumRow>,
     // `scanner`/`clock` are pumped and exposed now; their panel consumers (idle
     // scan status, slot clock in the top bar) land in the next wiring pass.
     #[allow(dead_code)]
@@ -113,6 +113,11 @@ pub struct BusView {
     bands: Arc<Mutex<HashMap<Band, BandActivity>>>,
     logs: Ring<LogEntry>,
     decodes: Ring<Decode>,
+
+    /// Whether real producers (`DM420_REAL=1`) are driving the bus. Panels use
+    /// this to avoid presenting mock-only visuals (e.g. the simulated FFT) as if
+    /// they were live radio data.
+    real: bool,
 
     /// The bus, kept for issuing commands later (TX, tuning, scanner control).
     #[allow(dead_code)]
@@ -135,6 +140,7 @@ impl BusView {
         let bus = BusHandle::new();
 
         let rig = cell();
+        let spectrum = cell();
         let scanner = cell();
         let clock = cell();
         let bands: Arc<Mutex<HashMap<Band, BandActivity>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -143,10 +149,13 @@ impl BusView {
 
         // `tokio::spawn` (used by the producers and the pump helpers) needs an
         // active runtime context; hold the guard while we wire everything up.
+        let real = real_mode();
         let _guard = rt.enter();
-        if real_mode() {
+        if real {
             // Real rig + decode producers; mocks still drive the topics `core`
-            // doesn't cover yet (clock, logbook, scanner).
+            // doesn't cover yet (clock, logbook, scanner). Note: decodes are NOT
+            // among them — `spawn_support` deliberately omits `run_decodes`, so the
+            // decode stream is the real decoder's alone.
             app_core::spawn(&bus, real_core_config());
             mocks::spawn_support(&bus);
         } else {
@@ -157,6 +166,12 @@ impl BusView {
             &bus,
             Topic::RigState(mocks::radio_id()),
             rig.clone(),
+            egui_ctx.clone(),
+        );
+        pump_state(
+            &bus,
+            Topic::Spectrum(mocks::radio_id()),
+            spectrum.clone(),
             egui_ctx.clone(),
         );
         pump_state(&bus, Topic::ScannerState, scanner.clone(), egui_ctx.clone());
@@ -178,14 +193,21 @@ impl BusView {
 
         Self {
             rig,
+            spectrum,
             scanner,
             clock,
             bands,
             logs,
             decodes,
+            real,
             bus,
             _rt: rt,
         }
+    }
+
+    /// True when real producers (`DM420_REAL=1`) are driving the bus.
+    pub fn is_real(&self) -> bool {
+        self.real
     }
 
     // ----------------------------------------------------------------- reads
@@ -193,6 +215,11 @@ impl BusView {
     /// The current rig state (frequency, mode, PTT, meters), if seen yet.
     pub fn rig_state(&self) -> Option<RigState> {
         self.rig.lock().unwrap().clone()
+    }
+
+    /// The latest waterfall spectrum column, if one has arrived (real mode only).
+    pub fn spectrum(&self) -> Option<SpectrumRow> {
+        self.spectrum.lock().unwrap().clone()
     }
 
     /// The current scanner status, if seen yet. (Consumer lands next pass.)

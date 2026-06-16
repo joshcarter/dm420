@@ -773,6 +773,7 @@ version = "0.1.0"
 dependencies = [
  "audio",
  "bus",
+ "dsp",
  "modes",
  "rig",
  "serde",
