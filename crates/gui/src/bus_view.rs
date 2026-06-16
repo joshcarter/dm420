@@ -73,6 +73,9 @@ pub struct BusView {
     bands: Arc<Mutex<HashMap<Band, BandActivity>>>,
     logs: Ring<LogEntry>,
     decodes: Ring<Decode>,
+    /// Latest health per hardware subsystem (real mode only). Drives the panels'
+    /// fault display when a device is missing or disconnected.
+    health: Arc<Mutex<HashMap<SubsystemId, SubsystemHealth>>>,
 
     /// Whether real producers (`DM420_REAL=1`) are driving the bus. Panels use
     /// this to avoid presenting mock-only visuals (e.g. the simulated FFT) as if
@@ -106,6 +109,8 @@ impl BusView {
         let bands: Arc<Mutex<HashMap<Band, BandActivity>>> = Arc::new(Mutex::new(HashMap::new()));
         let logs = Ring::new(512);
         let decodes = Ring::new(64);
+        let health: Arc<Mutex<HashMap<SubsystemId, SubsystemHealth>>> =
+            Arc::new(Mutex::new(HashMap::new()));
 
         // `tokio::spawn` (used by the producers and the pump helpers) needs an
         // active runtime context; hold the guard while we wire everything up.
@@ -150,6 +155,13 @@ impl BusView {
             decodes.clone(),
             egui_ctx.clone(),
         );
+        // Health is only produced in real mode (by `core`); in mock mode the map
+        // stays empty and panels treat everything as healthy.
+        if real {
+            for id in [SubsystemId::Rig, SubsystemId::Audio] {
+                pump_health(&bus, id, health.clone(), egui_ctx.clone());
+            }
+        }
         drop(_guard);
 
         Self {
@@ -160,6 +172,7 @@ impl BusView {
             bands,
             logs,
             decodes,
+            health,
             real,
             bus,
             _rt: rt,
@@ -226,6 +239,13 @@ impl BusView {
             }
         }
         out
+    }
+
+    /// The latest health for a subsystem, if it has reported (real mode only).
+    /// `None` ⇒ no report yet (mock mode, or before the first publish), which
+    /// panels treat as "not faulted".
+    pub fn health(&self, id: SubsystemId) -> Option<SubsystemHealth> {
+        self.health.lock().unwrap().get(&id).cloned()
     }
 
     /// The `n` most recent decodes, newest first.
@@ -304,6 +324,35 @@ fn pump_stream<T: BusMessage>(
                     ctx.request_repaint();
                 }
                 // Lossy lag: keep reading. Closed/dropped: end the pump.
+                Err(BusError::Lagged { .. }) => continue,
+                Err(_) => break,
+            }
+        }
+    });
+}
+
+/// Spawn a pump that mirrors one subsystem's `health/{id}` State topic into the
+/// shared health map.
+fn pump_health(
+    bus: &BusHandle,
+    id: SubsystemId,
+    health: Arc<Mutex<HashMap<SubsystemId, SubsystemHealth>>>,
+    ctx: egui::Context,
+) {
+    let mut sub = match bus.subscribe::<SubsystemHealth>(TopicSelector::Exact(Topic::Health(id))) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("bus_view: health subscribe failed: {e:?}");
+            return;
+        }
+    };
+    tokio::spawn(async move {
+        loop {
+            match sub.recv().await {
+                Ok(h) => {
+                    health.lock().unwrap().insert(h.id, h);
+                    ctx.request_repaint();
+                }
                 Err(BusError::Lagged { .. }) => continue,
                 Err(_) => break,
             }

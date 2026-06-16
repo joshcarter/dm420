@@ -3,7 +3,9 @@
 
 use eframe::egui;
 use egui::{Align2, Color32, ColorImage, Pos2, Rect, TextureHandle, TextureOptions};
-use types::{Decode, DecodeContent, ParsedMessage, SpectrumRow};
+use types::{
+    Decode, DecodeContent, HealthState, ParsedMessage, SpectrumRow, SubsystemHealth, SubsystemId,
+};
 
 use super::{Panel, PanelCtx};
 use crate::chrome::{measure, panel_header, shadow};
@@ -73,14 +75,26 @@ impl Panel for Waterfall {
         let mut rx = header.right() - 2.0;
         painter.text(Pos2::new(rx, cy), Align2::RIGHT_CENTER, "MHz", mono(8.5), pal.sub);
         rx -= measure(painter, "MHz", mono(8.5)) + 5.0;
-        let vfo_hz = ctx.bus.rig_state().map(|r| r.vfo.0).unwrap_or(14_074_000);
-        let vfo_mhz = format!("{:.3}", vfo_hz as f64 / 1_000_000.0);
+        // When the rig is faulted, don't show a (possibly stale) frequency as if
+        // it were live — show a dashed, dimmed placeholder instead.
+        let rig_fault = ctx.bus.is_real()
+            && ctx
+                .bus
+                .health(SubsystemId::Rig)
+                .map(|h| h.is_faulted())
+                .unwrap_or(false);
+        let (vfo_text, vfo_col) = if rig_fault {
+            ("---.---".to_string(), pal.dim)
+        } else {
+            let vfo_hz = ctx.bus.rig_state().map(|r| r.vfo.0).unwrap_or(14_074_000);
+            (format!("{:.3}", vfo_hz as f64 / 1_000_000.0), pal.accent)
+        };
         engraved_text(
             painter,
             Pos2::new(rx, cy),
-            &vfo_mhz,
+            &vfo_text,
             heading_bold(15.0),
-            pal.accent,
+            vfo_col,
             shadow(pal),
             Align2::RIGHT_CENTER,
         );
@@ -96,7 +110,21 @@ impl Panel for Waterfall {
         );
         recessed_screen(painter, screen, pal);
 
-        if ctx.bus.is_real() {
+        // When the capture device is missing or disconnected, the spectrogram and
+        // decode rail have no live data — show the fault here instead of a frozen
+        // or empty screen. The supervisor keeps reconnecting in the background.
+        let audio_fault = ctx
+            .bus
+            .is_real()
+            .then(|| ctx.bus.health(SubsystemId::Audio))
+            .flatten()
+            .filter(SubsystemHealth::is_faulted);
+
+        if let Some(health) = audio_fault {
+            if screen.width() > 24.0 && screen.height() > 24.0 {
+                draw_fault_body(painter, screen, pal, &health);
+            }
+        } else if ctx.bus.is_real() {
             // Real mode: no FFT/spectrum producer is wired yet (the decoder
             // publishes `Decode`s, not `SpectrumRow`s), so we render the decodes
             // themselves in waterslide form — placed by audio offset (vertical)
@@ -322,6 +350,42 @@ fn draw_waterslide(
     painter.line_segment(
         [Pos2::new(now_x, rect.top()), Pos2::new(now_x, rect.bottom())],
         egui::Stroke::new(2.0, pal.accent),
+    );
+}
+
+/// Fault placeholder for the screen body: a centred status line plus the
+/// producer's reason, shown when the audio subsystem is down/degraded so the
+/// panel reads as "no signal because the device is gone", not "band is quiet".
+fn draw_fault_body(painter: &egui::Painter, screen: Rect, pal: &Palette, health: &SubsystemHealth) {
+    let painter = painter.with_clip_rect(screen.shrink(6.0));
+    let c = screen.center();
+    let title = match health.state {
+        HealthState::Down(_) => "AUDIO OFFLINE",
+        HealthState::Degraded(_) => "AUDIO DEGRADED",
+        HealthState::Healthy => return,
+    };
+    painter.text(
+        Pos2::new(c.x, c.y - 12.0),
+        Align2::CENTER_CENTER,
+        title,
+        heading_bold(15.0),
+        pal.accent,
+    );
+    if let Some(reason) = health.reason() {
+        painter.text(
+            Pos2::new(c.x, c.y + 10.0),
+            Align2::CENTER_CENTER,
+            reason,
+            mono(10.0),
+            pal.sub,
+        );
+    }
+    painter.text(
+        Pos2::new(c.x, c.y + 28.0),
+        Align2::CENTER_CENTER,
+        "reconnecting…",
+        mono(9.0),
+        pal.dim,
     );
 }
 
