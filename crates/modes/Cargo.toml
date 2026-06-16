@@ -1,11 +1,11 @@
 [package]
 name = "modes"
-version.workspace = true
 edition.workspace = true
-authors.workspace = true
-repository.workspace = true
-description = "On-air protocols: FT8/FT4 encode + decode integration, OverAirMode logic, and the calling-frequency tables. PSK31/RTTY are siblings, later."
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "From-scratch FT8/FT4 decoder/encoder (pure Rust) and the UTC slot clock (Phase 3)."
 
 [dependencies]
-bus.workspace = true
-types.workspace = true
+serde = { workspace = true }
+tracing = { workspace = true }

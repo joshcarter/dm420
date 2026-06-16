@@ -1,11 +1,17 @@
 [package]
 name = "rig"
-version.workspace = true
 edition.workspace = true
-authors.workspace = true
-repository.workspace = true
-description = "Radio back-end: the RadioBackend trait plus the Kenwood TS-480SAT/TS-590S CAT driver. Serves radio/{id}/command, publishes rig_state."
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Kenwood CAT rig control: typed codec, serial transport, in-memory mock, and a single-owner rig actor."
 
 [dependencies]
-bus.workspace = true
-types.workspace = true
+serialport.workspace = true
+crossbeam-channel.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

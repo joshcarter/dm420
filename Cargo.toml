@@ -6,6 +6,8 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+license = "MIT"
 authors = ["Josh Carter (N0JDC)", "Joel Odom (W4LL)"]
 repository = "https://github.com/joshcarter/dm420"
 
@@ -42,9 +44,14 @@ serde_json = "1"
 # --- hardware I/O (component owners enable when implementing) ---
 serialport = "4"   # Kenwood CAT (rig)
 cpal = "0.15"      # cross-platform audio capture/playback (audio)
+hound = "3.5"      # uncompressed WAV read/write (audio)
+
+# --- vendored rig/audio/modes support (Joel's prototype) ---
+crossbeam-channel = "0.5" # rig actor + audio capture channels
+tracing = "0.1"           # lightweight logging in vendored crates
 
 # --- misc ---
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 thiserror = "1"
 
 [profile.release]

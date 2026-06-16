@@ -1,11 +1,20 @@
 [package]
 name = "audio"
-version.workspace = true
 edition.workspace = true
-authors.workspace = true
-repository.workspace = true
-description = "Cross-platform audio capture/playback (cpal): delivers interval-aligned RX audio to the decoder; renders TX audio for the rig."
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Audio capture/playback for kenctl: cpal streams, uncompressed WAV via hound, level metering, sidecar metadata, and a windowed-sinc resampler (48k -> 12k groundwork for FT8 decode)."
 
 [dependencies]
-bus.workspace = true
-types.workspace = true
+cpal.workspace = true
+hound.workspace = true
+crossbeam-channel.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
