@@ -104,14 +104,16 @@ pub fn build_cmap(stops: &[(f32, [u8; 3])]) -> [Color32; 256] {
 }
 
 /// The "Martian / graphite" colormap (dark amber): dark background, bright signal.
+/// Runs from the screen background, up through the orange accent (#F7920F), and
+/// on to white so the strongest signals read at full brightness.
 pub fn martian_cmap() -> [Color32; 256] {
     build_cmap(&[
-        (0.00, [8, 6, 4]),
-        (0.22, [46, 18, 6]),
-        (0.42, [110, 44, 8]),
-        (0.60, [186, 86, 12]),
-        (0.78, [240, 150, 40]),
-        (1.00, [255, 236, 205]),
+        (0.00, [8, 6, 4]),       // GRAPHITE screen_bg — noise floor blends in
+        (0.18, [33, 18, 8]),     // noise floor lifts just off the background
+        (0.42, [150, 70, 12]),   // ramping up into the accent
+        (0.62, [247, 146, 15]),  // GRAPHITE accent #F7920F at full strength
+        (0.82, [251, 201, 120]), // hot amber on the way to white
+        (1.00, [255, 255, 255]), // strongest signal = white
     ])
 }
 
