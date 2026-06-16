@@ -7,26 +7,30 @@ Severity: 🔴 correctness/blocker · 🟡 should-fix · 🟢 polish.
 
 ## Configuration & hardcoding
 
-- 🔴 **Rig port/baud hardcoded.** `crates/core/src/rig_adapter.rs` has
-  `PORT = "/dev/cu.usbserial-120"` and `BAUD = 19_200` as in-function constants.
-  Should come from `CoreConfig` (a `serial: Option<{port, baud, profile}>` field)
-  driven by config file and/or `DM420_*` env vars. Wire `rig::autodetect` as a
-  fallback so the user isn't guessing baud.
-- 🔴 **Audio device hardcoded.** `crates/gui/src/bus_view.rs` `real_core_config()`
-  pins `input: Some("USB PnP Sound Device")`. Should be config/env-driven, with a
-  device picker in the UI (`audio::list_devices()` already exists).
-  Note `open_cpal_device` matches device name **exactly** — no substring/fuzzy.
-- 🟡 **Mode is hardcoded to FT8.** No FT4 selection; `Protocol::Ft8` is baked into
-  `real_core_config()`. Real impl needs a band/mode selector.
+- ✅ **Rig port/baud now configurable.** `CoreConfig.serial: Option<SerialConfig
+  {port, baud, profile, autodetect}>` drives `rig_adapter`; the GUI builds it from
+  `DM420_SERIAL_PORT` / `DM420_SERIAL_BAUD` / `DM420_SERIAL_PROFILE` (see
+  `crates/gui/src/settings.rs`). With no port (or on open failure) `rig::autodetect`
+  sweeps ports × bauds × profiles as a fallback.
+- ✅ **Audio device now configurable.** `DM420_AUDIO_INPUT` (case-insensitive
+  **substring** match — `open_cpal_device` was upgraded from exact-match). Unset ⇒
+  system default input. A panel-by-panel device picker (`audio::list_devices()`)
+  is still the eventual UI.
+- ✅ **Mode is configurable.** `DM420_MODE=ft8|ft4`. (A band/mode selector in the
+  UI is still future work.)
 - 🟡 **Real path gated by `DM420_REAL` / `DM420_WAV` env vars.** Fine for bring-up;
-  a real build needs proper source/device/radio selection (settings + UI).
+  the env layer (`settings.rs`) is structured so a future per-panel settings UI
+  edits the same `Settings`/`CoreConfig` instead of the environment.
 - 🟢 **Radio id hardcoded** to `mocks::radio_id()` ("rig0") throughout; single-radio
   assumption baked in.
 
 ## Rig control
 
-- 🔴 **Panics on serial open failure.** `open_serial(...).unwrap_or_else(|e| panic!())`.
-  Should surface an error to the UI and keep the app running (degrade to no-rig).
+- ✅ **No longer panics on serial open failure.** `rig_adapter` is a supervised
+  connection: it publishes `health/rig` (`SubsystemHealth`), keeps the app running,
+  polls with a failure threshold, and drops + reopens with capped backoff on link
+  loss. The `RigCommand` server replies `"rig offline"` while down. The Waterfall
+  panel dims the VFO readout to `---.---` when the rig is faulted.
 - 🔴 **TX is hard-blocked.** `allow_transmit: false` everywhere; no PTT/audio-TX
   path is wired. The interlock-token validation is stubbed — see the comment in
   `rig_adapter::apply` ("future core granter"). A real TX path needs the granter,
@@ -40,9 +44,12 @@ Severity: 🔴 correctness/blocker · 🟡 should-fix · 🟢 polish.
 
 ## Audio capture
 
-- 🔴 **No device disconnect/recovery.** `audio::capture_stream` opens once; if the
-  device disappears or errors, the stream silently ends and decoding stops with no
-  retry/reconnect. Needs supervision + reopen.
+- ✅ **Device disconnect/recovery handled.** `decode::spawn_live` wraps capture in a
+  supervised reconnect loop: a stream that delivers no samples for
+  `AUDIO_SILENCE_TIMEOUT` (≈ device lost) is rebuilt with backoff, the fault is
+  published on `health/audio`, and each session restarts from clean
+  spectrogram/slot state. The Waterfall panel shows `AUDIO OFFLINE/DEGRADED` with
+  the reason where the spectrogram + decode rail would be.
 - 🟡 **Slot alignment depends on the system clock (NTP).** `spawn_live` keys slot
   boundaries off wall-clock `current_slot_start`. Already documented as a
   requirement, but there's no drift detection/warning if the clock is off.
