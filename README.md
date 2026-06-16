@@ -39,4 +39,32 @@ cargo build --workspace      # build everything
 cargo run -p gui             # run the app (binary: dm420)
 ```
 
-The GUI requires the system clock within ~1 s of UTC (NTP) for FT8/FT4 slot timing.
+By default the GUI runs on **mock** producers, so it launches with no radio or
+audio hardware present. The GUI requires the system clock within ~1 s of UTC
+(NTP) for FT8/FT4 slot timing.
+
+### Configuration (environment variables)
+
+Real hardware is opt-in via `DM420_REAL`. Everything else has a sensible default;
+nothing here is required, and a missing/disconnected device degrades to an
+on-screen fault (the app keeps running and reconnects on its own). These are
+interim env vars — a per-panel settings UI will replace them.
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `DM420_REAL` | Use real rig/decode producers instead of mocks | mocks |
+| `DM420_AUDIO_INPUT` | Capture device name (case-insensitive substring, e.g. `USB PnP`) | system default input |
+| `DM420_SERIAL_PORT` | Rig CAT device, e.g. `/dev/cu.usbserial-120` | autodetect |
+| `DM420_SERIAL_BAUD` | Rig baud (standard Kenwood rate) | `19200` |
+| `DM420_SERIAL_PROFILE` | Serial line profile: `none` \| `dtr-rts` \| `rtscts` | `none` |
+| `DM420_MODE` | On-air mode: `ft8` \| `ft4` | `ft8` |
+| `DM420_WAV` | Replay a WAV instead of live capture (bring-up/testing) | live capture |
+
+```sh
+# Real radio + audio, explicit serial port, FT4:
+DM420_REAL=1 DM420_AUDIO_INPUT="USB PnP" DM420_SERIAL_PORT=/dev/cu.usbserial-120 \
+  DM420_SERIAL_BAUD=19200 DM420_MODE=ft4 cargo run -p gui
+
+# Real mode, let the rig autodetect its port/baud:
+DM420_REAL=1 cargo run -p gui
+```
