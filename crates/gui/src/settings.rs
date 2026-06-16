@@ -31,7 +31,7 @@ const DEFAULT_BAUD: u32 = 19_200;
 /// The subset of [`Settings`] the operator can edit live from the UI (the rig +
 /// audio hardware bindings). Held by `BusView` as the source of truth for the
 /// settings form, and pushed to the running producers on apply.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct HardwareConfig {
     pub audio_input: Option<String>,
     pub serial: SerialConfig,

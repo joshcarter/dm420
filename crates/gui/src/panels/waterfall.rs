@@ -143,9 +143,17 @@ impl Panel for Waterfall {
                 }
             }
         } else {
-            // Locked: normal operating view. Re-sync the form to the applied config
-            // the next time it's opened.
-            self.form.loaded = false;
+            // Locked: re-locking the GUI commits any edits made while unlocked.
+            // `form.loaded` is set only after the form was shown (real mode), so
+            // this fires once on the unlock→lock transition. Only apply on an
+            // actual change, so re-locking without edits doesn't force a reconnect.
+            if self.form.loaded {
+                let edited = self.form.to_config();
+                if edited != ctx.bus.current_config() {
+                    ctx.bus.apply_config(edited);
+                }
+                self.form.loaded = false; // re-sync to applied config on next unlock
+            }
 
             // When the capture device is missing or disconnected, the spectrogram
             // and decode rail have no live data — show the fault here instead of a
@@ -396,9 +404,9 @@ fn draw_waterslide(
 // =====================================================================
 
 /// Editable radio + audio settings shown in the unlocked FT8 panel body. Seeded
-/// from the currently-applied config the first time it opens (and on Revert);
-/// Apply pushes it to the live producers via [`BusView::apply_config`], which
-/// reconnect with the new settings.
+/// from the currently-applied config when the panel is unlocked; the edits are
+/// committed when the GUI is re-locked (see the locked branch in `Panel::ui`),
+/// which pushes them to the live producers via [`BusView::apply_config`].
 struct ConfigForm {
     /// Whether the fields have been seeded from the applied config yet.
     loaded: bool,
@@ -554,18 +562,16 @@ impl ConfigForm {
                 });
 
                 ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Apply").clicked() {
-                        bus.apply_config(self.to_config());
-                    }
-                    if ui.button("Refresh devices").clicked() {
-                        self.audio_devices = bus.audio_inputs();
-                        self.serial_ports = bus.serial_ports();
-                    }
-                    if ui.button("Revert").clicked() {
-                        self.loaded = false;
-                    }
-                });
+                if ui.button("Refresh devices").clicked() {
+                    self.audio_devices = bus.audio_inputs();
+                    self.serial_ports = bus.serial_ports();
+                }
+                ui.add_space(2.0);
+                ui.label(
+                    egui::RichText::new("Changes take effect when you lock the GUI.")
+                        .color(pal.sub)
+                        .italics(),
+                );
             });
     }
 }

@@ -84,7 +84,7 @@ pub enum DecodeSource {
 /// first; with `autodetect` set, a failed/absent port falls back to sweeping the
 /// likely-radio ports × standard bauds to find the radio. `baud`/`profile` are
 /// the manual hints used when not autodetecting.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SerialConfig {
     /// Device path, e.g. `"/dev/cu.usbserial-120"`. `None` ⇒ autodetect only.
     pub port: Option<String>,
