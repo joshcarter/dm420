@@ -26,7 +26,13 @@ use std::path::PathBuf;
 use app_core::{CoreConfig, DecodeSource, LineProfile, Protocol, SerialConfig};
 
 /// Default rig baud when `DM420_SERIAL_BAUD` is unset or invalid.
-const DEFAULT_BAUD: u32 = 19_200;
+pub(crate) const DEFAULT_BAUD: u32 = 19_200;
+
+/// Standard Kenwood CAT baud rates, fastest first — the choices offered by the
+/// settings-form baud picker. Presentation data: kept here (not pulled out of
+/// `app_core`'s public API) so `core`'s contract doesn't declare a specific
+/// vendor's rate table.
+pub(crate) const KENWOOD_BAUDS: &[u32] = &[115_200, 57_600, 38_400, 19_200, 9_600, 4_800];
 
 /// The subset of [`Settings`] the operator can edit live from the UI (the rig +
 /// audio hardware bindings). Held by `BusView` as the source of truth for the

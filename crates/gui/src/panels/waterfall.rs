@@ -7,13 +7,13 @@ use types::{
     Decode, DecodeContent, HealthState, ParsedMessage, SpectrumRow, SubsystemHealth, SubsystemId,
 };
 
-use app_core::{KENWOOD_BAUDS, LineProfile, Protocol, SerialConfig};
+use app_core::{LineProfile, Protocol, SerialConfig};
 
 use super::{Panel, PanelCtx};
 use crate::bus_view::BusView;
 use crate::chrome::{measure, panel_header, shadow};
 use crate::panel_data as pd;
-use crate::settings::HardwareConfig;
+use crate::settings::{DEFAULT_BAUD, HardwareConfig, KENWOOD_BAUDS};
 use crate::theme::*;
 use crate::waterslide_panel::{WaterslidePanel, WaterslideTheme};
 
@@ -427,7 +427,7 @@ impl Default for ConfigForm {
             loaded: false,
             audio_input: None,
             port: None,
-            baud: 19_200,
+            baud: DEFAULT_BAUD,
             profile: LineProfile::Default,
             autodetect: true,
             protocol: Protocol::Ft8,
@@ -474,6 +474,11 @@ impl ConfigForm {
         ui.spacing_mut().item_spacing = egui::vec2(10.0, 8.0);
         ui.label(egui::RichText::new("RADIO SETUP").color(pal.legend).strong());
 
+        // Audio device + decode mode are pushed to the live capture producer; in
+        // WAV replay (or rig-only) there is none, so they're fixed at startup and
+        // shown read-only rather than letting the operator edit dead controls.
+        let live_audio = bus.has_live_audio();
+
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -486,25 +491,47 @@ impl ConfigForm {
                             .audio_input
                             .clone()
                             .unwrap_or_else(|| "(system default)".into());
-                        egui::ComboBox::from_id_salt("audio_input")
-                            .selected_text(sel)
-                            .width(240.0)
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut self.audio_input, None, "(system default)");
-                                for d in &self.audio_devices {
-                                    ui.selectable_value(&mut self.audio_input, Some(d.clone()), d);
-                                }
-                            });
+                        ui.add_enabled_ui(live_audio, |ui| {
+                            egui::ComboBox::from_id_salt("audio_input")
+                                .selected_text(sel)
+                                .width(240.0)
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut self.audio_input,
+                                        None,
+                                        "(system default)",
+                                    );
+                                    for d in &self.audio_devices {
+                                        ui.selectable_value(
+                                            &mut self.audio_input,
+                                            Some(d.clone()),
+                                            d,
+                                        );
+                                    }
+                                });
+                        });
                         ui.end_row();
 
                         ui.label("Mode");
-                        egui::ComboBox::from_id_salt("mode")
-                            .selected_text(proto_label(self.protocol))
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut self.protocol, Protocol::Ft8, "FT8");
-                                ui.selectable_value(&mut self.protocol, Protocol::Ft4, "FT4");
-                            });
+                        ui.add_enabled_ui(live_audio, |ui| {
+                            egui::ComboBox::from_id_salt("mode")
+                                .selected_text(proto_label(self.protocol))
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut self.protocol, Protocol::Ft8, "FT8");
+                                    ui.selectable_value(&mut self.protocol, Protocol::Ft4, "FT4");
+                                });
+                        });
                         ui.end_row();
+
+                        if !live_audio {
+                            ui.label("");
+                            ui.label(
+                                egui::RichText::new("WAV replay — set at startup")
+                                    .color(pal.sub)
+                                    .italics(),
+                            );
+                            ui.end_row();
+                        }
 
                         ui.label("Rig port");
                         ui.checkbox(&mut self.autodetect, "Autodetect port / baud");

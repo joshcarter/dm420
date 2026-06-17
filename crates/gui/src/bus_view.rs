@@ -271,6 +271,14 @@ impl BusView {
         *self.applied.lock().unwrap() = cfg;
     }
 
+    /// Whether a live audio capture producer is running and therefore
+    /// reconfigurable. `false` for WAV replay or rig-only setups, where the audio
+    /// device and decode mode are fixed at startup and the settings form should
+    /// present them as read-only.
+    pub fn has_live_audio(&self) -> bool {
+        self.control.audio.is_some()
+    }
+
     /// Input-capable audio device names, for the settings picker.
     pub fn audio_inputs(&self) -> Vec<String> {
         app_core::list_audio_inputs()

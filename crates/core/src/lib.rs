@@ -34,7 +34,6 @@ pub use control::{AudioControl, CoreControl, RigControl};
 pub use modes::Protocol;
 pub use parse::parse_message;
 pub use rig::LineProfile;
-pub use rig::probe::KENWOOD_BAUDS;
 pub use rig_adapter::CommandResult;
 
 /// Names of input-capable audio devices, for a UI device picker. Empty on error.

@@ -38,7 +38,7 @@ pub struct PanelCtx<'a> {
     pub unlocked: bool,
 }
 
-/// A drawable instrument. Implementors own their view state and render into the
+/// A drawable instrument. Implementers own their view state and render into the
 /// `block` rect (already inset from the chassis groove by the tile behavior).
 pub trait Panel {
     fn title(&self) -> &str;
