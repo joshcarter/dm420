@@ -131,6 +131,49 @@ pub fn martian_cmap_light() -> [Color32; 256] {
     ])
 }
 
+/// What the next transmission is aimed at. A click on empty spectrum is a bare
+/// retune (`Offset`); a click on a decoded line is intent to work that station
+/// (`Station`, carrying its call so the send row can address it). This is the
+/// GUI-local stand-in for the bus `Selection.target: Option<DecodeRef>` — named
+/// so the later bus wiring is a mechanical swap.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Target {
+    Offset(i32),
+    Station { call: String, off: i32 },
+}
+
+impl Target {
+    /// The audio offset (Hz) the next TX lands on, regardless of variant.
+    pub fn off(&self) -> i32 {
+        match self {
+            Target::Offset(o) => *o,
+            Target::Station { off, .. } => *off,
+        }
+    }
+
+    /// The targeted station's callsign, if a station (not bare spectrum) is selected.
+    pub fn station(&self) -> Option<&str> {
+        match self {
+            Target::Station { call, .. } => Some(call),
+            Target::Offset(_) => None,
+        }
+    }
+
+    fn clamp_off(self, lim: i32) -> Self {
+        match self {
+            Target::Offset(o) => Target::Offset(o.clamp(-lim, lim)),
+            Target::Station { call, off } => Target::Station { call, off: off.clamp(-lim, lim) },
+        }
+    }
+}
+
+/// The station a decoded line refers to: the sender's callsign, which is the
+/// second whitespace token in every FT8 message form we generate — `CQ <call>
+/// <grid>` and `<to> <from> …` both put the station-of-interest at index 1.
+fn target_call(msg: &str) -> Option<String> {
+    msg.split_whitespace().nth(1).map(str::to_owned)
+}
+
 pub struct WaterslidePanel {
     sim: Sim,
     // Theme-independent FFT intensities (0..1), W×H row-major, scrolled in place.
@@ -141,10 +184,10 @@ pub struct WaterslidePanel {
     tex: Option<TextureHandle>,
     dx_frac: f64,
     primed: bool,
-    // Audio offset (Hz, ±TX_LIMIT_HZ) where the next FT4/FT8 transmission lands.
-    // Set by clicking the FFT lane (by vertical position) or by clicking a
-    // decoded line (snaps to that station's offset).
-    outgoing_off: i32,
+    // What the next FT4/FT8 transmission is aimed at (offset clamped to
+    // ±TX_LIMIT_HZ). Set by clicking the FFT lane (bare offset, by vertical
+    // position) or a decoded line (that station, snapped to its offset).
+    outgoing: Target,
 }
 
 impl WaterslidePanel {
@@ -156,8 +199,20 @@ impl WaterslidePanel {
             tex: None,
             dx_frac: 0.0,
             primed: false,
-            outgoing_off: 300,
+            outgoing: Target::Offset(300),
         }
+    }
+
+    /// The current outgoing target (offset or station), for the host panel's
+    /// send row to render and address.
+    pub fn outgoing(&self) -> &Target {
+        &self.outgoing
+    }
+
+    /// The current FT8 slot index from the sim clock. The host uses changes in
+    /// this to drive the mock arm→transmit cadence (one TX per slot boundary).
+    pub fn now_slot(&self) -> i64 {
+        (self.sim.t() / crate::waterslide_sim::SLOT).floor() as i64
     }
 
     /// Map an audio offset (Hz) to a vertical position in 0..H design space.
@@ -255,7 +310,9 @@ impl WaterslidePanel {
             .interact(rect, egui::Id::new("waterslide_tx_tune"), egui::Sense::click())
             .on_hover_cursor(egui::CursorIcon::PointingHand);
         let click_pos = resp.clicked().then(|| resp.interact_pointer_pos()).flatten();
-        let mut snap_off: Option<i32> = None;
+        // A click that lands on a decoded line records that station (call + its
+        // offset); resolved in the text loop below, applied in step 6.
+        let mut snap: Option<(Option<String>, i32)> = None;
 
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, theme.screen_bg);
@@ -307,10 +364,10 @@ impl WaterslidePanel {
             let msg_rect =
                 tp.text(pos, Align2::RIGHT_CENTER, &rec.msg, FontId::monospace(12.0 * fscale), theme.text);
             let msg_w = msg_rect.width();
-            // clicking the line snaps the outgoing frequency to its station
+            // clicking the line targets that station (and snaps to its offset)
             if let Some(cp) = click_pos {
                 if msg_rect.expand(4.0).contains(cp) {
-                    snap_off = Some(rec.off);
+                    snap = Some((target_call(&rec.msg), rec.off));
                 }
             }
             // reception SNR just to the left of the message
@@ -321,27 +378,34 @@ impl WaterslidePanel {
         // 5) NOW divider at the centre
         painter.line_segment([p(521.0, 0.0), p(521.0, H as f32)], Stroke::new(2.0, theme.accent));
 
-        // 6) resolve a click into a new outgoing frequency: snap to a decoded
-        // line if one was hit, otherwise read it off the vertical position.
+        // 6) resolve a click into the outgoing target: a decoded line becomes a
+        // Station (work that call); empty spectrum becomes a bare Offset read off
+        // the vertical position.
         if let Some(cp) = click_pos {
-            let off = snap_off.unwrap_or_else(|| {
-                let design_y = (cp.y - rect.top()) / sy;
-                ((250.0 - design_y) * (3000.0 / H as f32)).round() as i32
-            });
-            self.outgoing_off = off.clamp(-TX_LIMIT_HZ, TX_LIMIT_HZ);
+            self.outgoing = match snap {
+                Some((Some(call), off)) => Target::Station { call, off },
+                Some((None, off)) => Target::Offset(off),
+                None => {
+                    let design_y = (cp.y - rect.top()) / sy;
+                    let off = ((250.0 - design_y) * (3000.0 / H as f32)).round() as i32;
+                    Target::Offset(off)
+                }
+            }
+            .clamp_off(TX_LIMIT_HZ);
         }
 
         // 7) outgoing-frequency indicator: a translucent full-width lane with
         // bright accent rules top & bottom, centred on the next-TX offset.
-        let oy = Self::y_of(self.outgoing_off);
+        let off = self.outgoing.off();
+        let oy = Self::y_of(off);
         let band = Rect::from_min_max(p(0.0, oy - TX_BAND_HALF), p(X_FFT_R, oy + TX_BAND_HALF));
         painter.rect_filled(band, 0.0, theme.accent.gamma_multiply(0.10));
         painter.line_segment([band.left_top(), band.right_top()], Stroke::new(1.5, theme.accent));
         painter.line_segment([band.left_bottom(), band.right_bottom()], Stroke::new(1.5, theme.accent));
         let tx_label = format!(
             "TX {}{}",
-            if self.outgoing_off >= 0 { "+" } else { "\u{2212}" },
-            self.outgoing_off.abs()
+            if off >= 0 { "+" } else { "\u{2212}" },
+            off.abs()
         );
         painter.text(
             p(X_FFT_L + 4.0, oy),

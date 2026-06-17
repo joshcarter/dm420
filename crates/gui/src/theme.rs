@@ -61,6 +61,10 @@ pub struct Palette {
     pub legend: Color32,
     pub sub: Color32,
     pub accent: Color32,
+    /// Secondary accent (cyan/blue). Used where the primary amber would read as
+    /// "active/normal" but we need a distinct state — e.g. the Send button armed
+    /// vs. idle, or an unworked station calling CQ.
+    pub accent2: Color32,
     pub screen_bg: Color32,
     pub ring: Color32,
     pub body: Color32,
@@ -93,6 +97,7 @@ pub const GRAPHITE: Palette = Palette {
     legend: rgb(0xF6, 0xE6, 0xCF),
     sub: rgba(202, 180, 150, 184), // 0.72
     accent: rgb(0xF7, 0x92, 0x0F),
+    accent2: rgb(0x3A, 0xD0, 0xE0), // bright cyan, reads against the dark face
     screen_bg: rgb(0x08, 0x06, 0x04),
     ring: rgba(247, 146, 15, 102), // 0.40
     body: rgb(0xF4, 0xEE, 0xE6),
@@ -116,6 +121,7 @@ pub const SILVER: Palette = Palette {
     legend: rgb(0x36, 0x26, 0x0F),
     sub: rgba(95, 68, 32, 199), // 0.78
     accent: rgb(0xC2, 0x66, 0x0F),
+    accent2: rgb(0x0E, 0x70, 0x82), // deeper teal, reads against the silver face
     screen_bg: rgb(0xEF, 0xE7, 0xDC),
     ring: rgba(150, 80, 10, 107), // 0.42
     body: rgb(0x24, 0x18, 0x08),

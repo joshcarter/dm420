@@ -44,7 +44,8 @@ The box exists for two reasons beyond showing the queued message: typed
 freeform text for modes like PSK31. For v1 its behavior is:
 
 - Leading `/` → interpret the rest as a software command (see
-  [`radio_control.md`](radio_control.md)).
+  [`radio_control.md`](radio_control.md)). We may include `:` as an
+  alias to `/` for indicating commands.
 - **Enter** → arm / send the queued message on the next interval (or disarm if
   already armed).
 - Any other typed text → ignored.

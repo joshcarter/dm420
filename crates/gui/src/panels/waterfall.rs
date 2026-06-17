@@ -13,16 +13,10 @@ use super::{Panel, PanelCtx};
 use crate::bus_view::BusView;
 use crate::chrome::{measure, panel_header, shadow};
 use crate::panel_data as pd;
+use crate::send::{ArmState, Command, SendState};
 use crate::settings::{DEFAULT_BAUD, HardwareConfig, KENWOOD_BAUDS};
 use crate::theme::*;
 use crate::waterslide_panel::{WaterslidePanel, WaterslideTheme};
-
-/// `HHMMSS` for a UTC millisecond timestamp.
-fn hhmmss(ms: i64) -> String {
-    chrono::DateTime::from_timestamp_millis(ms)
-        .map(|t| t.format("%H%M%S").to_string())
-        .unwrap_or_else(|| "------".into())
-}
 
 /// SNR like the rest of the console: Unicode minus, two digits.
 fn fmt_snr(snr: i8) -> String {
@@ -50,6 +44,13 @@ pub struct Waterfall {
     slide: WaterslidePanel,
     spectro: Spectrogram,
     form: ConfigForm,
+    /// Send-row state (outgoing message + arm/transmit lifecycle). Mock-only.
+    send: SendState,
+    /// Last FT8 slot index seen, to fire the mock arm→transmit tick on a change.
+    last_slot: i64,
+    /// Dial frequency set via the `/f` command (MHz→Hz), shown in the header in
+    /// place of the rig readout. Mock feedback until rig wiring lands.
+    vfo_override_hz: Option<u64>,
 }
 
 impl Waterfall {
@@ -58,6 +59,95 @@ impl Waterfall {
             slide: WaterslidePanel::new(7200.0),
             spectro: Spectrogram::new(),
             form: ConfigForm::default(),
+            send: SendState::default(),
+            last_slot: i64::MIN,
+            vfo_override_hz: None,
+        }
+    }
+
+    /// The bottom "Send" row: `Send:` label, black message box (auto-filled with
+    /// the next outgoing message), and a right-aligned state button — orange
+    /// when idle, cyan when armed, "Cancel" while transmitting. Slash/colon
+    /// commands typed into the box are parsed on Enter; anything else toggles arm.
+    fn draw_send_row(&mut self, ctx: &mut PanelCtx, row: Rect) {
+        const MYCALL: &str = "N0JDC";
+        const MYGRID: &str = "DN70";
+
+        let pal = ctx.pal;
+        let painter = ctx.painter;
+
+        // Layout: [Send:] [────── box ──────] [button]
+        let pad = 8.0;
+        let label = "Send:";
+        let label_font = mono(11.0);
+        let label_w = measure(painter, label, label_font.clone());
+        let btn_w = 64.0;
+        let cy = row.center().y;
+
+        painter.text(
+            Pos2::new(row.left() + pad, cy),
+            Align2::LEFT_CENTER,
+            label,
+            label_font,
+            pal.sub,
+        );
+
+        let box_left = row.left() + pad + label_w + pad;
+        let btn_rect = Rect::from_min_max(
+            Pos2::new(row.right() - pad - btn_w, row.top() + 3.0),
+            Pos2::new(row.right() - pad, row.bottom() - 3.0),
+        );
+        let box_rect = Rect::from_min_max(
+            Pos2::new(box_left, row.top() + 3.0),
+            Pos2::new(btn_rect.left() - pad, row.bottom() - 3.0),
+        );
+
+        // Black message box with a 1px edge.
+        painter.rect_filled(box_rect, corner_radius(2), Color32::BLACK);
+        painter.rect_stroke(
+            box_rect,
+            corner_radius(2),
+            egui::Stroke::new(1.0, pal.edge),
+            egui::StrokeKind::Inside,
+        );
+
+        // Keep the box mirroring the engine's next message while idle/unfocused.
+        let box_id = egui::Id::new("ft8_send_box");
+        let focused = ctx.ui.memory(|m| m.has_focus(box_id));
+        let target = self.slide.outgoing().clone();
+        self.send.sync_auto(focused, &target, MYCALL, MYGRID);
+
+        let text_color = if self.send.armed == ArmState::Idle { pal.body } else { pal.accent2 };
+        let resp = ctx.ui.put(
+            box_rect.shrink2(egui::vec2(6.0, 0.0)),
+            egui::TextEdit::singleline(&mut self.send.buf)
+                .id(box_id)
+                .frame(egui::Frame::NONE)
+                .desired_width(f32::INFINITY)
+                .font(egui::FontId::monospace(12.0))
+                .text_color(text_color),
+        );
+        let enter = resp.lost_focus() && ctx.ui.input(|i| i.key_pressed(egui::Key::Enter));
+
+        // State button.
+        let btn = ctx
+            .ui
+            .interact(btn_rect, egui::Id::new("ft8_send_btn"), egui::Sense::click());
+        let fill = if self.send.armed == ArmState::Idle { pal.accent } else { pal.accent2 };
+        painter.rect_filled(btn_rect, corner_radius(2), fill);
+        painter.text(
+            btn_rect.center(),
+            Align2::CENTER_CENTER,
+            &tracked(self.send.button_label()),
+            heading_bold(9.0),
+            pal.on_accent,
+        );
+
+        // Enter or a button click activates: apply a command, else toggle arm.
+        if enter || btn.clicked() {
+            if let Some(Command::SetFrequency(mhz)) = self.send.activate() {
+                self.vfo_override_hz = Some((mhz * 1_000_000.0).round() as u64);
+            }
         }
     }
 }
@@ -92,7 +182,10 @@ impl Panel for Waterfall {
         let (vfo_text, vfo_col) = if rig_fault {
             ("---.---".to_string(), pal.dim)
         } else {
-            let vfo_hz = ctx.bus.rig_state().map(|r| r.vfo.0).unwrap_or(14_074_000);
+            let vfo_hz = self
+                .vfo_override_hz
+                .or_else(|| ctx.bus.rig_state().map(|r| r.vfo.0))
+                .unwrap_or(14_074_000);
             (format!("{:.3}", vfo_hz as f64 / 1_000_000.0), pal.accent)
         };
         engraved_text(
@@ -105,14 +198,14 @@ impl Panel for Waterfall {
             Align2::RIGHT_CENTER,
         );
 
-        // ticker (bottom) + screen (fills between header and ticker).
-        let ticker = Rect::from_min_max(
+        // send row (bottom) + screen (fills between header and the send row).
+        let send_row = Rect::from_min_max(
             Pos2::new(block.left(), block.bottom() - pd::TICKER_H),
             block.max,
         );
         let screen = Rect::from_min_max(
             Pos2::new(block.left(), header.bottom() + pd::HEADER_GAP),
-            Pos2::new(block.right(), ticker.top() - pd::GAP),
+            Pos2::new(block.right(), send_row.top() - pd::GAP),
         );
         recessed_screen(painter, screen, pal);
 
@@ -209,7 +302,15 @@ impl Panel for Waterfall {
             }
         }
 
-        draw_ticker(painter, ticker, pal, &ctx.bus.recent_decodes(4));
+        // Mock arm→transmit cadence: step the send lifecycle each slot boundary.
+        // `now_slot` only advances under the mock sim (locked mock mode), which is
+        // the only place the send row is functional for now.
+        let slot = self.slide.now_slot();
+        if slot != self.last_slot {
+            self.last_slot = slot;
+            self.send.slot_tick();
+        }
+        self.draw_send_row(ctx, send_row);
     }
 }
 
@@ -675,27 +776,3 @@ fn draw_fault_body(painter: &egui::Painter, screen: Rect, pal: &Palette, health:
     );
 }
 
-/// The bottom rail: most recent decode shown prominently (time · snr · message),
-/// then older ones trailing off dimmer. Empty until the first decode lands.
-fn draw_ticker(painter: &egui::Painter, rect: Rect, pal: &Palette, decodes: &[Decode]) {
-    let cy = rect.center().y;
-    let painter = painter.with_clip_rect(rect);
-    let mut x = rect.left();
-
-    let draw = |x: &mut f32, text: &str, color: Color32, font: egui::FontId| {
-        let w = measure(&painter, text, font.clone());
-        painter.text(Pos2::new(*x, cy), Align2::LEFT_CENTER, text, font, color);
-        *x += w;
-    };
-
-    for (i, d) in decodes.iter().enumerate() {
-        let lead = if i == 0 { pal.legend } else { pal.sub };
-        let snr = d.snr_db.map(fmt_snr).unwrap_or_else(|| "   ".into());
-        if i > 0 {
-            draw(&mut x, "  ·  ", pal.sub, mono(9.0));
-        }
-        draw(&mut x, &hhmmss(d.t.0), pal.sub, mono(9.0));
-        draw(&mut x, &format!("  {snr}  "), pal.accent, heading_bold(9.0));
-        draw(&mut x, &decode_text(d), lead, mono(9.0));
-    }
-}
