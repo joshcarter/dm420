@@ -5,6 +5,11 @@ should receive data from the FT4/FT8 protocol decoder automatically,
 but in future versions it'll need a manual entry ability for logging
 other types of contacts.
 
+A contact is logged automatically when the QSO engine sees `RR73`
+received (we answered a station) or `RR73` sent (we called CQ). The
+full lifecycle and the unresolved question of how to treat incomplete
+QSOs are covered in [`qso_flow.md`](qso_flow.md).
+
 The log book should also show logs from other stations on the network.
 When other operators log their own contacts, those will be broadcast
 as network messages. There will not be a shared database of contacts,

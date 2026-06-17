@@ -29,9 +29,18 @@ message in a proper contact. The "send" button will take action on
 the next FT8 interval. It will also change to become a "cancel"
 button during transmission.
 
-Note: this will need to be a text box because the input box will also
-be used for radio control commands (see below). Exact behavior when
-typing into this box is still TBD.
+The full contact lifecycle — calling CQ vs. answering a station, the
+armed/wait-for-CQ model, multiple-caller selection, offset handling,
+logging, and post-QSO behavior — is specified in
+[`qso_flow.md`](qso_flow.md). The on-air mechanics we interoperate
+with are documented in [`wsjtx_qso_sequencing.md`](wsjtx_qso_sequencing.md).
+
+Note: this needs to be a text box because the input box is also used
+for radio control commands (see below). For v1 its behavior is: a
+leading `/` interprets the rest as a software command; **Enter** arms
+and sends the queued message on the next interval (pressing Enter
+again while armed disarms); any other typed text is ignored. There is
+no manual hand-editing of FT8 message content in v1.
 
 ## PSK31 Message Send
 

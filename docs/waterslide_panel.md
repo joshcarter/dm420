@@ -46,7 +46,13 @@ The radio's next FT4/FT8 transmission will take place at that outgoing
 frequency, either to answer a calling station or to do a new "calling
 all stations" transmission.
 
-An indicater should be shown for the current outgoing frequency.
+An indicater should be shown for the current outgoing frequency. The
+outgoing frequency is held for the duration of a QSO (it does not
+chase the partner), and a completed CQ-initiated QSO resumes calling
+CQ on the same offset. The contact lifecycle that drives all of this —
+including how clicking text vs. empty spectrum maps to answering vs.
+calling CQ, and how multiple answering stations are highlighted and
+selected — is specified in [`qso_flow.md`](qso_flow.md).
 
 During radio transmit, recieve data will not be present. However our
 own transmission audo will be known. The graph should show our
