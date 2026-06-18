@@ -137,7 +137,13 @@ async fn transmit(
         );
     };
 
-    tracing::debug!(?slot, ?mode, offset = offset.0, message = %message.text, "audio-tx: begin over");
+    // `into_slot` (ms past the 15 s FT8 slot edge) is the FT8-critical metric: the
+    // tones must reach the air near the top of the slot or the far end's DT goes out
+    // of range. Logged at each step so the lateness budget is visible on real hw.
+    tracing::info!(
+        ?slot, ?mode, offset = offset.0, into_slot_ms = now_ms().rem_euclid(15_000),
+        message = %message.text, "audio-tx: begin over",
+    );
 
     // FT8 only for now: the encoder has no FT4 synth yet.
     if mode != t::OverAirMode::Ft8 {
@@ -161,8 +167,10 @@ async fn transmit(
     while samples.last().is_some_and(|&s| s.abs() < 1e-4) {
         samples.pop();
     }
-    // ~0.5 s of lead is ample for the rig's (millisecond) T/R switch; drop the rest.
-    const TX_LEAD_SAMPLES: usize = TX_SAMPLE_RATE as usize / 2;
+    // Leave only a short T/R-settle lead (~0.2 s). We key up *before* playing (see
+    // below), so the rig is already transmitting by the time audio flows; a long
+    // lead just pushes our DT later. Small margin guards the rig's ALC attack.
+    const TX_LEAD_SAMPLES: usize = TX_SAMPLE_RATE as usize / 5;
     let lead = samples.iter().take_while(|&&s| s.abs() < 1e-4).count();
     if lead > TX_LEAD_SAMPLES {
         samples.drain(..lead - TX_LEAD_SAMPLES);
@@ -197,6 +205,13 @@ async fn transmit(
     // watchdog covers a full over, and a Kenwood rejects `TX` while transmitting.
     let outcome = match audio::play(output, samples, TX_SAMPLE_RATE) {
         Ok(playback) => {
+            // How late the very first audio sample reaches the air, relative to the
+            // slot edge — synth + key-up + device-open all land in here. Plus the
+            // ~0.2 s lead trimmed above, this is our effective DT.
+            tracing::info!(
+                into_slot_ms = now_ms().rem_euclid(15_000),
+                "audio-tx: playback started (tones reach air ~0.2 s later)",
+            );
             // Stream the own-TX columns while it plays; `stop` ends the streamer the
             // instant the over does (normal finish or operator Stop).
             let stop = Arc::new(AtomicBool::new(false));

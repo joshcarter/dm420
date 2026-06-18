@@ -85,10 +85,13 @@ fn publish_rig_state(bus: &BusHandle) {
 
 // --------------------------------------------------------------------- clock
 
-/// Publish the slot phase twice a second so the clock UI (and slot-aligned
-/// producers later) has a heartbeat.
+/// Publish the slot phase frequently so the clock UI has a heartbeat *and* the QSO
+/// engine detects the slot boundary promptly: the shell starts an over when it sees
+/// `slot_phase` wrap, so this interval is the worst-case lateness added to every
+/// transmit. FT8 wants the tones on-air near the top of the slot, so keep it small
+/// (50 ms ⇒ ≤50 ms boundary-detection lag, vs ½ s at the old UI-only rate).
 async fn run_clock(bus: BusHandle) {
-    let mut tick = tokio::time::interval(Duration::from_millis(500));
+    let mut tick = tokio::time::interval(Duration::from_millis(50));
     loop {
         tick.tick().await;
         let ms = now_ms();
