@@ -188,7 +188,7 @@ impl Panel for Waterfall {
             block.min,
             Pos2::new(block.right(), block.top() + pd::HEADER_ROW_H),
         );
-        panel_header(painter, header, pal, "FT8", "0–3000 Hz · time → left");
+        panel_header(painter, header, pal, "FT8", "0–3000 Hz · time → left", ctx.active);
         // right side: prominent tuned-frequency readout
         let cy = header.center().y;
         let mut rx = header.right() - 2.0;

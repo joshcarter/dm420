@@ -43,7 +43,7 @@ impl Panel for Contacts {
             block.min,
             Pos2::new(block.right(), block.top() + pd::HEADER_ROW_H),
         );
-        panel_header(painter, header, pal, "Contacts", "World · DN70KA");
+        panel_header(painter, header, pal, "Contacts", "World · DN70KA", ctx.active);
         painter.text(
             Pos2::new(header.right() - 2.0, header.center().y),
             Align2::RIGHT_CENTER,

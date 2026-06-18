@@ -49,7 +49,7 @@ impl Panel for LogBook {
             0
         };
         let logs = ctx.bus.recent_logs(capacity);
-        panel_header(painter, header, pal, "Log Book", &format!("last {} · FT8", logs.len()));
+        panel_header(painter, header, pal, "Log Book", &format!("last {} · FT8", logs.len()), ctx.active);
         painter.text(
             Pos2::new(header.right() - 2.0, header.center().y),
             Align2::RIGHT_CENTER,

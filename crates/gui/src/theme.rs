@@ -39,8 +39,11 @@ pub fn mono(size: f32) -> FontId {
 pub const CHASSIS_RADIUS: u8 = 4;
 pub const BRACKET_ARM: f32 = 9.0;
 pub const BRACKET_STROKE: f32 = 1.5;
-pub const SPINE_W: f32 = 3.0;
-pub const SPINE_H: f32 = 14.0;
+/// Header focus marker: a 9px square at the start of each panel header. Hollow
+/// (accent stroke) by default; filled with a faint glow when the panel holds
+/// keyboard focus. Replaces the old 3×14 spine bar.
+pub const FOCUS_BOX_SZ: f32 = 9.0;
+pub const FOCUS_BOX_STROKE: f32 = 1.5;
 pub const TOGGLE_SQ: f32 = 10.0;
 pub const TOGGLE_STROKE: f32 = 1.5;
 // Panel/layout geometry (TOPBAR_H, FOOTER_H, header rows, gaps) lives in
@@ -204,13 +207,35 @@ pub fn recessed_screen(painter: &egui::Painter, rect: Rect, pal: &Palette) {
     corner_brackets(painter, rect, pal.accent);
 }
 
-/// Draw the 3px accent spine bar at `left_center`, returning x where text starts.
-pub fn spine(painter: &egui::Painter, left_center: Pos2, accent: Color32) -> f32 {
-    let rect = Rect::from_center_size(
-        Pos2::new(left_center.x + SPINE_W * 0.5, left_center.y),
-        Vec2::new(SPINE_W, SPINE_H),
+/// Draw the header focus marker at `left_center` (its left-center point),
+/// returning the x where header text should start. A 9px square: hollow with a
+/// 1.5px accent stroke when `active` is false, or filled with a faint accent
+/// glow when this panel holds keyboard focus. Uses the **accent** (amber), never
+/// the cyan/blue transmit color, so focus reads as distinct from live state.
+pub fn focus_box(painter: &egui::Painter, left_center: Pos2, pal: &Palette, active: bool) -> f32 {
+    let rect = Rect::from_min_size(
+        Pos2::new(left_center.x, left_center.y - FOCUS_BOX_SZ * 0.5),
+        Vec2::splat(FOCUS_BOX_SZ),
     );
-    painter.rect_filled(rect, CornerRadius::ZERO, accent);
+    if active {
+        // Soft accent halo: a few expanded translucent rings behind the box.
+        for i in 1..=3 {
+            painter.rect_stroke(
+                rect.expand(i as f32 * 1.5),
+                CornerRadius::ZERO,
+                Stroke::new(1.0, pal.accent.gamma_multiply(0.16)),
+                StrokeKind::Outside,
+            );
+        }
+        painter.rect_filled(rect, CornerRadius::ZERO, pal.accent);
+    } else {
+        painter.rect_stroke(
+            rect,
+            CornerRadius::ZERO,
+            Stroke::new(FOCUS_BOX_STROKE, pal.accent),
+            StrokeKind::Inside,
+        );
+    }
     rect.right()
 }
 

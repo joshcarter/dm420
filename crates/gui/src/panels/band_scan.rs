@@ -91,7 +91,7 @@ impl Panel for BandScan {
         } else {
             format!("Last scan: {} min ago", self.last_min)
         };
-        panel_header(painter, header, pal, "Band Scan", &status);
+        panel_header(painter, header, pal, "Band Scan", &status, ctx.active);
 
         // Scan / Cancel button (lit accent key in a recessed track), header-right.
         let label = if self.running { "CANCEL" } else { "SCAN" };

@@ -156,10 +156,18 @@ pub fn key_cell_accent(
 // Shared panel chrome: header (spine + legend + sub) + the standard block split.
 // ---------------------------------------------------------------------------
 
-/// Draw a panel header (spine + uppercase legend + sub-label).
-pub fn panel_header(painter: &egui::Painter, header: Rect, pal: &Palette, title: &str, sub: &str) {
+/// Draw a panel header (focus marker + uppercase legend + sub-label). `active`
+/// fills the focus box when this panel holds keyboard focus.
+pub fn panel_header(
+    painter: &egui::Painter,
+    header: Rect,
+    pal: &Palette,
+    title: &str,
+    sub: &str,
+    active: bool,
+) {
     let cy = header.center().y;
-    let after = spine(painter, Pos2::new(header.left(), cy), pal.accent);
+    let after = focus_box(painter, Pos2::new(header.left(), cy), pal, active);
     let tx = after + 8.0;
     let t = tracked(&title.to_uppercase());
     engraved_text(
