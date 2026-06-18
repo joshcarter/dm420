@@ -125,6 +125,9 @@ struct Tactical<'a> {
     relief: &'a egui::TextureHandle,
     dt: f64,
     bus: &'a BusView,
+    /// The operator's configured station identity, threaded to the panels.
+    call: &'a str,
+    grid: &'a str,
     unlocked: bool,
     /// The pane that currently receives keyboard input. Panels compare their own
     /// tile id against this to decide whether Enter/typing is theirs to handle.
@@ -157,6 +160,8 @@ impl<'a> Behavior<Box<dyn Panel>> for Tactical<'a> {
             relief: self.relief,
             dt: self.dt,
             bus: self.bus,
+            call: self.call,
+            grid: self.grid,
             unlocked: self.unlocked,
             active: id == self.focused,
         };
@@ -389,6 +394,8 @@ impl eframe::App for App {
                     relief: &relief,
                     dt: dt as f64,
                     bus: &self.view,
+                    call: &self.station.call,
+                    grid: &self.station.grid,
                     unlocked: self.edit_mode,
                     focused: self.focused,
                     clicked: &mut clicked,
@@ -432,24 +439,57 @@ impl App {
         painter.rect_filled(marker, CornerRadius::ZERO, pal.accent);
         // Callsign left edge == FT8 header label left: focus box (9) + 8px gap.
         let call_x = panel_left + FOCUS_BOX_SZ + 8.0;
-        let call = tracked("N0JDC");
-        engraved_text(
-            painter,
-            Pos2::new(call_x, cy),
-            &call,
-            heading_bold(18.0),
-            pal.legend,
-            shadow(pal),
-            Align2::LEFT_CENTER,
-        );
-        let grid_x = call_x + measure(painter, &call, heading_bold(18.0)) + 9.0;
-        painter.text(
-            Pos2::new(grid_x, cy + 1.0),
-            Align2::LEFT_CENTER,
-            &tracked("DN70KA"),
-            mono(9.0),
-            pal.sub,
-        );
+        if self.edit_mode {
+            // Unlocked: the identity becomes two text fields so the operator can
+            // retype the station call sign and grid, then re-lock to commit. Both
+            // are kept upper-case to FT8/Maidenhead convention as they're typed.
+            let box_h = 22.0;
+            let call_rect =
+                Rect::from_min_size(Pos2::new(call_x, cy - box_h / 2.0), Vec2::new(118.0, box_h));
+            let call_resp = ui.put(
+                call_rect,
+                egui::TextEdit::singleline(&mut self.station.call)
+                    .font(heading_bold(16.0))
+                    .char_limit(11)
+                    .hint_text("CALL"),
+            );
+            if call_resp.changed() {
+                self.station.call = self.station.call.to_uppercase();
+            }
+            let grid_rect = Rect::from_min_size(
+                Pos2::new(call_rect.right() + 8.0, cy - box_h / 2.0),
+                Vec2::new(84.0, box_h),
+            );
+            let grid_resp = ui.put(
+                grid_rect,
+                egui::TextEdit::singleline(&mut self.station.grid)
+                    .font(mono(13.0))
+                    .char_limit(6)
+                    .hint_text("GRID"),
+            );
+            if grid_resp.changed() {
+                self.station.grid = self.station.grid.to_uppercase();
+            }
+        } else {
+            let call = tracked(&self.station.call);
+            engraved_text(
+                painter,
+                Pos2::new(call_x, cy),
+                &call,
+                heading_bold(18.0),
+                pal.legend,
+                shadow(pal),
+                Align2::LEFT_CENTER,
+            );
+            let grid_x = call_x + measure(painter, &call, heading_bold(18.0)) + 9.0;
+            painter.text(
+                Pos2::new(grid_x, cy + 1.0),
+                Align2::LEFT_CENTER,
+                &tracked(&self.station.grid),
+                mono(9.0),
+                pal.sub,
+            );
+        }
 
         // ---- right cluster, laid out right-to-left ----
         let right_edge = bar.right() - 24.0;

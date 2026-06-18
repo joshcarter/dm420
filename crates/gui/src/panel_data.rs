@@ -69,7 +69,10 @@ pub const MAP_H: f32 = 900.0;   // (= (LAT_TOP − (−90)) * S)
 #[inline] pub fn map_x(lon: f32) -> f32 { (lon - LON0) * KX * S }
 #[inline] pub fn map_y(lat: f32) -> f32 { (LAT_TOP - lat) * S }
 
-pub const HOME_LAT: f32 = 40.00; // Lafayette, CO (QTH) — N0JDC, grid DN70KA
+// Fallback QTH (Lafayette, CO ≈ grid DN70KA), used by the Contacts map only when
+// the operator's configured grid can't be decoded. Normally home is derived from
+// that grid via `grid_to_lonlat`.
+pub const HOME_LAT: f32 = 40.00;
 pub const HOME_LON: f32 = -105.10;
 
 // Graticule: world meridians/parallels every 30° (edges ±180/±90 omitted).

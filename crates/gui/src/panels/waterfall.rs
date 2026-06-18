@@ -71,8 +71,8 @@ impl Waterfall {
     /// armed state). The box is not a free text field: only `/`/`:` (start a slash
     /// command) and Enter (activate the button) are accepted; see `send.rs`.
     fn draw_send_row(&mut self, ctx: &mut PanelCtx, row: Rect) {
-        const MYCALL: &str = "N0JDC";
-        const MYGRID: &str = "DN70";
+        // The operator's configured station identity (top-bar, env-seeded).
+        let (mycall, mygrid) = (ctx.call, ctx.grid);
 
         // Keyboard: only the active panel acts on typed input / Enter. `/` or `:`
         // begins a slash command; Backspace/Escape edit/abort it; Enter activates
@@ -97,7 +97,7 @@ impl Waterfall {
 
         // Keep the box mirroring the engine's next message (unless mid-command).
         let target = self.slide.outgoing().clone();
-        self.send.refresh_auto(&target, MYCALL, MYGRID);
+        self.send.refresh_auto(&target, mycall, mygrid);
 
         let pal = ctx.pal;
         let painter = ctx.painter;

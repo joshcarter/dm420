@@ -20,6 +20,8 @@
 //! - `DM420_SERIAL_PROFILE` — serial line profile: `none` | `dtr-rts` | `rtscts`.
 //! - `DM420_MODE` — `ft8` | `ft4` (default `ft8`).
 //! - `DM420_WAV` — replay this WAV instead of live capture (bring-up/testing).
+//! - `DM420_CALLSIGN` — the operator's station call sign (default `N0JDC`).
+//! - `DM420_GRID` — the operator's Maidenhead grid locator (default `DN70KA`).
 
 use std::path::PathBuf;
 
@@ -42,6 +44,27 @@ pub struct HardwareConfig {
     pub audio_input: Option<String>,
     pub serial: SerialConfig,
     pub protocol: Protocol,
+}
+
+/// The operator's station identity: call sign + Maidenhead grid locator. This is
+/// GUI-only presentation/encoding state — it labels the top bar and feeds the FT8
+/// message generator — so it lives outside [`Settings`] and never reaches `core`.
+/// Held by `App`, edited live from the top bar when the GUI is unlocked.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Station {
+    pub call: String,
+    pub grid: String,
+}
+
+impl Station {
+    /// Read `DM420_CALLSIGN` / `DM420_GRID`, falling back to the project's home
+    /// station. Both are upper-cased to FT8/Maidenhead convention.
+    pub fn from_env() -> Self {
+        Station {
+            call: env_nonempty("DM420_CALLSIGN").unwrap_or_else(|| "N0JDC".into()).to_uppercase(),
+            grid: env_nonempty("DM420_GRID").unwrap_or_else(|| "DN70KA".into()).to_uppercase(),
+        }
+    }
 }
 
 /// Parsed startup configuration. Built once at launch by [`Settings::from_env`].

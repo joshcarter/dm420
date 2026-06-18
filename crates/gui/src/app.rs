@@ -9,12 +9,16 @@ use egui_tiles::Tree;
 
 use crate::bus_view::BusView;
 use crate::panels::Panel;
+use crate::settings::Station;
 use crate::theme::{Palette, GRAPHITE, SILVER};
 use crate::{build_tree, TreeIds};
 
 pub struct App {
     pub dark: bool,
     pub edit_mode: bool, // GUI LOCK/EDIT
+    /// The operator's station identity (call sign + grid). Shown in the top bar
+    /// and editable there when unlocked; read by the panels via `PanelCtx`.
+    pub station: Station,
     pub tree: Tree<Box<dyn Panel>>,
     pub tree_ids: TreeIds,
     /// The pane that currently has keyboard focus (click or Cmd/Ctrl-1..4).
@@ -40,6 +44,7 @@ impl App {
         Self {
             dark,
             edit_mode: false,
+            station: Station::from_env(),
             tree,
             tree_ids,
             focused,

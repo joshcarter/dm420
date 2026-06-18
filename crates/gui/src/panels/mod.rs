@@ -31,6 +31,12 @@ pub struct PanelCtx<'a> {
     pub relief: &'a TextureHandle,
     pub dt: f64,
     pub bus: &'a BusView,
+    /// The operator's station call sign (the configured identity, upper-cased).
+    /// Read by the FT8 send row to build outgoing messages.
+    pub call: &'a str,
+    /// The operator's Maidenhead grid locator. Used by the send row and to centre
+    /// the Contacts map on home.
+    pub grid: &'a str,
     /// True when the GUI is unlocked (the top-bar GUI switch is on EDIT). Panels
     /// use this to reveal their edit/settings affordances; the default (locked)
     /// is the normal operating view. Each panel decides what unlocking means for

@@ -1,3 +1,11 @@
+# Immediate
+
+Regenerate CLAUDE.md
+
+# Soon
+
+FT4/FT8 mode switch. Also switch calling frequency for each band.
+
 Waterslide view: as signals get decoded, we may need to shift the
 vertical position of decodes when their text won't render cleanly
 because of adjacent signals. We may need to bump the position of a
@@ -20,12 +28,13 @@ different band counts as a different contact. Maybe when UI is
 unlocked, have a "reset" button on the log book which moves the old
 log book to a new file name.
 
-Configuration: add "edit" view to each panel when UI is unlocked. FT8
-panel will need radio setup such as audio device and CAT serial port
-and baud rate.
-
 Toggle switches (e.g. light/dark): hit box for switch should be entire
 switch.
+
+# Next
+
+Unlocked view should show the keyboard shortcut for each panel.
+
 
 # Optional
 

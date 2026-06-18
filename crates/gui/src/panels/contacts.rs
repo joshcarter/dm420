@@ -38,12 +38,17 @@ impl Panel for Contacts {
         let painter = ctx.painter;
         let pal = ctx.pal;
         let spots = ctx.bus.worked_spots();
+        // Home is the operator's configured grid, decoded to lon/lat; fall back to
+        // the default QTH if the grid can't be parsed.
+        let home = pd::grid_to_lonlat(ctx.grid)
+            .map(|g| (g.lon, g.lat))
+            .unwrap_or((pd::HOME_LON, pd::HOME_LAT));
 
         let header = Rect::from_min_max(
             block.min,
             Pos2::new(block.right(), block.top() + pd::HEADER_ROW_H),
         );
-        panel_header(painter, header, pal, "Contacts", "World · DN70KA", ctx.active);
+        panel_header(painter, header, pal, "Contacts", &format!("World · {}", ctx.grid), ctx.active);
         painter.text(
             Pos2::new(header.right() - 2.0, header.center().y),
             Align2::RIGHT_CENTER,
@@ -61,7 +66,7 @@ impl Panel for Contacts {
             Pos2::new(block.right(), footer.top() - pd::GAP),
         );
         recessed_screen(painter, screen, pal);
-        draw_map(painter, screen, pal, ctx.relief, &spots);
+        draw_map(painter, screen, pal, ctx.relief, &spots, home);
         self.draw_footer(ctx.ui, painter, footer, pal);
     }
 }
@@ -171,6 +176,9 @@ fn draw_map(
     pal: &Palette,
     relief: &TextureHandle,
     spots: &[(String, String)],
+    // The operator's home location as `(lon, lat)` — a plotted bounds point and
+    // the centre of the range rings.
+    home_ll: (f32, f32),
 ) {
     if screen.width() < 24.0 || screen.height() < 24.0 {
         return;
@@ -189,7 +197,7 @@ fn draw_map(
         .filter_map(|(call, grid)| pd::station_lonlat(call, grid))
         .map(|(lon, lat)| Vec2::new(pd::map_x(lon), pd::map_y(lat)))
         .collect();
-    pts.push(Vec2::new(pd::map_x(pd::HOME_LON), pd::map_y(pd::HOME_LAT)));
+    pts.push(Vec2::new(pd::map_x(home_ll.0), pd::map_y(home_ll.1)));
     let (mut minx, mut miny, mut maxx, mut maxy) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
     for v in &pts {
         minx = minx.min(v.x); miny = miny.min(v.y);
@@ -275,7 +283,7 @@ fn draw_map(
     }
 
     // 3) range rings (dashed ellipses about home)
-    let home = proj(pd::HOME_LON, pd::HOME_LAT);
+    let home = proj(home_ll.0, home_ll.1);
     for &km in pd::RING_KM {
         let rx = sl((km / 85.0) * pd::KX * pd::S);
         let ry = sl((km / 111.0) * pd::S);
