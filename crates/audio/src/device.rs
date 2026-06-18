@@ -42,24 +42,57 @@ pub fn list_devices() -> Result<Vec<DeviceInfo>, AudioError> {
         .map_err(|e| AudioError::Device(e.to_string()))?
     {
         let name = device.name().unwrap_or_else(|_| "<unknown>".into());
-        if let Ok(cfg) = device.default_input_config() {
+        // Per-device probe at DEBUG: exactly what cpal reports, so we can see why a
+        // duplex device (the rig codec) may not surface as an output.
+        debug!(
+            device = %name,
+            in_default = device.default_input_config().is_ok(),
+            in_ranges = device
+                .supported_input_configs()
+                .map(|mut c| c.next().is_some())
+                .unwrap_or(false),
+            out_default = device.default_output_config().is_ok(),
+            out_ranges = device
+                .supported_output_configs()
+                .map(|mut c| c.next().is_some())
+                .unwrap_or(false),
+            "audio device probe",
+        );
+        if let Some((rate, channels)) = probe_config(&device, DeviceKind::Input) {
             out.push(DeviceInfo {
                 name: name.clone(),
                 kind: DeviceKind::Input,
-                sample_rate: cfg.sample_rate().0,
-                channels: cfg.channels(),
+                sample_rate: rate,
+                channels,
                 is_default: Some(&name) == default_in.as_ref(),
                 looks_like_radio: is_radio_codec(&name),
             });
         }
-        if let Ok(cfg) = device.default_output_config() {
+        // Output entry when cpal can enumerate an output config. cpal can't
+        // enumerate a USB codec's output even though it streams fine, so also list a
+        // radio codec as an output (deduped) — the player opens it with an assumed
+        // config.
+        if let Some((rate, channels)) = probe_config(&device, DeviceKind::Output) {
             out.push(DeviceInfo {
                 name: name.clone(),
                 kind: DeviceKind::Output,
-                sample_rate: cfg.sample_rate().0,
-                channels: cfg.channels(),
+                sample_rate: rate,
+                channels,
                 is_default: Some(&name) == default_out.as_ref(),
                 looks_like_radio: is_radio_codec(&name),
+            });
+        } else if is_radio_codec(&name)
+            && !out
+                .iter()
+                .any(|d| d.kind == DeviceKind::Output && d.name == name)
+        {
+            out.push(DeviceInfo {
+                name: name.clone(),
+                kind: DeviceKind::Output,
+                sample_rate: 48_000,
+                channels: 2,
+                is_default: false,
+                looks_like_radio: true,
             });
         }
     }
@@ -67,6 +100,30 @@ pub fn list_devices() -> Result<Vec<DeviceInfo>, AudioError> {
         debug!(?d.kind, name = %d.name, rate = d.sample_rate, ch = d.channels, "found audio device");
     }
     Ok(out)
+}
+
+/// A device's `(sample_rate, channels)` for `kind`: its default config if the
+/// device answers, else the first supported config range. Some USB codecs (the
+/// TS-590 "USB Audio CODEC" among them) reject the default-config query on one
+/// direction while enumerating ranges fine — without this fallback a duplex codec
+/// vanishes from one side of the device list (e.g. shows as input but not output).
+fn probe_config(device: &cpal::Device, kind: DeviceKind) -> Option<(u32, u16)> {
+    match kind {
+        DeviceKind::Input => {
+            if let Ok(cfg) = device.default_input_config() {
+                return Some((cfg.sample_rate().0, cfg.channels()));
+            }
+            let r = device.supported_input_configs().ok()?.next()?;
+            Some((r.max_sample_rate().0, r.channels()))
+        }
+        DeviceKind::Output => {
+            if let Ok(cfg) = device.default_output_config() {
+                return Some((cfg.sample_rate().0, cfg.channels()));
+            }
+            let r = device.supported_output_configs().ok()?.next()?;
+            Some((r.max_sample_rate().0, r.channels()))
+        }
+    }
 }
 
 /// Pick a device from `devices` of the given `kind` by `selector`:
@@ -140,6 +197,10 @@ pub(crate) fn open_cpal_device(
             let needle = n.to_lowercase();
             let mut name_matched = 0u32;
             let mut substring: Option<cpal::Device> = None;
+            // cpal can't enumerate a USB codec's output even though it streams fine;
+            // keep the codec's output sibling (matching name, not input-capable) as a
+            // fallback when nothing reports the requested capability.
+            let mut codec_fallback: Option<cpal::Device> = None;
             for d in host
                 .devices()
                 .map_err(|e| AudioError::Device(e.to_string()))?
@@ -153,7 +214,15 @@ pub(crate) fn open_cpal_device(
                 }
                 name_matched += 1;
                 if !supports_kind(&d, kind) {
-                    debug!(name = %dn, ?kind, "skipping matched device without {kind:?} support");
+                    if kind == DeviceKind::Output
+                        && is_radio_codec(&dn)
+                        && !supports_kind(&d, DeviceKind::Input)
+                        && codec_fallback.is_none()
+                    {
+                        codec_fallback = Some(d);
+                    } else {
+                        debug!(name = %dn, ?kind, "skipping matched device without {kind:?} support");
+                    }
                     continue;
                 }
                 if exact {
@@ -165,7 +234,7 @@ pub(crate) fn open_cpal_device(
                     substring = Some(d);
                 }
             }
-            substring.ok_or_else(|| {
+            substring.or(codec_fallback).ok_or_else(|| {
                 AudioError::Device(if name_matched > 0 {
                     format!("audio device matching '{n}' exists but has no {kind:?} streams")
                 } else {
@@ -260,6 +329,38 @@ pub(crate) fn resolve_input_config(
     );
     let (idx, rate) = choose_config(&summaries, 48_000).ok_or_else(|| {
         AudioError::Device("device reports no usable input stream configs".into())
+    })?;
+    Ok(ranges[idx].with_sample_rate(cpal::SampleRate(rate)))
+}
+
+/// Resolve a usable *output* stream config: the device default first, then fall
+/// back to scanning `supported_output_configs()` — the mirror of
+/// [`resolve_input_config`], for codecs that reject the default-output query.
+pub(crate) fn resolve_output_config(
+    device: &cpal::Device,
+) -> Result<cpal::SupportedStreamConfig, AudioError> {
+    if let Ok(cfg) = device.default_output_config() {
+        return Ok(cfg);
+    }
+    let ranges: Vec<cpal::SupportedStreamConfigRange> = device
+        .supported_output_configs()
+        .map_err(|e| AudioError::Device(format!("querying output configs: {e}")))?
+        .collect();
+    let summaries: Vec<ConfigRange> = ranges
+        .iter()
+        .map(|r| ConfigRange {
+            channels: r.channels(),
+            min_rate: r.min_sample_rate().0,
+            max_rate: r.max_sample_rate().0,
+            format_pref: format_pref(r.sample_format()),
+        })
+        .collect();
+    debug!(
+        ?summaries,
+        "default output config unavailable; choosing from supported ranges"
+    );
+    let (idx, rate) = choose_config(&summaries, 48_000).ok_or_else(|| {
+        AudioError::Device("device reports no usable output stream configs".into())
     })?;
     Ok(ranges[idx].with_sample_rate(cpal::SampleRate(rate)))
 }

@@ -1,0 +1,25 @@
+# DM420 station identity — interim config (format & persistence are TBD; see
+# joels-notes.md). Copy this file to `dm420.toml` in the directory you launch
+# DM420 from, then set your own values.
+#
+# There is NO built-in default: DM420 will not call CQ or answer until a callsign
+# is set — here, via the DM420_CALLSIGN / DM420_GRID env vars, or typed into the
+# unlocked top bar (GUI ▸ EDIT). Env vars take precedence over this file.
+
+[station]
+callsign = "YOURCALL"   # e.g. W4LL
+grid     = "AA00"       # your Maidenhead grid, e.g. EM73
+
+# Audio device selections. Usually set from the unlocked Radio Setup panel and
+# written here automatically; empty = system default. For a Kenwood-style rig both
+# are typically "USB Audio CODEC".
+[audio]
+input  = ""   # RX capture device (DM420_AUDIO_INPUT env overrides this)
+output = ""   # TX output device (the rig's data-in)
+
+# Logging verbosity for DM420's own crates: trace | debug | info | warn | error.
+# Default is "info". Logs are appended to dm420.log in the launch directory (each
+# run opens with a timestamped "DM420 starting" line). RUST_LOG overrides this when
+# set (standard EnvFilter syntax, e.g. RUST_LOG=core::tx=debug,info).
+[logging]
+level = "info"

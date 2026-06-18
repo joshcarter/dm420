@@ -48,7 +48,10 @@ hound = "3.5"      # uncompressed WAV read/write (audio)
 
 # --- vendored rig/audio/modes support (Joel's prototype) ---
 crossbeam-channel = "0.5" # rig actor + audio capture channels
-tracing = "0.1"           # lightweight logging in vendored crates
+tracing = "0.1"           # lightweight logging facade (all crates emit through it)
+# Logging backend — only the `gui` binary installs a subscriber (see gui/logging.rs).
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"  # non-blocking file writer for dm420.log
 
 # --- misc ---
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }

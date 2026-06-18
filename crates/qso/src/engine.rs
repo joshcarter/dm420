@@ -190,15 +190,23 @@ impl Engine {
     fn on_command(&mut self, cmd: QsoCommand) {
         match cmd {
             QsoCommand::CallCq => {
+                tracing::info!(offset = ?self.outgoing, "qso engine: calling CQ");
                 self.state = State::Calling {
                     offset: self.outgoing,
                     tx_parity: None,
                 };
             }
             QsoCommand::Start { target } => {
+                tracing::info!(
+                    target = ?target.call,
+                    "qso engine: armed — will answer when the target next calls CQ"
+                );
                 self.state = State::Armed { target };
             }
-            QsoCommand::Abort => self.state = State::Idle,
+            QsoCommand::Abort => {
+                tracing::info!("qso engine: abort → idle");
+                self.state = State::Idle;
+            }
         }
     }
 
@@ -244,6 +252,7 @@ impl Engine {
         match msg {
             // The target called CQ — snap to it and answer in the opposite slot.
             ParsedMessage::Cq { caller, grid, .. } if Some(caller) == target.call.as_ref() => {
+                tracing::info!(target = ?caller, "qso engine: target called CQ → answering");
                 let opener = self.opener(caller);
                 self.state = State::Active(Box::new(Active {
                     role: Role::Answering,

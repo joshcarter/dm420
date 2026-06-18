@@ -216,13 +216,6 @@ impl WaterslidePanel {
         &self.outgoing
     }
 
-    /// Set the outgoing target. Used by the live (real-mode) waterslide, whose
-    /// click handling lives in `panels::waterfall::draw_waterslide` rather than
-    /// this panel's own `ui`, to feed the clicked decode/offset back to the send row.
-    pub fn set_outgoing(&mut self, target: Target) {
-        self.outgoing = target;
-    }
-
     /// Map an audio offset (Hz) to a vertical position in 0..H design space.
     /// Mirrors `waterslide_sim::y_of` against this panel's reference height.
     fn y_of(off: i32) -> f32 {

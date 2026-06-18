@@ -11,7 +11,7 @@ use crossbeam_channel::{Receiver, Sender, bounded};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Load a WAV file as mono f32 samples plus its sample rate. Handles 16/24/32-bit
 /// integer and 32-bit float, any channel count (downmixed by averaging).
@@ -137,19 +137,24 @@ fn playback_thread(
     let setup = (|| {
         let device = open_cpal_device(DeviceKind::Output, output_name.as_deref())?;
         let name = device.name().unwrap_or_else(|_| "<unknown>".into());
-        let config = device
-            .default_output_config()
-            .map_err(|e| AudioError::Device(e.to_string()))?;
-        if config.sample_format() != cpal::SampleFormat::F32 {
-            return Err(AudioError::Unsupported(format!(
-                "output sample format {:?} (only f32 supported)",
-                config.sample_format()
-            )));
-        }
-        Ok((device, name, config))
+        // Prefer the device's reported config; fall back to a common f32 layout for a
+        // USB codec whose output configs cpal can't enumerate (it still streams fine).
+        let (rate, channels) = match crate::device::resolve_output_config(&device) {
+            Ok(cfg) => {
+                if cfg.sample_format() != cpal::SampleFormat::F32 {
+                    return Err(AudioError::Unsupported(format!(
+                        "output sample format {:?} (only f32 supported)",
+                        cfg.sample_format()
+                    )));
+                }
+                (cfg.sample_rate().0, cfg.channels())
+            }
+            Err(_) => (48_000, 2),
+        };
+        Ok((device, name, rate, channels))
     })();
 
-    let (device, name, config) = match setup {
+    let (device, name, device_rate, channels) = match setup {
         Ok(v) => v,
         Err(e) => {
             let _ = ready_tx.send(Err(e));
@@ -157,8 +162,13 @@ fn playback_thread(
         }
     };
 
-    let device_rate = config.sample_rate().0;
-    let channels = config.channels() as usize;
+    let stream_config = cpal::StreamConfig {
+        channels,
+        sample_rate: cpal::SampleRate(device_rate),
+        buffer_size: cpal::BufferSize::Default,
+    };
+    let channels = channels as usize;
+    debug!(device = %name, rate = device_rate, channels, "audio-tx: opening output stream");
 
     // Resample the whole file up front (memory is cheap at these sizes, and it
     // keeps the audio callback trivial). Track progress in *file* frames so the
@@ -179,9 +189,10 @@ fn playback_thread(
     let samples_cb = Arc::clone(&samples);
     let done_cb = done_tx.clone();
     let progress_cb = Arc::clone(&progress);
+    let err_name = name.clone(); // for the stream-error callback (catches device dropouts)
 
     let stream = device.build_output_stream(
-        &config.config(),
+        &stream_config,
         move |out: &mut [f32], _| {
             let mut p = pos_cb.load(Ordering::Relaxed) as usize;
             for frame in out.chunks_mut(channels) {
@@ -199,22 +210,24 @@ fn playback_thread(
                 let _ = done_cb.try_send(());
             }
         },
-        |e| warn!(error = %e, "audio output stream error"),
+        move |e| warn!(device = %err_name, error = %e, "audio-tx: output stream error (device dropout?)"),
         None,
     );
 
     let stream = match stream {
         Ok(s) => s,
         Err(e) => {
+            warn!(device = %name, error = %e, "audio-tx: failed to build output stream");
             let _ = ready_tx.send(Err(AudioError::Stream(e.to_string())));
             return;
         }
     };
     if let Err(e) = stream.play() {
+        warn!(device = %name, error = %e, "audio-tx: failed to start output stream");
         let _ = ready_tx.send(Err(AudioError::Stream(e.to_string())));
         return;
     }
-    info!(device = %name, device_rate, channels, frames = samples.len(), "playback started");
+    info!(device = %name, device_rate, channels, frames = samples.len(), "audio-tx: playback started");
     let _ = ready_tx.send(Ok(name));
 
     // Hold the stream until stopped (wait() sends stop after done arrives).

@@ -31,7 +31,9 @@ const FT4_ND: usize = 87;
 pub struct Decode {
     /// Relative signal strength (Costas sync score; higher = stronger).
     pub score: i32,
-    /// Approximate SNR in dB (POC estimate ≈ score/2; relative, not calibrated).
+    /// Estimated SNR in dB, referenced to a 2500 Hz noise bandwidth (WSJT-X
+    /// convention): signal power at the Costas sync tones vs. the neighbouring
+    /// noise bins. A power ratio, so it is independent of the input gain.
     pub snr_db: f32,
     /// Time offset of the transmission from the start of the analyzed audio (s).
     pub dt: f32,
@@ -171,6 +173,100 @@ fn ft4_sync_score(wf: &Waterfall, c: &Candidate) -> i32 {
         }
     }
     if num > 0 { score / num } else { 0 }
+}
+
+/// The per-slot noise floor as linear power per analysis bin: the median of every
+/// stored magnitude over the filled blocks. FT8/FT4 signals occupy only a small
+/// fraction of the time–frequency bins, so the median tracks the noise, not the
+/// signals — and reading a global floor (rather than the tone bins beside a strong
+/// signal) avoids the spectral-leakage contamination that makes loud signals
+/// under-report.
+fn noise_floor(wf: &Waterfall) -> f64 {
+    let mags = &wf.mag[..wf.num_blocks * wf.block_stride];
+    if mags.is_empty() {
+        return 1e-12;
+    }
+    let mut hist = [0u32; 256];
+    for &v in mags {
+        hist[v as usize] += 1;
+    }
+    let target = mags.len() as u32 / 2; // median bin
+    let mut acc = 0u32;
+    let mut med = 0u8;
+    for (v, &count) in hist.iter().enumerate() {
+        acc += count;
+        if acc > target {
+            med = v as u8;
+            break;
+        }
+    }
+    10f64.powf(mag_db(med) as f64 / 10.0)
+}
+
+/// Estimate SNR in dB (≈2500 Hz reference, WSJT-X convention) for a candidate.
+///
+/// Takes the signal power at the known Costas **sync tones**, subtracts the
+/// per-slot `noise` floor to get the pure signal, and corrects the ratio from the
+/// per-bin analysis bandwidth to the 2500 Hz reference. Because it is a power
+/// *ratio* it is independent of the input gain — a strong signal reads high and one
+/// at the decode limit lands near −21 dB regardless of how hot the audio is driven
+/// (which the old `score / 2` placeholder did not).
+// The loop indices drive the block/time math and the Costas lookup, so the range
+// loops are intentional (matching `ft8_sync_score`).
+#[allow(clippy::needless_range_loop)]
+fn estimate_snr(wf: &Waterfall, c: &Candidate, noise: f64) -> f32 {
+    if noise <= 0.0 {
+        return 49.0;
+    }
+    let nb = wf.num_blocks as i32;
+    let (num_sync, len_sync, sync_offset) = if wf.protocol == Protocol::Ft4 {
+        (FT4_NUM_SYNC, FT4_LENGTH_SYNC, FT4_SYNC_OFFSET)
+    } else {
+        (FT8_NUM_SYNC, FT8_LENGTH_SYNC, FT8_SYNC_OFFSET)
+    };
+
+    // Linear power recovered from the stored u8 magnitude (dB → linear).
+    let lin = |v: u8| 10f64.powf(mag_db(v) as f64 / 10.0);
+
+    let mut sig_sum = 0.0f64; // signal+noise power at the sync tones
+    let mut sig_n = 0u32;
+    for m in 0..num_sync {
+        for k in 0..len_sync {
+            // FT4's sync starts one symbol into the slot (see `ft4_sync_score`).
+            let block = if wf.protocol == Protocol::Ft4 {
+                (1 + sync_offset * m + k) as i32
+            } else {
+                (sync_offset * m + k) as i32
+            };
+            let block_abs = c.time_offset + block;
+            if block_abs < 0 {
+                continue;
+            }
+            if block_abs >= nb {
+                break;
+            }
+            let costas = if wf.protocol == Protocol::Ft4 {
+                FT4_COSTAS[m][k] as i32
+            } else {
+                FT8_COSTAS[k] as i32
+            };
+            sig_sum += lin(mag_at(wf, c, block_abs, costas));
+            sig_n += 1;
+        }
+    }
+    if sig_n == 0 {
+        return -24.0; // no sync coverage in range — report the decode floor
+    }
+
+    // Pure signal power (subtract the noise carried in the sync-tone bin), floored
+    // so a sync tone at/under the noise still yields a finite dB.
+    let s_plus_n = sig_sum / sig_n as f64;
+    let signal = (s_plus_n - noise).max(noise * 1e-3);
+    // Per-bin analysis bandwidth → 2500 Hz reference: -10*log10(2500 / bin_hz).
+    let bin_hz = 1.0 / (wf.symbol_period * wf.freq_osr as f32);
+    let correction = -10.0 * (2500.0 / bin_hz as f64).log10();
+    let snr_db = 10.0 * (signal / noise).log10() + correction;
+    (snr_db as f32).clamp(-28.0, 49.0)
 }
 
 fn find_candidates(wf: &Waterfall) -> Vec<Candidate> {
@@ -324,6 +420,24 @@ fn decode_candidate(wf: &Waterfall, c: &Candidate) -> Option<[u8; 10]> {
 /// Decode a slot of mono audio at `sample_rate` (12 kHz expected) and return the
 /// transmissions found, strongest first.
 pub fn decode(samples: &[f32], sample_rate: u32, protocol: Protocol) -> Vec<Decode> {
+    // Collect the streamed decodes; order is strongest-first (candidate score).
+    // The call site re-sorts low-to-high in frequency if it wants that.
+    let mut out = Vec::new();
+    decode_streaming(samples, sample_rate, protocol, |d| out.push(d));
+    out
+}
+
+/// Like [`decode`], but hand each transmission to `on_decode` the instant it is
+/// found (strongest first) rather than collecting them into a `Vec`. This lets the
+/// live pipeline publish each decode onto the bus as it lands, so the UI and the
+/// QSO engine see the strongest signals (e.g. a CQ being answered) first — a beat
+/// before the whole slot's batch would have finished — instead of all at once.
+pub fn decode_streaming(
+    samples: &[f32],
+    sample_rate: u32,
+    protocol: Protocol,
+    mut on_decode: impl FnMut(Decode),
+) {
     let mut mon = Monitor::new(sample_rate, protocol, TIME_OSR, FREQ_OSR, 200.0, 3000.0);
     let bs = mon.block_size;
     let mut pos = 0;
@@ -333,10 +447,10 @@ pub fn decode(samples: &[f32], sample_rate: u32, protocol: Protocol) -> Vec<Deco
     }
 
     let wf = &mon.wf;
-    let cands = find_candidates(wf);
+    let noise = noise_floor(wf);
+    let cands = find_candidates(wf); // already sorted strongest-first by score
     let mut hash = CallHash::new();
     let mut seen: HashSet<[u8; 10]> = HashSet::new();
-    let mut out = Vec::new();
     let sp = wf.symbol_period;
     for c in &cands {
         let Some(payload) = decode_candidate(wf, c) else {
@@ -352,18 +466,15 @@ pub fn decode(samples: &[f32], sample_rate: u32, protocol: Protocol) -> Vec<Deco
             (wf.min_bin as f32 + c.freq_offset as f32 + c.freq_sub as f32 / wf.freq_osr as f32)
                 / sp;
         let dt = (c.time_offset as f32 + c.time_sub as f32 / wf.time_osr as f32) * sp;
-        out.push(Decode {
+        on_decode(Decode {
             score: c.score,
-            snr_db: c.score as f32 * 0.5,
+            snr_db: estimate_snr(wf, c, noise),
             dt,
             freq_hz,
             message: text,
             msg_type,
         });
     }
-    // Present low-to-high in frequency by default at the call site; here keep
-    // strongest-first (candidates are already sorted by score).
-    out
 }
 
 #[cfg(test)]
@@ -411,5 +522,44 @@ mod tests {
         let msgs: Vec<&String> = decodes.iter().map(|d| &d.message).collect();
         assert!(msgs.iter().any(|m| *m == "CQ K1ABC FN42"), "got {msgs:?}");
         assert!(msgs.iter().any(|m| *m == "W9XYZ K1ABC -09"), "got {msgs:?}");
+    }
+
+    #[test]
+    fn snr_is_plausible_for_a_clean_signal() {
+        let mut h = Ch::new();
+        let payload = encode_std("CQ", "K1ABC", "FN42", &mut h).unwrap();
+        let sig = synth_ft8(&payload, 1000.0, 12000);
+        let d = decode(&sig, 12000, Protocol::Ft8)
+            .into_iter()
+            .find(|d| d.message == "CQ K1ABC FN42")
+            .expect("decodes");
+        // Lands in a sane FT8 range and reads as a strong signal (the GUI calls
+        // anything above -12 dB "strong").
+        assert!((-28.0..=49.0).contains(&d.snr_db), "snr out of range: {}", d.snr_db);
+        assert!(d.snr_db > -12.0, "clean signal should be strong, got {}", d.snr_db);
+    }
+
+    #[test]
+    fn snr_tracks_signal_level_relative_to_noise() {
+        let mut h = Ch::new();
+        let payload = encode_std("CQ", "K1ABC", "FN42", &mut h).unwrap();
+        let sig = synth_ft8(&payload, 1000.0, 12000);
+        // Same message + same fixed noise, two signal levels: the louder one must
+        // report a higher SNR (the whole point — it's relative to the noise floor).
+        let snr_at = |scale: f32| -> f32 {
+            let mut s: Vec<f32> = sig.iter().map(|x| x * scale).collect();
+            add_noise(&mut s, 0.10, 0xA5A5_5A5A_0F0F_F0F0);
+            decode(&s, 12000, Protocol::Ft8)
+                .into_iter()
+                .find(|d| d.message == "CQ K1ABC FN42")
+                .unwrap_or_else(|| panic!("decodes at scale {scale}"))
+                .snr_db
+        };
+        let strong = snr_at(1.0);
+        let weak = snr_at(0.15);
+        assert!(
+            strong > weak,
+            "louder signal must read higher SNR: strong={strong} weak={weak}"
+        );
     }
 }

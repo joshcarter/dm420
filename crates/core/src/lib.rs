@@ -26,11 +26,13 @@ use bus::types::RadioId;
 mod control;
 mod decode;
 mod health;
+mod interlock;
 mod map;
 mod parse;
 mod rig_adapter;
+mod tx;
 
-pub use control::{AudioControl, CoreControl, RigControl};
+pub use control::{AudioControl, CoreControl, RigControl, TxControl};
 pub use modes::Protocol;
 pub use parse::parse_message;
 pub use rig::LineProfile;
@@ -42,6 +44,18 @@ pub fn list_audio_inputs() -> Vec<String> {
         .map(|ds| {
             ds.into_iter()
                 .filter(|d| d.kind == audio::DeviceKind::Input)
+                .map(|d| d.name)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Names of output-capable audio devices, for a UI device picker. Empty on error.
+pub fn list_audio_outputs() -> Vec<String> {
+    audio::list_devices()
+        .map(|ds| {
+            ds.into_iter()
+                .filter(|d| d.kind == audio::DeviceKind::Output)
                 .map(|d| d.name)
                 .collect()
         })
@@ -115,6 +129,9 @@ pub struct CoreConfig {
     /// Where to persist the logbook (JSON). `None` ⇒ no logbook producer, so the
     /// log stays in-memory only (mock mode supplies its own fake logbook).
     pub logbook: Option<PathBuf>,
+    /// Initial TX audio output device; `None` = system default. Live-editable
+    /// afterward via [`CoreControl::tx`].
+    pub tx_output: Option<String>,
 }
 
 impl Default for CoreConfig {
@@ -125,6 +142,7 @@ impl Default for CoreConfig {
             decode: DecodeSource::None,
             serial: None,
             logbook: None,
+            tx_output: None,
         }
     }
 }
@@ -144,16 +162,40 @@ pub fn spawn(bus: &BusHandle, cfg: CoreConfig) -> CoreControl {
         decode,
         serial,
         logbook,
+        tx_output,
     } = cfg;
 
+    tracing::info!(
+        radio = ?radio,
+        allow_transmit,
+        tx_output = ?tx_output,
+        has_serial = serial.is_some(),
+        "core: launching producers",
+    );
+
     let mut control = CoreControl::default();
+
+    // The interlock granter owns the single PTT token — the authority
+    // `allow_transmit` ultimately unlocks. Serve it for bus clients (the QSO
+    // shell) and share it into the rig adapter for in-process key-up validation.
+    let granter = interlock::Granter::default();
+    interlock::serve(bus, radio.clone(), granter.clone());
+
+    // TX path: the audio-TX service that synthesizes, keys, and plays. Its output
+    // device is live-editable from the UI via `control.tx`. Spawned whenever
+    // transmit is permitted (the operator still keys it explicitly, per over).
+    let tx_control = Arc::new(control::TxControl::new(tx_output));
+    if allow_transmit {
+        tx::spawn(bus, radio.clone(), tx_control.clone());
+    }
+    control.tx = Some(tx_control);
 
     // The rig producer is optional: with no serial config there's simply no rig
     // on the bus (the GUI shows it as down). A present config never panics —
     // `rig_adapter` supervises the connection and reports health.
     if let Some(serial) = serial {
         let rig = Arc::new(RigControl::new(serial));
-        rig_adapter::spawn(bus, radio.clone(), allow_transmit, rig.clone());
+        rig_adapter::spawn(bus, radio.clone(), allow_transmit, rig.clone(), granter.clone());
         control.rig = Some(rig);
     }
 

@@ -57,10 +57,17 @@ const AUTODETECT_WINDOW: Duration = Duration::from_millis(250);
 /// `None` while disconnected.
 type SharedHandle = Arc<Mutex<Option<RigHandle>>>;
 
-pub fn spawn(bus: &BusHandle, radio: t::RadioId, allow_transmit: bool, control: Arc<RigControl>) {
+pub fn spawn(
+    bus: &BusHandle,
+    radio: t::RadioId,
+    allow_transmit: bool,
+    control: Arc<RigControl>,
+    granter: crate::interlock::Granter,
+) {
     let shared: SharedHandle = Arc::new(Mutex::new(None));
-    // The command server outlives any single connection; it reads `shared`.
-    serve_commands(bus, radio.clone(), shared.clone());
+    // The command server outlives any single connection; it reads `shared` and
+    // validates keying requests against the interlock `granter`.
+    serve_commands(bus, radio.clone(), shared.clone(), granter);
 
     // The supervisor owns connect/poll/reconnect on its own std thread (serial
     // I/O is blocking). It never returns.
@@ -244,7 +251,12 @@ fn publish_state(bus: &BusHandle, radio: &t::RadioId, handle: &RigHandle) {
     }
 }
 
-fn serve_commands(bus: &BusHandle, radio: t::RadioId, shared: SharedHandle) {
+fn serve_commands(
+    bus: &BusHandle,
+    radio: t::RadioId,
+    shared: SharedHandle,
+    granter: crate::interlock::Granter,
+) {
     let mut server =
         match bus.serve::<t::RigCommand, CommandResult>(&Topic::RigCommand(radio.clone())) {
             Ok(s) => s,
@@ -259,6 +271,7 @@ fn serve_commands(bus: &BusHandle, radio: t::RadioId, shared: SharedHandle) {
             let shared = shared.clone();
             let radio = radio.clone();
             let bus = bus.clone();
+            let granter = granter.clone();
             // The rig call blocks; keep it off the async executor.
             let reply = tokio::task::spawn_blocking(move || {
                 // Snapshot the live handle; if the rig is down, fail fast rather
@@ -267,7 +280,7 @@ fn serve_commands(bus: &BusHandle, radio: t::RadioId, shared: SharedHandle) {
                     Some(h) => h,
                     None => return CommandResult::Err("rig offline".into()),
                 };
-                apply(&handle, &cmd, &radio, &bus)
+                apply(&handle, &cmd, &radio, &bus, &granter)
             })
             .await
             .unwrap_or_else(|_| CommandResult::Err("rig task panicked".into()));
@@ -283,6 +296,7 @@ fn apply(
     cmd: &t::RigCommand,
     radio: &t::RadioId,
     bus: &BusHandle,
+    granter: &crate::interlock::Granter,
 ) -> CommandResult {
     let res = match cmd {
         t::RigCommand::SetFreq(t::AbsHz(hz)) => handle.set_freq(Vfo::A, *hz),
@@ -290,9 +304,16 @@ fn apply(
             let (mode, _data) = map::to_rig_mode(*m);
             handle.set_mode(mode)
         }
-        // Interlock-token validation belongs to the (future) core granter; for now
-        // Joel's actor enforces the TX gate + watchdog, so we forward the request.
-        t::RigCommand::PttRequest { on, token: _ } => handle.set_ptt(*on),
+        // Key-up requires a live interlock grant for this token (the granter is the
+        // authority `allow_transmit` unlocks). Key-down is always allowed — never
+        // block releasing TX. The actor's gate + 10 s watchdog still apply beneath.
+        t::RigCommand::PttRequest { on, token } => {
+            if *on && !granter.validate(*token) {
+                tracing::warn!(?token, "rig: PTT key-up denied (no live interlock grant)");
+                return CommandResult::Err("interlock: no live PTT grant for this token".into());
+            }
+            handle.set_ptt(*on)
+        }
     };
     match res {
         Ok(()) => {

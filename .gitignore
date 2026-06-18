@@ -1,3 +1,9 @@
 /target
 /.claude
 /reviews
+
+# Personal station config (call/grid). Copy dm420.example.toml → dm420.toml.
+/dm420.toml
+
+# Runtime log — appended each run (see gui/src/logging.rs).
+/dm420.log

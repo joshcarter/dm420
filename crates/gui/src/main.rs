@@ -15,6 +15,7 @@ mod app;
 mod bus_view;
 mod chrome;
 mod geo_data;
+mod logging;
 mod panel_data;
 mod panels;
 mod send;
@@ -35,6 +36,11 @@ use panels::{BandScan, Contacts, LogBook, Panel, PanelCtx, Waterfall};
 use theme::*;
 
 fn main() -> eframe::Result<()> {
+    // Install file logging first so everything after it is captured. The guard
+    // must live for the whole run (it flushes the writer on drop).
+    let _log_guard = logging::init();
+    tracing::info!(version = env!("CARGO_PKG_VERSION"), "DM420 starting");
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([pd::PANEL_W, pd::PANEL_H])
@@ -529,9 +535,13 @@ impl App {
         );
         if gui_clicks[0] {
             // Re-lock commits configuration: push any edited call/grid to the QSO
-            // engine so its outgoing messages use the new identity.
+            // engine, and persist the identity to dm420.toml so it survives a restart
+            // (comment-preserving; only once a callsign is actually set).
             self.edit_mode = false;
             self.view.set_qso_station(self.station.to_qso_config());
+            if self.station.is_set() {
+                self.station.save();
+            }
         }
         if gui_clicks[1] {
             self.edit_mode = true;

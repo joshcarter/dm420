@@ -443,6 +443,15 @@ pub enum TxOutcome {
     Failed(String),
 }
 
+/// Reply to a [`TxRequest`] on `radio/{id}/audio_tx` — receipt only. The real
+/// result (sent/denied/failed) is reported separately on `radio/{id}/tx_report`;
+/// a client awaiting this ack learns the over has finished and can then release
+/// its interlock token.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TxAck {
+    Accepted,
+}
+
 // =====================================================================
 // §7  Logbook  —  logbook/entries  (StreamLossless + gossiped)
 // =====================================================================
@@ -553,6 +562,28 @@ pub enum InterlockError {
     Denied,
     Expired,
     NotHolder,
+}
+
+/// `interlock/{id}` (Command) — a TX client asks the granter for, or returns, the
+/// PTT token. The granter enforces a single live holder; the grant self-expires at
+/// its TTL so a crashed client can't wedge the transmitter.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum InterlockRequest {
+    /// Request the PTT token (granted only if no live holder exists).
+    Acquire,
+    /// Return the token early (otherwise it lapses at TTL).
+    Release(InterlockToken),
+}
+
+/// Reply to an [`InterlockRequest`].
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum InterlockReply {
+    /// Token granted; valid for `ttl_ms` from the moment of the grant.
+    Granted { token: InterlockToken, ttl_ms: u64 },
+    /// Acquisition refused (someone else holds a live token).
+    Denied(InterlockError),
+    /// Release acknowledged.
+    Released,
 }
 
 // =====================================================================

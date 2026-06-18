@@ -151,6 +151,13 @@ impl BusView {
         // active runtime context; hold the guard while we wire everything up.
         let settings = crate::settings::Settings::from_env();
         let real = settings.is_real();
+        tracing::info!(
+            mode = if real { "real" } else { "mock" },
+            audio_input = ?settings.audio_input,
+            audio_output = ?settings.audio_output,
+            protocol = ?settings.protocol,
+            "bus_view: starting producers",
+        );
         let applied = Arc::new(Mutex::new(settings.hardware()));
         let _guard = rt.enter();
         let control = if real {
@@ -168,10 +175,9 @@ impl BusView {
 
         // The QSO engine is logic, not hardware — it runs in both modes, driven
         // by whichever decode/clock producers are live, serving `qso/{id}/command`
-        // and publishing `QsoState`. TX stays gated off (`allow_transmit: false`)
-        // until the PTT granter + audio-TX path exist. The UI consumer of
-        // `QsoState` (the send row) lands in the next wiring pass.
-        let qso_control = qso::spawn(&bus, mocks::radio_id(), station, false);
+        // and publishing `QsoState`. It auto-sends in real mode (a rig + the PTT
+        // interlock are present); in mock mode it sequences but never keys.
+        let qso_control = qso::spawn(&bus, mocks::radio_id(), station, real);
 
         pump_state(
             &bus,
@@ -347,6 +353,9 @@ impl BusView {
         if let Some(audio) = &self.control.audio {
             audio.set(cfg.audio_input.clone(), cfg.protocol);
         }
+        if let Some(tx) = &self.control.tx {
+            tx.set(cfg.audio_output.clone());
+        }
         *self.applied.lock().unwrap() = cfg;
     }
 
@@ -361,6 +370,11 @@ impl BusView {
     /// Input-capable audio device names, for the settings picker.
     pub fn audio_inputs(&self) -> Vec<String> {
         app_core::list_audio_inputs()
+    }
+
+    /// Output-capable audio device names, for the TX-output settings picker.
+    pub fn audio_outputs(&self) -> Vec<String> {
+        app_core::list_audio_outputs()
     }
 
     /// Available serial port names (likely-radio first), for the settings picker.
@@ -400,14 +414,14 @@ impl BusView {
     }
 
     /// Arm to answer `call` at `offset_hz` (the DM420 wait-for-CQ model — the
-    /// engine replies when that station next calls CQ).
-    pub fn answer_station(&self, offset_hz: f32, call: String) {
+    /// engine replies when that station next calls CQ). `slot` is the slot the
+    /// target's decode landed in, threaded from the click so the `DecodeRef` is the
+    /// real one. (The engine still re-derives TX parity from the target's own CQ
+    /// when it commits, but the ref now carries the true slot for selection/gossip.)
+    pub fn answer_station(&self, offset_hz: f32, call: String, slot: SlotId) {
         let target = DecodeRef {
             radio: mocks::radio_id(),
-            // The engine commits on the target's CQ decode (matching `call`) and
-            // takes the TX-slot parity from that decode, so this placeholder slot
-            // is never read. TODO: thread the real `DecodeRef` from the click.
-            slot: SlotId(0),
+            slot,
             call: Some(Callsign(call)),
         };
         self.publish_selection(offset_hz, Some(target.clone()));
@@ -511,7 +525,7 @@ fn pump_state<T: BusMessage>(bus: &BusHandle, topic: Topic, cell: Cell<T>, ctx: 
     let mut sub = match bus.subscribe::<T>(TopicSelector::Exact(topic)) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("bus_view: state subscribe failed: {e:?}");
+            tracing::error!(error = ?e, "bus_view: state subscribe failed");
             return;
         }
     };
@@ -540,7 +554,7 @@ fn pump_stream<T: BusMessage>(
     let mut sub = match bus.subscribe::<T>(sel) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("bus_view: stream subscribe failed: {e:?}");
+            tracing::error!(error = ?e, "bus_view: stream subscribe failed");
             return;
         }
     };
@@ -609,7 +623,7 @@ fn pump_health(
     let mut sub = match bus.subscribe::<SubsystemHealth>(TopicSelector::Exact(Topic::Health(id))) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("bus_view: health subscribe failed: {e:?}");
+            tracing::error!(error = ?e, "bus_view: health subscribe failed");
             return;
         }
     };
@@ -639,7 +653,7 @@ fn pump_bands(bus: &BusHandle, bands: Arc<Mutex<HashMap<Band, BandActivity>>>, c
         match bus.subscribe::<BandActivity>(TopicSelector::Exact(Topic::ScannerCandidates)) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("bus_view: candidates subscribe failed: {e:?}");
+                tracing::error!(error = ?e, "bus_view: candidates subscribe failed");
                 return;
             }
         };
