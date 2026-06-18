@@ -4,6 +4,27 @@ Running notes, gotchas, and reminders. Newest at the top.
 
 ## 2026-06-18
 
+- **🔴 IMPORTANT — EMI/RFI crashed the rig's USB on transmit (FIXED, station-side):**
+  this was the real TX blocker. With keying + data-route audio all correct, the **entire
+  TS-590 USB connection dropped out the instant RF actually flowed** — the audio codec
+  (TX *and* RX) **and** the CAT serial port all died together — then re-enumerated a few
+  seconds after TX stopped. **Root cause: RF feedback (common-mode RFI) crashing the USB
+  device.** It is *not* a DM420 bug: the CAT **serial** dying (`Broken pipe`) proves the
+  whole physical USB device dropped, not any audio/cpal contention. **Resolved with
+  station-side RFI mitigation** (common-mode/ferrite choking of the RF path).
+  - **Recognize it instantly in `dm420.log`:** three near-simultaneous (~0.1 s) lines —
+    `core::rig_adapter: rig poll failed … Broken pipe` + `audio::player: … output stream
+    error (device dropout?)` + `audio::recorder: audio input stream error` (all *"device
+    no longer available"*) — landing **~0.2–0.5 s after the FT8 tones start**, i.e. the
+    moment RF power flows. (The synth's ~1.18 s of leading silence makes no RF, so it
+    survives keying and dies on modulation.) The device re-enumerates seconds later and
+    DM420 auto-reconnects (rig autodetect + capture re-open).
+  - **If it ever recurs:** more/better common-mode chokes (type 31 mix, rig end) on the
+    **USB cable and the coax/feedline**; check SWR + feedline common-mode current; add a
+    USB galvanic isolator or powered hub; drop power to confirm the dose-response; the
+    decisive split-test is a **dummy load** (no drop ⇒ feedline RFI, choke the coax; still
+    drops ⇒ RF getting in at the rig/USB).
+
 - **Real logging to `dm420.log` (done; standard tracing levels):** the app installs a
   `tracing` subscriber (`gui/src/logging.rs`) that writes **`dm420.log`** in the launch
   dir, **appended across runs** (each run opens with a timestamped `DM420 starting`
@@ -16,6 +37,8 @@ Running notes, gotchas, and reminders. Newest at the top.
     interlock (grant/release/deny) → core::tx (begin/synth/key-up/PTT refresh/key-down/
     abort, plus an INFO/WARN per over) → rig (`set_ptt` TX1/RX, key-up deny) → audio
     (output device opened, playback started, stream-error on a dropout). ~12 lines/over.
+    Routine rig CAT byte chatter (the 0.5 s `IF` poll — send/rx/reply) sits at **`trace`**
+    so `debug` stays readable; `RUST_LOG=rig::channel=trace` brings it back when needed.
   - **INFO seams:** app start + version, producer mode (real/mock) + audio devices,
     `core: launching producers`, `qso: engine spawned`. Every old `eprintln!` diagnostic
     is gone, replaced by a real log record at the right level.

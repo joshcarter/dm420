@@ -10,7 +10,7 @@ use crate::RigError;
 use std::collections::VecDeque;
 use std::io;
 use std::time::{Duration, Instant};
-use tracing::{debug, trace, warn};
+use tracing::{trace, warn};
 
 /// What a caller expects back from a command.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,7 +93,7 @@ impl<B: ByteIo> SerialChannel<B> {
             self.buf.extend_from_slice(&tmp[..n]);
             // Log the actual bytes so a silent/garbled radio is diagnosable from
             // the log alone (this is what tells "no bytes" from "wrong baud").
-            debug!(bytes = n, rx = %crate::probe::hex_ascii(&tmp[..n]), "serial rx");
+            trace!(bytes = n, rx = %crate::probe::hex_ascii(&tmp[..n]), "serial rx");
         }
         Ok(n)
     }
@@ -126,7 +126,7 @@ impl<B: ByteIo> CatChannel for SerialChannel<B> {
         }
 
         let prefix: String = cmd.chars().take(2).collect();
-        debug!(tx = %cmd, ?expect, "CAT send");
+        trace!(tx = %cmd, ?expect, "CAT send");
         self.io.write_all(format!("{cmd};").as_bytes())?;
 
         let timeout = match expect {
@@ -142,7 +142,7 @@ impl<B: ByteIo> CatChannel for SerialChannel<B> {
                 match expect {
                     Expect::NoReply => self.pending.push_back(msg),
                     Expect::Reply | Expect::Any if matches => {
-                        debug!(rx = %msg, "CAT reply");
+                        trace!(rx = %msg, "CAT reply");
                         return Ok(Some(msg));
                     }
                     _ => self.pending.push_back(msg),
