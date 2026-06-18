@@ -4,8 +4,8 @@
 use eframe::egui;
 use egui::{Align2, Color32, ColorImage, Pos2, Rect, TextureHandle, TextureOptions};
 use types::{
-    Decode, DecodeContent, HealthState, ParsedMessage, QsoPhase, SlotId, SpectrumRow,
-    SubsystemHealth, SubsystemId,
+    Decode, DecodeContent, ExchangePayload, HealthState, ParsedMessage, QsoPhase, Signoff, SlotId,
+    SpectrumRow, SubsystemHealth, SubsystemId,
 };
 
 use app_core::{LineProfile, Protocol, SerialConfig};
@@ -33,11 +33,39 @@ fn decode_text(d: &Decode) -> String {
                 Some(g) => format!("CQ {} {}", caller.0, g.0),
                 None => format!("CQ {}", caller.0),
             },
-            ParsedMessage::Exchange { to, from, .. } => format!("{} {}", to.0, from.0),
-            ParsedMessage::Signoff { to, from, .. } => format!("{} {} 73", to.0, from.0),
+            ParsedMessage::Exchange { to, from, payload } => {
+                format!("{} {} {}", to.0, from.0, fmt_payload(payload))
+            }
+            ParsedMessage::Signoff { to, from, kind } => {
+                format!("{} {} {}", to.0, from.0, fmt_signoff(*kind))
+            }
             ParsedMessage::Free(s) | ParsedMessage::Raw(s) => s.clone(),
         },
         DecodeContent::Streaming { text } => text.clone(),
+    }
+}
+
+/// The exchange body as WSJT-X renders it: grid verbatim, reports as `%+2.2d`
+/// (`-07`, `+05`), the roger form prefixed `R`, Field Day as `[R ]<class> <section>`.
+fn fmt_payload(p: &ExchangePayload) -> String {
+    match p {
+        ExchangePayload::Grid(g) => g.0.clone(),
+        ExchangePayload::Report(r) => format!("{r:+03}"),
+        ExchangePayload::RogerReport(r) => format!("R{r:+03}"),
+        ExchangePayload::FieldDay {
+            class,
+            section,
+            rogered,
+        } => format!("{}{class} {}", if *rogered { "R " } else { "" }, section.0),
+    }
+}
+
+/// A sign-off rendered as its on-air token (not always `73`).
+fn fmt_signoff(kind: Signoff) -> &'static str {
+    match kind {
+        Signoff::Rrr => "RRR",
+        Signoff::Rr73 => "RR73",
+        Signoff::Seven3 => "73",
     }
 }
 

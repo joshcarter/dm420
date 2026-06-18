@@ -117,7 +117,12 @@ async fn run(
     let _ = bus.publish(&Topic::QsoState(radio.clone()), engine.state());
 
     let mut prev_phase = 1.0f32;
-    let mut seq: u64 = 0;
+    // Seed the per-contact sequence from the wall clock so `QsoId { origin, seq }`
+    // stays unique *across sessions*. A plain 0 restart reused 1, 2, 3… every run,
+    // colliding with already-logged ids — the logbook dedups by `QsoId`, so those
+    // post-restart contacts were silently dropped (never persisted). now_ms at
+    // startup is strictly greater than any prior session's seqs, so no collision.
+    let mut seq: u64 = now_ms();
 
     loop {
         // Pick up any live station-config change before handling the next event.

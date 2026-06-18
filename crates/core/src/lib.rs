@@ -126,8 +126,9 @@ pub struct CoreConfig {
     pub decode: DecodeSource,
     /// How to reach the rig. `None` ⇒ no rig producer (mock/headless).
     pub serial: Option<SerialConfig>,
-    /// Where to persist the logbook (JSON). `None` ⇒ no logbook producer, so the
-    /// log stays in-memory only (mock mode supplies its own fake logbook).
+    /// Where to persist the logbook (JSONL, one contact per line). `None` ⇒ no
+    /// logbook producer, so the log stays in-memory only (mock mode supplies its
+    /// own fake logbook).
     pub logbook: Option<PathBuf>,
     /// Initial TX audio output device; `None` = system default. Live-editable
     /// afterward via [`CoreControl::tx`].
