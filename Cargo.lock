@@ -1591,6 +1591,7 @@ dependencies = [
  "egui_tiles",
  "image",
  "mocks",
+ "qso",
  "tokio",
  "types",
 ]

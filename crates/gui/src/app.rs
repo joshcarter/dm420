@@ -41,10 +41,12 @@ impl App {
         let dark = std::env::var("MARTIAN_LIGHT").is_err();
         let (tree, tree_ids) = build_tree();
         let focused = tree_ids.waterfall; // FT8 panel holds focus at startup
+        let station = Station::from_env();
+        let view = BusView::start(egui_ctx.clone(), station.to_qso_config());
         Self {
             dark,
             edit_mode: false,
-            station: Station::from_env(),
+            station,
             tree,
             tree_ids,
             focused,
@@ -54,7 +56,7 @@ impl App {
             visuals_set_for: None,
             shot_path: std::env::var("MARTIAN_SHOT").ok(),
             frame: 0,
-            view: BusView::start(egui_ctx.clone()),
+            view,
         }
     }
 

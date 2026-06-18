@@ -65,6 +65,20 @@ impl Station {
             grid: env_nonempty("DM420_GRID").unwrap_or_else(|| "DN70KA".into()).to_uppercase(),
         }
     }
+
+    /// The identity the QSO engine builds outgoing messages from. The contest
+    /// profile and Field Day exchange are placeholders until a contest/exchange
+    /// UI exists — TODO: surface `ContestProfile` + the FD `<class> <section>`
+    /// (the engine already sequences both profiles; only the picker is missing).
+    pub fn to_qso_config(&self) -> qso::StationConfig {
+        qso::StationConfig {
+            call: types::Callsign(self.call.clone()),
+            grid: types::GridSquare(self.grid.clone()),
+            fd_class: "1B".into(),
+            fd_section: types::Section("CO".into()),
+            contest: types::ContestProfile::Standard,
+        }
+    }
 }
 
 /// Parsed startup configuration. Built once at launch by [`Settings::from_env`].

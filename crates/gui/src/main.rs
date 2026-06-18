@@ -505,7 +505,10 @@ impl App {
             "sw_gui",
         );
         if gui_clicks[0] {
+            // Re-lock commits configuration: push any edited call/grid to the QSO
+            // engine so its outgoing messages use the new identity.
             self.edit_mode = false;
+            self.view.set_qso_station(self.station.to_qso_config());
         }
         if gui_clicks[1] {
             self.edit_mode = true;

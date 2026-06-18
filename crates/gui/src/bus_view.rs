@@ -85,6 +85,9 @@ pub struct BusView {
     /// Handle for live reconfiguration of the running producers (real mode only;
     /// empty otherwise).
     control: app_core::CoreControl,
+    /// Handle to push station-identity / contest changes to the running QSO
+    /// engine (e.g. when the operator edits the call/grid and re-locks).
+    qso_control: qso::QsoControl,
     /// The currently-applied hardware config — the settings form's source of
     /// truth. Updated on apply alongside pushing to `control`.
     applied: Arc<Mutex<crate::settings::HardwareConfig>>,
@@ -101,7 +104,7 @@ impl BusView {
     /// Stand up the runtime, launch the mock producers, and start a pump per
     /// topic. `egui_ctx` is cloned into each pump so new data wakes the UI even
     /// when it's otherwise idle.
-    pub fn start(egui_ctx: egui::Context) -> Self {
+    pub fn start(egui_ctx: egui::Context, station: qso::StationConfig) -> Self {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -137,6 +140,13 @@ impl BusView {
             mocks::spawn(&bus);
             app_core::CoreControl::default()
         };
+
+        // The QSO engine is logic, not hardware — it runs in both modes, driven
+        // by whichever decode/clock producers are live, serving `qso/{id}/command`
+        // and publishing `QsoState`. TX stays gated off (`allow_transmit: false`)
+        // until the PTT granter + audio-TX path exist. The UI consumer of
+        // `QsoState` (the send row) lands in the next wiring pass.
+        let qso_control = qso::spawn(&bus, mocks::radio_id(), station, false);
 
         pump_state(
             &bus,
@@ -185,6 +195,7 @@ impl BusView {
             health,
             real,
             control,
+            qso_control,
             applied,
             bus,
             _rt: rt,
@@ -299,6 +310,12 @@ impl BusView {
     /// The `n` most recent decodes, newest first.
     pub fn recent_decodes(&self, n: usize) -> Vec<Decode> {
         self.decodes.snapshot().into_iter().rev().take(n).collect()
+    }
+
+    /// Push a station-identity / contest change to the running QSO engine (call on
+    /// re-lock after the operator edits the call/grid).
+    pub fn set_qso_station(&self, station: qso::StationConfig) {
+        self.qso_control.set_station(station);
     }
 
     /// The underlying bus, for issuing commands (TX, tuning) from the UI later.
