@@ -2,11 +2,14 @@
 //! slot-aligned on-air transmission.
 //!
 //! Serves `radio/{id}/audio_tx`. For each request it synthesizes the FT8 waveform
-//! ([`modes::synth_message`]), keys the rig over the rig command topic
+//! ([`modes::synth_message`]), keys the rig **once** over the rig command topic
 //! (`PttRequest{token}` — validated by the interlock granter), plays the audio to
-//! the configured output device (the rig's data-in), **re-keys PTT inside the
-//! rig's 10 s watchdog** so the carrier never drops mid-over, keys down, and
-//! reports the outcome on `radio/{id}/tx_report`.
+//! the configured output device (the rig's data-in), keys down at the end, and
+//! reports the outcome on `radio/{id}/tx_report`. A whole over fits inside the
+//! rig's PTT watchdog (`rig::actor::PTT_WATCHDOG`, sized to outlast one slot), so
+//! we never re-key mid-over — real Kenwoods reject a `TX` command while already
+//! transmitting, which would error the refresh and let the watchdog drop the
+//! carrier.
 //!
 //! Spawned **only when `allow_transmit` is set** — this is the explicit, opt-in TX
 //! path; nothing here runs in the default (RX-only) build.
@@ -22,11 +25,9 @@ use crate::rig_adapter::CommandResult;
 
 /// The modes synth produces audio at 12 kHz.
 const TX_SAMPLE_RATE: u32 = 12_000;
-/// Re-key this often during a transmission to stay inside the rig's 10 s PTT
-/// watchdog (`rig::actor::PTT_WATCHDOG`).
-const PTT_REFRESH: Duration = Duration::from_secs(5);
 /// Hard cap on a single transmission so key-down always lands before the next slot
-/// even if playback never signals done. An FT8 over is ~12.6 s in a 15 s slot.
+/// even if playback never signals done. An FT8 over is ~12.6 s in a 15 s slot, and
+/// this stays under the rig's PTT watchdog so key-down beats it.
 const MAX_TX: Duration = Duration::from_secs(14);
 
 /// Serve `radio/{id}/audio_tx`: run each requested transmission to completion (one
@@ -175,11 +176,12 @@ async fn transmit(
         return (Some(slot), classify_key_error(e));
     }
 
-    // Play to the rig's data-in, refreshing PTT inside the watchdog until done (or
-    // the operator hits Stop, which cuts the over short).
+    // Play to the rig's data-in, staying keyed until playback finishes (or the
+    // operator hits Stop, which cuts the over short). No mid-over re-keying: the
+    // watchdog covers a full over, and a Kenwood rejects `TX` while transmitting.
     let outcome = match audio::play(output, samples, TX_SAMPLE_RATE) {
         Ok(playback) => {
-            let aborted = wait_keyed(bus, radio, token, &playback, abort_gen, base).await;
+            let aborted = wait_done(&playback, abort_gen, base).await;
             playback.stop();
             if aborted {
                 t::TxOutcome::Failed("aborted by operator".into())
@@ -196,20 +198,13 @@ async fn transmit(
     (Some(slot), outcome)
 }
 
-/// Wait for playback to finish (or the safety cap / an operator Stop), re-keying
-/// PTT every [`PTT_REFRESH`] so the rig watchdog never drops the carrier mid-over.
-/// Returns `true` if the operator aborted (Stop) before playback finished.
-async fn wait_keyed(
-    bus: &BusHandle,
-    radio: &t::RadioId,
-    token: t::InterlockToken,
-    playback: &audio::Playback,
-    abort_gen: &AtomicU64,
-    base: u64,
-) -> bool {
+/// Wait for playback to finish (or the safety cap / an operator Stop). The carrier
+/// stays keyed from the single key-up in [`transmit`] — a full over fits inside the
+/// rig's PTT watchdog, so there is no mid-over re-keying. Returns `true` if the
+/// operator aborted (Stop) before playback finished.
+async fn wait_done(playback: &audio::Playback, abort_gen: &AtomicU64, base: u64) -> bool {
     let tick = Duration::from_millis(200);
     let mut elapsed = Duration::ZERO;
-    let mut since_refresh = Duration::ZERO;
     while !playback.is_done() && elapsed < MAX_TX {
         if abort_gen.load(Ordering::Acquire) != base {
             tracing::debug!("audio-tx: Stop detected mid-over; aborting carrier");
@@ -217,14 +212,6 @@ async fn wait_keyed(
         }
         tokio::time::sleep(tick).await;
         elapsed += tick;
-        since_refresh += tick;
-        if since_refresh >= PTT_REFRESH {
-            // Refresh the watchdog; key-down on the next slot edge / the cap
-            // recovers from an unexpected denial, so the result is best-effort.
-            tracing::debug!("audio-tx: PTT refresh (staying inside rig watchdog)");
-            let _ = key(bus, radio, token, true).await;
-            since_refresh = Duration::ZERO;
-        }
     }
     false
 }

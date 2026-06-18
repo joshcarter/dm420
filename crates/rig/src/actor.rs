@@ -7,7 +7,11 @@
 //!
 //! The actor also enforces the PTT watchdog: a `SetPtt(true)` arms a deadline and
 //! the loop auto-releases TX if it isn't refreshed, so a hung script or dropped
-//! connection cannot leave the radio keyed.
+//! connection cannot leave the radio keyed. The deadline must outlast a full
+//! single-slot over (a digital-mode TX keys once and stays keyed for the whole
+//! ~13 s waveform); it is a backstop for a *stuck* over, not a mid-over heartbeat.
+//! Re-keying mid-over to "refresh" it doesn't work on real Kenwoods — they reject
+//! a `TX` command while already transmitting.
 
 use crate::codec::{Mode, RigState, Vfo};
 use crate::{Rig, RigError};
@@ -18,7 +22,10 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 /// Auto-release TX this long after the last `SetPtt(true)` unless refreshed.
-pub const PTT_WATCHDOG: Duration = Duration::from_secs(10);
+/// Sized to outlast one full FT8/FT4 over (~13 s waveform, capped at `core::tx`'s
+/// 14 s `MAX_TX`) plus margin, so it never fires mid-over — it is the backstop for
+/// a hung app or a missed key-down, bounded to a single 15 s slot.
+pub const PTT_WATCHDOG: Duration = Duration::from_secs(15);
 
 /// A typed request to the rig. Mirrors the [`Rig`] surface; the Step 1.5 "full
 /// control" commands (power, gains, …) ride on [`RigRequest::Raw`].
