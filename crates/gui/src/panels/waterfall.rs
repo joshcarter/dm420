@@ -691,21 +691,8 @@ fn draw_waterslide(
             (Some((c, _)), Some(s)) => c.as_str() == s,
             _ => false,
         };
-        let strong = d.snr_db.map(|s| s > -12).unwrap_or(false);
-        let msg_col = if is_sel {
-            pal.accent2
-        } else if strong {
-            pal.body
-        } else {
-            pal.dim
-        };
-        let snr_col = if is_sel {
-            pal.accent2
-        } else if strong {
-            pal.accent
-        } else {
-            pal.dim
-        };
+        let msg_col = if is_sel { pal.accent2 } else { pal.body };
+        let snr_col = if is_sel { pal.accent2 } else { pal.accent };
         let msg_rect = painter.text(
             Pos2::new(x, y),
             Align2::LEFT_CENTER,
