@@ -30,12 +30,14 @@ mod interlock;
 mod map;
 mod parse;
 mod rig_adapter;
+mod tx;
 
 pub use control::{AudioControl, CoreControl, RigControl};
 pub use modes::Protocol;
 pub use parse::parse_message;
 pub use rig::LineProfile;
 pub use rig_adapter::CommandResult;
+pub use tx::TxConfig;
 
 /// Names of input-capable audio devices, for a UI device picker. Empty on error.
 pub fn list_audio_inputs() -> Vec<String> {
@@ -113,6 +115,9 @@ pub struct CoreConfig {
     pub decode: DecodeSource,
     /// How to reach the rig. `None` ⇒ no rig producer (mock/headless).
     pub serial: Option<SerialConfig>,
+    /// Output device for TX audio (the rig's data-in); `None` = system default.
+    /// Only used when `allow_transmit` is set.
+    pub tx_output: Option<String>,
 }
 
 impl Default for CoreConfig {
@@ -122,6 +127,7 @@ impl Default for CoreConfig {
             allow_transmit: false,
             decode: DecodeSource::None,
             serial: None,
+            tx_output: None,
         }
     }
 }
@@ -140,6 +146,7 @@ pub fn spawn(bus: &BusHandle, cfg: CoreConfig) -> CoreControl {
         allow_transmit,
         decode,
         serial,
+        tx_output,
     } = cfg;
 
     let mut control = CoreControl::default();
@@ -149,6 +156,12 @@ pub fn spawn(bus: &BusHandle, cfg: CoreConfig) -> CoreControl {
     // shell) and share it into the rig adapter for in-process key-up validation.
     let granter = interlock::Granter::default();
     interlock::serve(bus, radio.clone(), granter.clone());
+
+    // Opt-in TX path: only when allow_transmit is set do we stand up the audio-TX
+    // service that synthesizes, keys, and plays. Off by default (RX-only).
+    if allow_transmit {
+        tx::spawn(bus, radio.clone(), tx::TxConfig { output: tx_output });
+    }
 
     // The rig producer is optional: with no serial config there's simply no rig
     // on the bus (the GUI shows it as down). A present config never panics —

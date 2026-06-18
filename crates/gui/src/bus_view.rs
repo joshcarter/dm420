@@ -148,10 +148,11 @@ impl BusView {
 
         // The QSO engine is logic, not hardware — it runs in both modes, driven
         // by whichever decode/clock producers are live, serving `qso/{id}/command`
-        // and publishing `QsoState`. TX stays gated off (`allow_transmit: false`)
-        // until the PTT granter + audio-TX path exist. The UI consumer of
-        // `QsoState` (the send row) lands in the next wiring pass.
-        let qso_control = qso::spawn(&bus, mocks::radio_id(), station, false);
+        // and publishing `QsoState`. TX is opt-in: the engine auto-sends only in
+        // real mode with `DM420_ALLOW_TX` set (and a rig + the PTT interlock
+        // present); otherwise it sequences but never keys.
+        let allow_tx = real && settings.allow_tx;
+        let qso_control = qso::spawn(&bus, mocks::radio_id(), station, allow_tx);
 
         pump_state(
             &bus,

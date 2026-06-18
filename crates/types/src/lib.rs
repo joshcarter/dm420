@@ -443,6 +443,15 @@ pub enum TxOutcome {
     Failed(String),
 }
 
+/// Reply to a [`TxRequest`] on `radio/{id}/audio_tx` — receipt only. The real
+/// result (sent/denied/failed) is reported separately on `radio/{id}/tx_report`;
+/// a client awaiting this ack learns the over has finished and can then release
+/// its interlock token.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TxAck {
+    Accepted,
+}
+
 // =====================================================================
 // §7  Logbook  —  logbook/entries  (StreamLossless + gossiped)
 // =====================================================================

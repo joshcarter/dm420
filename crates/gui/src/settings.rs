@@ -22,6 +22,10 @@
 //! - `DM420_WAV` — replay this WAV instead of live capture (bring-up/testing).
 //! - `DM420_CALLSIGN` — the operator's station call sign (default `N0JDC`).
 //! - `DM420_GRID` — the operator's Maidenhead grid locator (default `DN70KA`).
+//! - `DM420_ALLOW_TX` — **opt in to transmit** (default off; RX-only). Real mode
+//!   only; needs a rig + the PTT interlock. Start into a dummy load at QRP.
+//! - `DM420_AUDIO_OUTPUT` — TX audio output device (the rig's data-in); default
+//!   system output.
 
 use std::path::{Path, PathBuf};
 
@@ -122,6 +126,11 @@ pub struct Settings {
     pub protocol: Protocol,
     /// If set, replay this WAV instead of opening the live capture device.
     pub wav: Option<PathBuf>,
+    /// Opt in to transmit (`DM420_ALLOW_TX`). Off by default; honored only in real
+    /// mode. Gates the whole TX path (rig PTT, audio-TX codec, QSO auto-send).
+    pub allow_tx: bool,
+    /// TX audio output device (`DM420_AUDIO_OUTPUT`); `None` = system default.
+    pub audio_output: Option<String>,
 }
 
 impl Settings {
@@ -134,6 +143,8 @@ impl Settings {
             serial: serial_from_env(),
             protocol: protocol_from_env(),
             wav: wav_from_env(),
+            allow_tx: env_flag("DM420_ALLOW_TX"),
+            audio_output: env_nonempty("DM420_AUDIO_OUTPUT"),
         }
     }
 
@@ -152,8 +163,9 @@ impl Settings {
         }
     }
 
-    /// Build the `core` config for real mode: the configured rig, TX blocked, and
-    /// either a WAV replay (`DM420_WAV`) or live capture of the configured device.
+    /// Build the `core` config for real mode: the configured rig, TX gated by
+    /// `DM420_ALLOW_TX` (off by default), and either a WAV replay (`DM420_WAV`) or
+    /// live capture of the configured device.
     pub fn core_config(&self) -> CoreConfig {
         let decode = match &self.wav {
             Some(path) => DecodeSource::Wav {
@@ -168,9 +180,10 @@ impl Settings {
         };
         CoreConfig {
             radio: mocks::radio_id(),
-            allow_transmit: false,
+            allow_transmit: self.allow_tx,
             decode,
             serial: Some(self.serial.clone()),
+            tx_output: self.audio_output.clone(),
         }
     }
 }

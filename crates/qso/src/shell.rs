@@ -13,15 +13,16 @@
 //! on the air. This mirrors `core`'s TX hard-block (`docs/qso_flow.md`, `TODO.md`).
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use bus::types::{
-    AbsHz, Band, ClockStatus, Decode, LogEntry, OffsetHz, OverAirMode, QsoCommand, QsoId, RadioId,
-    Selection, StationId, Timestamp,
+    AbsHz, Band, ClockStatus, Decode, InterlockReply, InterlockRequest, LogEntry, OffsetHz,
+    OverAirMode, QsoCommand, QsoId, RadioId, Selection, StationId, Timestamp, TxAck, TxRequest,
 };
 use bus::{BusHandle, BusMessage, DeliveryClass, Topic, TopicSelector};
 use serde::{Deserialize, Serialize};
 
-use crate::engine::{CompletedQso, Engine, Event, Step};
+use crate::engine::{CompletedQso, Engine, Event, Step, TxIntent};
 use crate::message::StationConfig;
 
 /// Reply to a `qso/{id}/command` request. The engine accepts every command (it
@@ -173,13 +174,10 @@ fn apply(
 
     if let Some(tx) = step.tx {
         if allow_transmit {
-            // TODO(tx): request a PTT interlock token from the granter and place a
-            // `TxRequest::SlottedMessage` on `radio/{id}/audio_tx`. The granter +
-            // codec don't exist yet (TX hard-blocked), so this is unreachable today.
-            tracing::warn!(
-                "qso: allow_transmit set but no TX path exists; dropping {:?}",
-                tx.message.text
-            );
+            // Hand the over to the audio-TX codec on its own task (acquire token →
+            // request TxRequest → release). The engine loop keeps running so it
+            // still services decodes/clock during the ~13 s transmission.
+            spawn_transmit(bus.clone(), radio.clone(), tx);
         } else {
             tracing::debug!(
                 "qso: TX gated off; would send {:?} @ {:?}",
@@ -196,6 +194,58 @@ fn apply(
             build_log(done, radio.clone(), my_station.clone(), *seq),
         );
     }
+}
+
+/// Transmit one over on its own task: acquire the PTT token from the granter, hand
+/// the message to the audio-TX codec (which keys, plays, and reports on
+/// `tx_report`), then release the token so the next slot can acquire it. Spawned so
+/// the engine loop keeps servicing decodes/clock through the ~13 s over.
+fn spawn_transmit(bus: BusHandle, radio: RadioId, tx: TxIntent) {
+    tokio::spawn(async move {
+        let token = match bus
+            .request::<InterlockRequest, InterlockReply>(
+                &Topic::Interlock(radio.clone()),
+                InterlockRequest::Acquire,
+                Duration::from_secs(2),
+            )
+            .await
+        {
+            Ok(InterlockReply::Granted { token, .. }) => token,
+            Ok(other) => {
+                tracing::warn!("qso: PTT interlock not granted: {other:?}");
+                return;
+            }
+            Err(e) => {
+                tracing::warn!("qso: interlock request failed: {e:?}");
+                return;
+            }
+        };
+
+        let req = TxRequest::SlottedMessage {
+            radio: radio.clone(),
+            // TODO: derive the mode from OperatingState (FT4 = 7.5 s slots) once it
+            // is published; the audio-TX codec only synthesizes FT8 today.
+            mode: OverAirMode::Ft8,
+            offset: tx.offset,
+            slot: tx.slot,
+            message: tx.message,
+            token,
+        };
+        // The codec replies once the over finishes (~13 s).
+        if let Err(e) = bus
+            .request::<TxRequest, TxAck>(&Topic::AudioTx(radio.clone()), req, Duration::from_secs(30))
+            .await
+        {
+            tracing::warn!("qso: audio-tx request failed: {e:?}");
+        }
+        let _ = bus
+            .request::<InterlockRequest, InterlockReply>(
+                &Topic::Interlock(radio.clone()),
+                InterlockRequest::Release(token),
+                Duration::from_secs(2),
+            )
+            .await;
+    });
 }
 
 /// Build a [`LogEntry`] from a completed contact. Band/freq/mode are placeholders

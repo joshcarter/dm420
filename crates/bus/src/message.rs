@@ -51,6 +51,7 @@ bus_message!(SubsystemHealth, State); // health/{id} (State, latest-wins per sub
 bus_message!(RigCommand, Command);
 bus_message!(SessionCommand, Command);
 bus_message!(TxRequest, Command);
+bus_message!(TxAck, Command);
 bus_message!(InterlockRequest, Command);
 bus_message!(InterlockReply, Command);
 bus_message!(QsoCommand, Command);
