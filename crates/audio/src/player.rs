@@ -139,13 +139,13 @@ impl OutputStream {
 
     /// Load a mono waveform (at `file_rate`) and start playing it immediately,
     /// resampling to the device rate as needed.
-    pub fn load(&self, mono: Vec<f32>, file_rate: u32) {
+    pub fn load(&self, mono: &[f32], file_rate: u32) {
         let ratio = file_rate as f64 / self.device_rate as f64;
         let samples = if file_rate == self.device_rate {
-            mono
+            mono.to_vec()
         } else {
             let mut r = Resampler::new(file_rate, self.device_rate);
-            let mut out = r.push(&mono);
+            let mut out = r.push(mono);
             out.extend(r.flush());
             out
         };

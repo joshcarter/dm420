@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bus::types as t;
 use bus::{BusError, BusHandle, Topic, TopicSelector};
@@ -191,6 +191,7 @@ async fn transmit(
     // short T/R-settle lead (so the tones start near the top of the slot, not the
     // synth's centered ~1.18 s in — a late start otherwise pushes our DT out of the
     // far station's decode window).
+    let t_synth = Instant::now();
     let Some(mut samples) = modes::synth_message(&message.text, offset.0, TX_SAMPLE_RATE) else {
         return (
             Some(slot),
@@ -208,53 +209,51 @@ async fn transmit(
     if lead > TX_LEAD_SAMPLES {
         samples.drain(..lead - TX_LEAD_SAMPLES);
     }
-    tracing::debug!(
-        samples = samples.len(),
-        secs = samples.len() as f32 / TX_SAMPLE_RATE as f32,
-        "audio-tx: synthesized FT8 waveform",
-    );
+    let synth_ms = t_synth.elapsed().as_millis();
 
     // Baseline the abort counter before keying up, so only a Stop that lands
     // during *this* over aborts it.
     let base = abort_gen.load(Ordering::Acquire);
 
     // Key up — validated against the interlock grant by the rig adapter.
-    tracing::debug!(?token, "audio-tx: keying up (TX1 / data route)");
+    let t_key = Instant::now();
     if let Err(e) = key(bus, radio, token, true).await {
         let _ = key(bus, radio, token, false).await; // best-effort safety
         return (Some(slot), classify_key_error(e));
     }
-
-    // Pre-FFT the synthesized waveform into own-TX waterfall columns so we can
-    // stream them, paced to playback, onto the spectrum topic — the operator sees
-    // their outgoing signal scroll by at its true offset (the RX capture is
-    // meaningless while keyed). Columns share the RX axis (same FFT size + rate).
-    let bin_hz = TX_SAMPLE_RATE as f32 / FFT_SIZE as f32;
-    let max_bins = (SPECTRUM_MAX_HZ / bin_hz).ceil() as usize;
-    let tx_cols = tx_spectrum_columns(&samples, max_bins);
+    let key_ms = t_key.elapsed().as_millis();
 
     // Play to the rig's data-in on the warm stream — starts on the next audio
     // callback (no device open here), staying keyed until playback finishes (or the
     // operator hits Stop, which cuts the over short). No mid-over re-keying: the
     // watchdog covers a full over, and a Kenwood rejects `TX` while transmitting.
-    out.load(samples, TX_SAMPLE_RATE);
-    // How late the first audio sample reaches the air, relative to the slot edge —
-    // synth + key-up land in here (no longer a device open). Plus the ~0.2 s lead
-    // trimmed above, this is our effective DT.
+    let t_load = Instant::now();
+    out.load(&samples, TX_SAMPLE_RATE);
+    let load_ms = t_load.elapsed().as_millis();
+    // How late the first audio sample reaches the air, relative to the slot edge.
+    // `synth/key/load_ms` break down the gap from "begin over" so we can see which
+    // step dominates. Plus the ~0.2 s lead trimmed above, this is our effective DT.
     tracing::info!(
         into_slot_ms = now_ms().rem_euclid(15_000),
+        synth_ms,
+        key_ms,
+        load_ms,
         "audio-tx: playback started (tones reach air ~0.2 s later)",
     );
-    // Stream the own-TX columns while it plays; `stop` ends the streamer the instant
-    // the over does (normal finish or operator Stop).
+    // Stream the own-TX waterfall columns while it plays, FFT'd lazily as playback
+    // reaches each one — kept *off* the pre-playback critical path. `stop` ends the
+    // streamer the instant the over does (normal finish or operator Stop).
+    let bin_hz = TX_SAMPLE_RATE as f32 / FFT_SIZE as f32;
+    let max_bins = (SPECTRUM_MAX_HZ / bin_hz).ceil() as usize;
     let stop = Arc::new(AtomicBool::new(false));
     spawn_tx_spectrum(
         bus.clone(),
         radio.clone(),
         mode,
         out.progress(),
-        tx_cols,
+        Arc::new(samples),
         bin_hz,
+        max_bins,
         stop.clone(),
     );
     let aborted = wait_done(out, abort_gen, base).await;
@@ -323,45 +322,34 @@ fn classify_key_error(e: String) -> t::TxOutcome {
     }
 }
 
-/// FFT the synthesized waveform into scrolling-waterfall columns, one every
-/// [`SPECTRUM_HOP_S`]. Each entry is `(sample index at the window's right edge,
-/// magnitudes)` so the streamer can release a column once playback has reached it.
-fn tx_spectrum_columns(samples: &[f32], max_bins: usize) -> Vec<(usize, Vec<u8>)> {
-    let hop = (TX_SAMPLE_RATE as f64 * SPECTRUM_HOP_S).max(1.0) as usize;
-    let mut cols = Vec::new();
-    let mut end = FFT_SIZE;
-    while end <= samples.len() {
-        cols.push((
-            end,
-            dsp::spectrum_column(&samples[end - FFT_SIZE..end], FFT_SIZE, max_bins),
-        ));
-        end += hop;
-    }
-    cols
-}
-
-/// Stream the pre-computed own-TX waterfall columns onto the spectrum topic, paced
-/// to playback `progress` (file frames at 12 kHz, so it indexes `samples` directly)
-/// and tagged [`SignalSource::OwnTx`](t::SignalSource::OwnTx) so the GUI shows them
-/// in place of the RX waterfall while keyed. Ends when every column is out or
-/// `stop` is set (the over finished or the operator aborted).
+/// Stream the own-TX waterfall onto the spectrum topic, tagged
+/// [`SignalSource::OwnTx`](t::SignalSource::OwnTx) so the GUI shows it in place of
+/// the RX waterfall while keyed. Each column is FFT'd **lazily**, only once playback
+/// `progress` (file frames at 12 kHz, so it indexes `samples` directly) reaches it —
+/// spreading the FFT work across the over instead of front-loading it onto the
+/// pre-playback critical path. Ends when the waveform is exhausted or `stop` is set
+/// (the over finished or the operator aborted).
+#[allow(clippy::too_many_arguments)]
 fn spawn_tx_spectrum(
     bus: BusHandle,
     radio: t::RadioId,
     mode: t::OverAirMode,
     progress: Arc<AtomicU64>,
-    cols: Vec<(usize, Vec<u8>)>,
+    samples: Arc<Vec<f32>>,
     bin_hz: f32,
+    max_bins: usize,
     stop: Arc<AtomicBool>,
 ) {
+    let hop = (TX_SAMPLE_RATE as f64 * SPECTRUM_HOP_S).max(1.0) as usize;
     tokio::spawn(async move {
-        let mut i = 0;
-        while i < cols.len() {
+        let mut end = FFT_SIZE; // right edge of the next column's FFT window
+        while end <= samples.len() {
             if stop.load(Ordering::Acquire) {
                 break;
             }
             let played = progress.load(Ordering::Relaxed) as usize;
-            while i < cols.len() && cols[i].0 <= played {
+            while end <= played && end <= samples.len() {
+                let mags = dsp::spectrum_column(&samples[end - FFT_SIZE..end], FFT_SIZE, max_bins);
                 let _ = bus.publish(
                     &Topic::Spectrum(radio.clone()),
                     t::SpectrumRow {
@@ -370,11 +358,11 @@ fn spawn_tx_spectrum(
                         t: t::Timestamp(now_ms()),
                         bin0_offset: t::OffsetHz(0.0),
                         bin_hz,
-                        mags: cols[i].1.clone(),
+                        mags,
                         source: t::SignalSource::OwnTx,
                     },
                 );
-                i += 1;
+                end += hop;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
