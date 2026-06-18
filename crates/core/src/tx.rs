@@ -11,10 +11,12 @@
 //! Spawned **only when `allow_transmit` is set** — this is the explicit, opt-in TX
 //! path; nothing here runs in the default (RX-only) build.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use bus::types as t;
-use bus::{BusHandle, Topic};
+use bus::{BusError, BusHandle, Topic, TopicSelector};
 
 use crate::rig_adapter::CommandResult;
 
@@ -29,7 +31,7 @@ const MAX_TX: Duration = Duration::from_secs(14);
 
 /// Serve `radio/{id}/audio_tx`: run each requested transmission to completion (one
 /// at a time) and report its outcome on `radio/{id}/tx_report`.
-pub fn spawn(bus: &BusHandle, radio: t::RadioId, tx: std::sync::Arc<crate::control::TxControl>) {
+pub fn spawn(bus: &BusHandle, radio: t::RadioId, tx: Arc<crate::control::TxControl>) {
     let mut server = match bus.serve::<t::TxRequest, t::TxAck>(&Topic::AudioTx(radio.clone())) {
         Ok(s) => s,
         Err(e) => {
@@ -37,13 +39,19 @@ pub fn spawn(bus: &BusHandle, radio: t::RadioId, tx: std::sync::Arc<crate::contr
             return;
         }
     };
+    // Bumped whenever the QSO engine drops to Idle (the operator's Stop, seen via
+    // the engine's published state). A transmit baselines it and aborts the over
+    // the instant it changes — so Stop kills the carrier mid-message.
+    let abort_gen = Arc::new(AtomicU64::new(0));
+    spawn_abort_watcher(bus, radio.clone(), abort_gen.clone());
+
     let bus = bus.clone();
     tokio::spawn(async move {
         tracing::info!("audio-tx: TX path armed");
         while let Some((req, responder)) = server.next().await {
             // Read the (live-editable) output device fresh for each over.
             let output = tx.snapshot();
-            let (slot, outcome) = transmit(&bus, &radio, output, req).await;
+            let (slot, outcome) = transmit(&bus, &radio, output, req, &abort_gen).await;
             let _ = bus.publish(
                 &Topic::TxReport(radio.clone()),
                 t::TxReport {
@@ -58,6 +66,37 @@ pub fn spawn(bus: &BusHandle, radio: t::RadioId, tx: std::sync::Arc<crate::contr
     });
 }
 
+/// Watch the QSO engine's published state and bump `abort_gen` each time it drops
+/// into Idle (the operator's Stop, or a finished QSO). A transmit baselines the
+/// counter at the start of an over, so an Idle that *precedes* the over (e.g. the
+/// engine going Idle as it queues a courtesy 73) is captured in the baseline and
+/// won't abort it — only an Idle that lands *during* the over does.
+fn spawn_abort_watcher(bus: &BusHandle, radio: t::RadioId, abort_gen: Arc<AtomicU64>) {
+    let mut sub = match bus.subscribe::<t::QsoState>(TopicSelector::Exact(Topic::QsoState(radio))) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("audio-tx: cannot watch QsoState for aborts: {e:?}");
+            return;
+        }
+    };
+    tokio::spawn(async move {
+        let mut prev_idle = true; // the engine starts Idle
+        loop {
+            match sub.recv().await {
+                Ok(state) => {
+                    let idle = matches!(state.phase, t::QsoPhase::Idle);
+                    if idle && !prev_idle {
+                        abort_gen.fetch_add(1, Ordering::Release);
+                    }
+                    prev_idle = idle;
+                }
+                Err(BusError::Lagged { .. }) => continue,
+                Err(_) => break,
+            }
+        }
+    });
+}
+
 /// Run one transmission end to end. Returns the slot it was for (for the report)
 /// and the outcome.
 async fn transmit(
@@ -65,6 +104,7 @@ async fn transmit(
     radio: &t::RadioId,
     output: Option<String>,
     req: t::TxRequest,
+    abort_gen: &AtomicU64,
 ) -> (Option<t::SlotId>, t::TxOutcome) {
     let t::TxRequest::SlottedMessage {
         mode,
@@ -102,18 +142,27 @@ async fn transmit(
         samples.pop();
     }
 
+    // Baseline the abort counter before keying up, so only a Stop that lands
+    // during *this* over aborts it.
+    let base = abort_gen.load(Ordering::Acquire);
+
     // Key up — validated against the interlock grant by the rig adapter.
     if let Err(e) = key(bus, radio, token, true).await {
         let _ = key(bus, radio, token, false).await; // best-effort safety
         return (Some(slot), classify_key_error(e));
     }
 
-    // Play to the rig's data-in, refreshing PTT inside the watchdog until done.
+    // Play to the rig's data-in, refreshing PTT inside the watchdog until done (or
+    // the operator hits Stop, which cuts the over short).
     let outcome = match audio::play(output, samples, TX_SAMPLE_RATE) {
         Ok(playback) => {
-            wait_keyed(bus, radio, token, &playback).await;
+            let aborted = wait_keyed(bus, radio, token, &playback, abort_gen, base).await;
             playback.stop();
-            t::TxOutcome::Sent
+            if aborted {
+                t::TxOutcome::Failed("aborted by operator".into())
+            } else {
+                t::TxOutcome::Sent
+            }
         }
         Err(e) => t::TxOutcome::Failed(format!("audio output: {e}")),
     };
@@ -123,18 +172,24 @@ async fn transmit(
     (Some(slot), outcome)
 }
 
-/// Wait for playback to finish (or the safety cap), re-keying PTT every
-/// [`PTT_REFRESH`] so the rig watchdog never drops the carrier mid-over.
+/// Wait for playback to finish (or the safety cap / an operator Stop), re-keying
+/// PTT every [`PTT_REFRESH`] so the rig watchdog never drops the carrier mid-over.
+/// Returns `true` if the operator aborted (Stop) before playback finished.
 async fn wait_keyed(
     bus: &BusHandle,
     radio: &t::RadioId,
     token: t::InterlockToken,
     playback: &audio::Playback,
-) {
-    let tick = Duration::from_millis(500);
+    abort_gen: &AtomicU64,
+    base: u64,
+) -> bool {
+    let tick = Duration::from_millis(200);
     let mut elapsed = Duration::ZERO;
     let mut since_refresh = Duration::ZERO;
     while !playback.is_done() && elapsed < MAX_TX {
+        if abort_gen.load(Ordering::Acquire) != base {
+            return true; // operator hit Stop — abort the over now
+        }
         tokio::time::sleep(tick).await;
         elapsed += tick;
         since_refresh += tick;
@@ -145,6 +200,7 @@ async fn wait_keyed(
             since_refresh = Duration::ZERO;
         }
     }
+    false
 }
 
 /// Issue one `PttRequest` over the rig command topic.
