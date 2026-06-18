@@ -20,6 +20,8 @@
 //! - `DM420_SERIAL_PROFILE` — serial line profile: `none` | `dtr-rts` | `rtscts`.
 //! - `DM420_MODE` — `ft8` | `ft4` (default `ft8`).
 //! - `DM420_WAV` — replay this WAV instead of live capture (bring-up/testing).
+//! - `DM420_LOGBOOK` — path to the persisted logbook JSON (default
+//!   `~/.dm420/logbook.json`). Real mode only; the mock logbook is in-memory.
 //! - `DM420_CALLSIGN` — the operator's station call sign (default `N0JDC`).
 //! - `DM420_GRID` — the operator's Maidenhead grid locator (default `DN70KA`).
 
@@ -146,8 +148,22 @@ impl Settings {
             allow_transmit: false,
             decode,
             serial: Some(self.serial.clone()),
+            logbook: Some(logbook_path()),
         }
     }
+}
+
+/// Where the real logbook persists its JSON. `DM420_LOGBOOK` overrides; otherwise
+/// `~/.dm420/logbook.json`, falling back to the current directory if there's no
+/// home. The logbook creates the parent directory on first write.
+fn logbook_path() -> PathBuf {
+    if let Some(p) = env_nonempty("DM420_LOGBOOK") {
+        return PathBuf::from(p);
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home).join(".dm420").join("logbook.json");
+    }
+    PathBuf::from("dm420-logbook.json")
 }
 
 /// True if the var is set to a non-empty value other than `"0"`.

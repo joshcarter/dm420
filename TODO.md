@@ -32,6 +32,15 @@ different band counts as a different contact. Maybe when UI is
 unlocked, have a "reset" button on the log book which moves the old
 log book to a new file name.
 
+Map panel: Field Day station positions. The map now places heard stations
+from grid squares (CQ grid / standard grid exchange). During ARRL Field Day
+the exchange carries an ARRL *section* (e.g. `WI`), not a grid, so those
+stations can't be placed by grid and are currently skipped. We need to infer
+an approximate position from the section identifier (a section → bounding
+region/centroid table, then the same in-grid land-snapping treatment) so
+Field Day contacts and heard stations still appear on the map. See the note
+in `bus_view::station_grid` and `docs/map_panel.md`.
+
 Toggle switches (e.g. light/dark): hit box for switch should be entire
 switch.
 

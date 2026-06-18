@@ -57,11 +57,14 @@ pub fn spawn(bus: &BusHandle) {
 }
 
 /// Launch only the producers the real `core` adapter does not yet cover (clock,
-/// logbook, scanner). Use this alongside `core::spawn` so the real rig/decode
+/// scanner). Use this alongside `core::spawn` so the real rig/decode/logbook
 /// producers own their topics without a second writer fighting them.
+///
+/// The logbook is no longer here: `core::spawn` runs the real persistent logbook
+/// in real mode, so a mock writer must not also publish fake QSOs onto
+/// `logbook/entries`.
 pub fn spawn_support(bus: &BusHandle) {
     tokio::spawn(run_clock(bus.clone()));
-    tokio::spawn(run_logbook(bus.clone()));
     tokio::spawn(run_scanner(bus.clone()));
 }
 

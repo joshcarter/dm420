@@ -15,6 +15,7 @@ rig.workspace = true
 audio.workspace = true
 modes.workspace = true
 dsp.workspace = true
+logbook.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 serde.workspace = true

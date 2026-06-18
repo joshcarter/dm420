@@ -112,6 +112,9 @@ pub struct CoreConfig {
     pub decode: DecodeSource,
     /// How to reach the rig. `None` ⇒ no rig producer (mock/headless).
     pub serial: Option<SerialConfig>,
+    /// Where to persist the logbook (JSON). `None` ⇒ no logbook producer, so the
+    /// log stays in-memory only (mock mode supplies its own fake logbook).
+    pub logbook: Option<PathBuf>,
 }
 
 impl Default for CoreConfig {
@@ -121,6 +124,7 @@ impl Default for CoreConfig {
             allow_transmit: false,
             decode: DecodeSource::None,
             serial: None,
+            logbook: None,
         }
     }
 }
@@ -139,6 +143,7 @@ pub fn spawn(bus: &BusHandle, cfg: CoreConfig) -> CoreControl {
         allow_transmit,
         decode,
         serial,
+        logbook,
     } = cfg;
 
     let mut control = CoreControl::default();
@@ -164,6 +169,13 @@ pub fn spawn(bus: &BusHandle, cfg: CoreConfig) -> CoreControl {
             control.audio = Some(audio);
         }
         DecodeSource::None => {}
+    }
+
+    // The logbook owns `logbook/entries` in real mode: it persists QSOs the engine
+    // logs on RR73 and replays history on startup. In mock mode there's no path, so
+    // the fake logbook (from `mocks::spawn`) drives the topic instead.
+    if let Some(path) = logbook {
+        logbook::spawn(bus, path);
     }
 
     control

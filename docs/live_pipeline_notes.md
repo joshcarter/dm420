@@ -38,9 +38,14 @@ Severity: 🔴 correctness/blocker · 🟡 should-fix · 🟢 polish.
 
 ## Still-mock subsystems (in real mode)
 
-- 🔴 **Logbook, scanner, and clock are still mock** even with `DM420_REAL=1`
-  (`mocks::spawn_support`). The Contacts map and Log Book panels show **fake QSOs**.
-  Real producers needed (logbook persistence + ADIF, scanner strategy, UTC clock).
+- ✅ **Logbook is real in real mode.** `core::spawn` runs the `logbook` crate: it
+  records the QSO the engine logs on RR73, persists the whole log as JSON
+  (`~/.dm420/logbook.json` or `DM420_LOGBOOK`), and replays history on startup.
+  `mocks::spawn_support` no longer publishes fake QSOs. Still pending: **ADIF**
+  import/export and the **peer-merge** G-set; and `build_log` (in `qso/shell.rs`)
+  still stamps placeholder **band/freq/mode** until `OperatingState` is published.
+- 🟡 **Scanner is still mock** even with `DM420_REAL=1` (`mocks::spawn_support`);
+  the clock is real wall-clock. Real scanner strategy still needed.
 
 ## Audio capture
 

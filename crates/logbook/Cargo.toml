@@ -9,3 +9,6 @@ description = "Log store: in-memory + on-disk persistence, ADIF import/export, a
 [dependencies]
 bus.workspace = true
 types.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+serde_json.workspace = true

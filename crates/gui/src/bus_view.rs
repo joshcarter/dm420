@@ -57,6 +57,19 @@ impl<T: Clone> Ring<T> {
     }
 }
 
+/// A station to plot on the Contacts map: a callsign, the grid we placed it from,
+/// and the most-recent time we logged (worked) or heard (unworked) it, ms since
+/// epoch. The panel uses `last_ms` for the recent/all filter and for dimming
+/// unworked markers by age.
+pub struct MapSpot {
+    pub call: String,
+    pub grid: String,
+    pub last_ms: i64,
+    /// `true` if worked (in the log) → filled marker; `false` if only heard →
+    /// hollow marker that dims with age.
+    pub worked: bool,
+}
+
 /// The GUI-facing view of live bus state. Cheap to construct once at startup and
 /// held by `App`; every accessor returns an owned snapshot so panels never hold a
 /// lock across drawing. Dropping it drops the runtime, which stops the producers
@@ -74,6 +87,11 @@ pub struct BusView {
     bands: Arc<Mutex<HashMap<Band, BandActivity>>>,
     logs: Ring<LogEntry>,
     decodes: Ring<Decode>,
+    /// Stations heard with a grid, keyed by call → (grid, last-heard ms).
+    /// Accumulated from the decode stream and pruned to the last hour on read; the
+    /// Contacts map plots these as dimming "unworked" markers. A dedicated map
+    /// (not the bounded `decodes` ring) so an hour of spots survives a busy band.
+    heard: Arc<Mutex<HashMap<String, (GridSquare, i64)>>>,
     /// Latest QSO-engine state (phase, partner, queued next message). Drives the
     /// FT8 send row.
     qso: Cell<QsoState>,
@@ -124,6 +142,8 @@ impl BusView {
         let bands: Arc<Mutex<HashMap<Band, BandActivity>>> = Arc::new(Mutex::new(HashMap::new()));
         let logs = Ring::new(512);
         let decodes = Ring::new(64);
+        let heard: Arc<Mutex<HashMap<String, (GridSquare, i64)>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         let health: Arc<Mutex<HashMap<SubsystemId, SubsystemHealth>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
@@ -186,6 +206,10 @@ impl BusView {
             decodes.clone(),
             egui_ctx.clone(),
         );
+        // Heard stations for the map: a second decode subscriber that keeps a
+        // longer-lived (call → grid) map than the bounded `decodes` ring. Runs in
+        // both modes — heard spots come from whatever decoder is live.
+        pump_heard(&bus, heard.clone(), egui_ctx.clone());
         // Health is only produced in real mode (by `core`); in mock mode the map
         // stays empty and panels treat everything as healthy.
         if real {
@@ -203,6 +227,7 @@ impl BusView {
             bands,
             logs,
             decodes,
+            heard,
             qso,
             health,
             real,
@@ -261,19 +286,50 @@ impl BusView {
         self.logs.buf.lock().unwrap().len()
     }
 
-    /// Distinct worked stations that carry a grid, as `(call, grid)`, most-recent
-    /// contact per call. Feeds the Contacts map.
-    pub fn worked_spots(&self) -> Vec<(String, String)> {
+    /// Distinct worked stations that carry a grid, most-recent contact per call.
+    /// Feeds the Contacts map's "worked" (filled) layer.
+    pub fn worked_spots(&self) -> Vec<MapSpot> {
         let mut seen = HashSet::new();
         let mut out = Vec::new();
         for e in self.logs.snapshot().into_iter().rev() {
             if let Some(grid) = &e.grid
                 && seen.insert(e.call.0.clone())
             {
-                out.push((e.call.0.clone(), grid.0.clone()));
+                out.push(MapSpot {
+                    call: e.call.0.clone(),
+                    grid: grid.0.clone(),
+                    last_ms: e.time.0,
+                    worked: true,
+                });
             }
         }
         out
+    }
+
+    /// Stations heard with a grid in the last hour, most-recent per call. Feeds the
+    /// Contacts map's "unworked" (hollow, dimming) layer. Older spots are dropped
+    /// per `docs/map_panel.md` (transient points last at most an hour). Callers
+    /// that also show worked spots should exclude calls already in the log.
+    pub fn heard_spots(&self) -> Vec<MapSpot> {
+        let cutoff = now_ms() - 3_600_000; // one hour
+        self.heard
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, (_, t))| *t >= cutoff)
+            .map(|(call, (grid, t))| MapSpot {
+                call: call.clone(),
+                grid: grid.0.clone(),
+                last_ms: *t,
+                worked: false,
+            })
+            .collect()
+    }
+
+    /// Current wall-clock time, ms since the Unix epoch — the reference the map
+    /// uses for recent/all filtering and age-dimming.
+    pub fn now_ms(&self) -> i64 {
+        now_ms()
     }
 
     /// The currently-applied hardware config (the settings form's starting point).
@@ -415,6 +471,39 @@ fn band_order(b: Band) -> u8 {
     }
 }
 
+/// Wall-clock time, ms since the Unix epoch.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Extract a placeable `(call, grid)` from a decode, if it advertises a locator —
+/// a CQ with a grid, or a standard grid exchange.
+///
+/// NOTE (Field Day): a Field Day exchange carries an ARRL `Section`, not a grid
+/// (`ExchangePayload::FieldDay`), so those stations yield `None` here and won't be
+/// placed yet. Plotting them needs section → coordinate inference — see TODO.md.
+fn station_grid(d: &Decode) -> Option<(String, GridSquare)> {
+    let DecodeContent::Slotted { message, .. } = &d.content else {
+        return None;
+    };
+    match message {
+        ParsedMessage::Cq {
+            caller,
+            grid: Some(g),
+            ..
+        } => Some((caller.0.clone(), g.clone())),
+        ParsedMessage::Exchange {
+            from,
+            payload: ExchangePayload::Grid(g),
+            ..
+        } => Some((from.0.clone(), g.clone())),
+        _ => None,
+    }
+}
+
 // ------------------------------------------------------------------- pumps
 
 /// Spawn a pump that mirrors a `State` topic's latest value into `cell`.
@@ -463,6 +552,45 @@ fn pump_stream<T: BusMessage>(
                     ctx.request_repaint();
                 }
                 // Lossy lag: keep reading. Closed/dropped: end the pump.
+                Err(BusError::Lagged { .. }) => continue,
+                Err(_) => break,
+            }
+        }
+    });
+}
+
+/// Spawn a pump that folds grid-bearing decodes into the heard-stations map
+/// (call → newest (grid, time)). Lets the Contacts map plot stations heard but
+/// not worked, retained far longer than the bounded `decodes` ring.
+fn pump_heard(
+    bus: &BusHandle,
+    heard: Arc<Mutex<HashMap<String, (GridSquare, i64)>>>,
+    ctx: egui::Context,
+) {
+    let mut sub =
+        match bus.subscribe::<Decode>(TopicSelector::Exact(Topic::Decodes(mocks::radio_id()))) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("bus_view: heard subscribe failed: {e:?}");
+                return;
+            }
+        };
+    tokio::spawn(async move {
+        loop {
+            match sub.recv().await {
+                Ok(d) => {
+                    if let Some((call, grid)) = station_grid(&d) {
+                        let t = d.t.0;
+                        let mut m = heard.lock().unwrap();
+                        // Keep the newest sighting per call.
+                        let newer = m.get(&call).is_none_or(|(_, prev)| t >= *prev);
+                        if newer {
+                            m.insert(call, (grid, t));
+                            drop(m);
+                            ctx.request_repaint();
+                        }
+                    }
+                }
                 Err(BusError::Lagged { .. }) => continue,
                 Err(_) => break,
             }

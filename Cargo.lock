@@ -774,6 +774,7 @@ dependencies = [
  "audio",
  "bus",
  "dsp",
+ "logbook",
  "modes",
  "rig",
  "serde",
@@ -2091,6 +2092,9 @@ name = "logbook"
 version = "0.1.0"
 dependencies = [
  "bus",
+ "serde_json",
+ "tokio",
+ "tracing",
  "types",
 ]
 

@@ -67,11 +67,14 @@ subscriber must never stall a publisher.**
 | `mocks` | ✅ implemented | fake producers for every topic; `mocks::spawn_support` |
 | `gui` | ✅ active dev | the app |
 | `qso` | 🪧 **stub** (~8 lines) | contact state machine — not built; currently mocked |
-| `logbook` | 🪧 **stub** | log store + ADIF + peer-merge — not built; currently mocked |
+| `logbook` | ✅ implemented | JSON-persistent log store: logs on RR73, replays history on startup; ADIF + peer-merge still pending |
 | `scanner` | 🪧 **stub** | band-scanner strategy — not built; currently mocked |
 
-In **real mode** the logbook, scanner, and clock are **still mock** (`mocks::spawn_support`),
-so the Log Book and Contacts/map panels show **fake QSOs** until those crates land.
+In **real mode** the **scanner** is still mock (`mocks::spawn_support`); the **logbook**
+is now the real persistent crate (spawned by `core::spawn`, JSON at `~/.dm420/logbook.json`
+or `DM420_LOGBOOK`), and the clock is real wall-clock. So the Log Book and Contacts/map
+panels show **real** QSOs in real mode — and seeded **fake** QSOs in mock mode, which still
+uses `mocks::spawn` for everything.
 
 ### GUI internals (`crates/gui/src`)
 

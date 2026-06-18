@@ -1,9 +1,13 @@
 //! Contacts panel: a world map (relief-shaded land mesh + graticule +
-//! range rings + worked spots) over a flat tactical footer (toggles + SNR bars).
-//! Bounds auto-fit the plotted spots, so it reads as a regional map when contacts
-//! cluster and zooms out to the globe when DX comes in.
-//! Owns the four footer toggle states. The map/footer drawing helpers
-//! (`over`, `dashed_polyline`, `ellipse_pts`) are single-consumer and live here.
+//! range rings + station spots) over a flat tactical footer (toggles + SNR bars).
+//! Plots both worked stations (filled, from the log) and heard-but-unworked
+//! stations (hollow, dimming with last-heard age — `docs/map_panel.md`). Bounds
+//! auto-fit the plotted spots, so it reads as a regional map when contacts cluster
+//! and zooms out to the globe when DX comes in. Owns the two footer toggle states.
+//! The map/footer drawing helpers (`over`, `dashed_polyline`, `ellipse_pts`) are
+//! single-consumer and live here.
+
+use std::collections::HashSet;
 
 use eframe::egui;
 use egui::{
@@ -11,19 +15,22 @@ use egui::{
 };
 
 use super::{Panel, PanelCtx};
+use crate::bus_view::MapSpot;
 use crate::chrome::{measure, panel_header};
 use crate::geo_data;
 use crate::panel_data as pd;
 use crate::theme::*;
 
 pub struct Contacts {
-    toggles: [bool; 4], // footer DX ONLY / CQ / ALERT / LOG
+    /// Footer toggles: `[0]` recent-only (last 24 h) vs. all logged entries;
+    /// `[1]` include heard-but-unworked stations. Per `docs/map_panel.md`.
+    toggles: [bool; 2],
 }
 
 impl Contacts {
     pub fn new() -> Self {
         Self {
-            toggles: [true, false, false, true], // DX ONLY + LOG on, per reference
+            toggles: [true, true], // recent-only + show unworked
         }
     }
 }
@@ -36,7 +43,30 @@ impl Panel for Contacts {
     fn ui(&mut self, ctx: &mut PanelCtx, block: Rect) {
         let painter = ctx.painter;
         let pal = ctx.pal;
-        let spots = ctx.bus.worked_spots();
+
+        // Worked stations from the log; optionally trimmed to the last 24 h.
+        let now = ctx.bus.now_ms();
+        let mut worked = ctx.bus.worked_spots();
+        if self.toggles[0] {
+            let cutoff = now - 24 * 3_600_000;
+            worked.retain(|s| s.last_ms >= cutoff);
+        }
+        // Heard-but-unworked stations, excluding any we've already worked (a worked
+        // station is shown filled, not as a transient). Empty unless the "unworked"
+        // toggle is on. Order in the combined list doesn't matter — `draw_map`
+        // paints hollow then filled so worked markers always sit on top.
+        let mut spots = worked;
+        if self.toggles[1] {
+            let worked_calls: HashSet<String> = spots.iter().map(|s| s.call.clone()).collect();
+            spots.extend(
+                ctx.bus
+                    .heard_spots()
+                    .into_iter()
+                    .filter(|s| !worked_calls.contains(&s.call)),
+            );
+        }
+        let spot_count = spots.len();
+
         // Home is the operator's configured grid, decoded to lon/lat; fall back to
         // the default QTH if the grid can't be parsed.
         let home = pd::grid_to_lonlat(ctx.grid)
@@ -58,7 +88,7 @@ impl Panel for Contacts {
         painter.text(
             Pos2::new(header.right() - 2.0, header.center().y),
             Align2::RIGHT_CENTER,
-            format!("{} spots", spots.len()),
+            format!("{spot_count} spots"),
             mono(8.5),
             pal.sub,
         );
@@ -72,7 +102,7 @@ impl Panel for Contacts {
             Pos2::new(block.right(), footer.top() - pd::GAP),
         );
         recessed_screen(painter, screen, pal);
-        draw_map(painter, screen, pal, ctx.relief, &spots, home);
+        draw_map(painter, screen, pal, ctx.relief, &spots, now, home);
         self.draw_footer(ctx.ui, painter, footer, pal);
     }
 }
@@ -87,7 +117,7 @@ impl Contacts {
         pal: &Palette,
     ) {
         let cy = rect.center().y;
-        let labels = ["DX ONLY", "CQ", "ALERT", "LOG"];
+        let labels = ["RECENT", "UNWORKED"];
         let mut x = rect.left();
         for (i, label_text) in labels.iter().enumerate() {
             let sq =
@@ -204,7 +234,12 @@ fn draw_map(
     screen: Rect,
     pal: &Palette,
     relief: &TextureHandle,
-    spots: &[(String, String)],
+    // Worked (filled) and heard-but-unworked (hollow) stations in one list; the
+    // `worked` flag picks the marker style. Filled markers come last so they paint
+    // over hollow ones.
+    spots: &[MapSpot],
+    // Wall-clock now (ms since epoch) — the reference for dimming heard markers.
+    now_ms: i64,
     // The operator's home location as `(lon, lat)` — a plotted bounds point and
     // the centre of the range rings.
     home_ll: (f32, f32),
@@ -223,7 +258,7 @@ fn draw_map(
     // the worked cluster puts it (e.g. contacts to the west → home biased right).
     let mut pts: Vec<Vec2> = spots
         .iter()
-        .filter_map(|(call, grid)| pd::station_lonlat(call, grid))
+        .filter_map(|s| pd::station_lonlat(&s.call, &s.grid))
         .map(|(lon, lat)| Vec2::new(pd::map_x(lon), pd::map_y(lat)))
         .collect();
     pts.push(Vec2::new(pd::map_x(home_ll.0), pd::map_y(home_ll.1)));
@@ -234,14 +269,21 @@ fn draw_map(
         maxx = maxx.max(v.x);
         maxy = maxy.max(v.y);
     }
-    // Pad ~8% and guard against a degenerate (single-point) box.
-    let bw = (maxx - minx).max(1.0);
-    let bh = (maxy - miny).max(1.0);
-    minx -= bw * 0.08;
-    maxx += bw * 0.08;
-    miny -= bh * 0.08;
-    maxy += bh * 0.08;
+    // Pad ~8%, then enforce a minimum span so a sparse map — e.g. just the home
+    // marker before any spots arrive (real mode starts with an empty log + heard
+    // set) — settles on a regional view instead of collapsing onto a single point.
+    // Without this floor `scale` runs away and the scale-derived graticule font
+    // (`font(4.6)` below) requests a multi-thousand-pixel glyph that overflows the
+    // font atlas and aborts the app.
+    const MIN_SPAN_X: f32 = 400.0; // ~80° lon (the projection is 5 world units/°)
+    const MIN_SPAN_Y: f32 = 240.0; // ~48° lat
     let (bcx, bcy) = ((minx + maxx) * 0.5, (miny + maxy) * 0.5);
+    let half_x = ((maxx - minx) * 0.54).max(MIN_SPAN_X * 0.5); // 0.54 = ½ span + 8% pad
+    let half_y = ((maxy - miny) * 0.54).max(MIN_SPAN_Y * 0.5);
+    minx = bcx - half_x;
+    maxx = bcx + half_x;
+    miny = bcy - half_y;
+    maxy = bcy + half_y;
     let scale = (content.width() / (maxx - minx)).min(content.height() / (maxy - miny));
     let p = |sx: f32, sy: f32| {
         Pos2::new(
@@ -353,33 +395,61 @@ fn draw_map(
         );
     }
 
-    // 4) worked spots (filled) — position inferred from each station's grid.
-    // Marker/label sized in px (with clamp) so they stay readable at any zoom.
+    // 4) station spots — position inferred from each station's grid; marker/label
+    // sized in px (with clamp) so they stay readable at any zoom. A shared plotter
+    // draws worked (filled) and heard-but-unworked (hollow, dimmed by age) spots.
     let spot_r = sl(2.4).clamp(2.0, 3.6);
     let label_font = mono(sl(4.8).clamp(5.0, 8.0));
-    for (call, grid) in spots {
-        let Some((lon, lat)) = pd::station_lonlat(call, grid) else {
+    let plot =
+        |call: &str, lon: f32, lat: f32, fill: Option<Color32>, ring: Color32, label: Color32| {
+            let pos = proj(lon, lat);
+            match fill {
+                Some(c) => painter.circle_filled(pos, spot_r, c),
+                None => painter.circle_stroke(pos, spot_r, Stroke::new(1.2, ring)),
+            };
+            // Flip the label to the inboard side near the right/top edges so it stays on-screen.
+            let right = pos.x > content.right() - 42.0;
+            let near_top = pos.y < content.top() + 12.0;
+            let off = Vec2::new(
+                if right { -(spot_r + 1.5) } else { spot_r + 1.5 },
+                if near_top {
+                    spot_r + 5.0
+                } else {
+                    -(spot_r + 1.0)
+                },
+            );
+            let align = if right {
+                Align2::RIGHT_BOTTOM
+            } else {
+                Align2::LEFT_BOTTOM
+            };
+            painter.text(pos + off, align, call, label_font.clone(), label);
+        };
+
+    // Heard-but-unworked first, then worked, so filled markers paint over hollow
+    // ones. Heard → hollow cyan (secondary accent), dimming with last-heard age
+    // (full → 0.2 over the hour; spots older than an hour are filtered upstream).
+    for s in spots.iter().filter(|s| !s.worked) {
+        let Some((lon, lat)) = pd::station_lonlat(&s.call, &s.grid) else {
             continue;
         };
-        let pos = proj(lon, lat);
-        painter.circle_filled(pos, spot_r, pal.accent);
-        // Flip the label to the inboard side near the right/top edges so it stays on-screen.
-        let right = pos.x > content.right() - 42.0;
-        let near_top = pos.y < content.top() + 12.0;
-        let off = Vec2::new(
-            if right { -(spot_r + 1.5) } else { spot_r + 1.5 },
-            if near_top {
-                spot_r + 5.0
-            } else {
-                -(spot_r + 1.0)
-            },
+        let age = ((now_ms - s.last_ms).max(0) as f32 / 3_600_000.0).clamp(0.0, 1.0);
+        let alpha = 1.0 - 0.8 * age;
+        plot(
+            &s.call,
+            lon,
+            lat,
+            None,
+            pal.accent2.gamma_multiply(alpha),
+            pal.sub.gamma_multiply(alpha),
         );
-        let align = if right {
-            Align2::RIGHT_BOTTOM
-        } else {
-            Align2::LEFT_BOTTOM
+    }
+    // Worked → filled amber.
+    for s in spots.iter().filter(|s| s.worked) {
+        let Some((lon, lat)) = pd::station_lonlat(&s.call, &s.grid) else {
+            continue;
         };
-        painter.text(pos + off, align, call, label_font.clone(), pal.body);
+        plot(&s.call, lon, lat, Some(pal.accent), pal.accent, pal.body);
     }
 
     // 5) home / QTH marker — the strongest indicator, drawn last so it sits on top.
