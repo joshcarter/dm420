@@ -9,8 +9,7 @@
 //!
 //! On-disk format is **JSONL** — one JSON `LogEntry` per line. Each new contact is
 //! a single appended line, so a crash mid-write can at worst leave a partial
-//! trailing line (which [`load`] skips); the rest of the log survives. A legacy
-//! whole-array `.json` file is read and migrated to JSONL in place on startup.
+//! trailing line (which [`load`] skips); the rest of the log survives.
 //!
 //! Dedup-by-`QsoId` makes the startup replay idempotent: we observe our own
 //! replays through the same subscription, but a re-seen id is a no-op and is
@@ -55,15 +54,6 @@ async fn run(bus: BusHandle, path: PathBuf) {
         path.display()
     );
 
-    // Normalize on-disk storage to JSONL once at startup: migrates a legacy
-    // whole-array file in place, and leaves an already-JSONL file equivalent — so
-    // every later write can be a clean append.
-    if !entries.is_empty()
-        && let Err(e) = rewrite_jsonl(&path, &entries)
-    {
-        tracing::warn!("logbook: normalize to JSONL at {} failed: {e}", path.display());
-    }
-
     // Replay history so a panel that just subscribed renders past contacts.
     for entry in &entries {
         let _ = bus.publish(&Topic::LogbookEntries, entry.clone());
@@ -87,26 +77,15 @@ async fn run(bus: BusHandle, path: PathBuf) {
     }
 }
 
-/// Load the persisted log. Reads JSONL (one entry per line, the current format)
-/// and a legacy single JSON array (migrated to JSONL on startup). A missing file
-/// is an empty log; an unparseable line is skipped with a warning rather than
-/// discarding the whole log, so one torn line can't lose every contact.
+/// Load the persisted log (JSONL, one entry per line). A missing file is an empty
+/// log; an unparseable line is skipped with a warning rather than discarding the
+/// whole log, so one torn line can't lose every contact.
 fn load(path: &Path) -> Vec<LogEntry> {
     let Ok(bytes) = std::fs::read(path) else {
         return Vec::new();
     };
-    let text = String::from_utf8_lossy(&bytes);
-    // Legacy format: the whole log as one pretty-printed JSON array.
-    if text.trim_start().starts_with('[') {
-        return serde_json::from_str(text.trim()).unwrap_or_else(|e| {
-            tracing::warn!(
-                "logbook: {} is not valid JSON ({e}); starting with an empty log",
-                path.display()
-            );
-            Vec::new()
-        });
-    }
-    text.lines()
+    String::from_utf8_lossy(&bytes)
+        .lines()
         .filter(|l| !l.trim().is_empty())
         .filter_map(|l| match serde_json::from_str::<LogEntry>(l) {
             Ok(e) => Some(e),
@@ -133,24 +112,6 @@ fn append_entry(path: &Path, entry: &LogEntry) -> std::io::Result<()> {
         .append(true)
         .open(path)?;
     f.write_all(line.as_bytes())
-}
-
-/// Rewrite the whole log as JSONL atomically (temp file + rename), used once at
-/// startup to normalize/migrate; steady-state writes are appends.
-fn rewrite_jsonl(path: &Path, store: &[LogEntry]) -> std::io::Result<()> {
-    ensure_parent(path)?;
-    let mut buf = String::new();
-    for e in store {
-        buf.push_str(
-            &serde_json::to_string(e)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
-        );
-        buf.push('\n');
-    }
-    let tmp = path.with_extension("jsonl.tmp");
-    std::fs::write(&tmp, buf)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
 }
 
 /// Create the file's parent directory if it has one.
@@ -223,20 +184,6 @@ mod tests {
         let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
         f.write_all(b"{\"id\":{\"orig").unwrap();
         assert_eq!(load(&path), vec![entry(1), entry(2)]);
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn legacy_json_array_is_read_then_migrated() {
-        let path = scratch("legacy");
-        let _ = std::fs::remove_file(&path);
-        let log = vec![entry(1), entry(2)];
-        // Old on-disk format: one pretty-printed JSON array.
-        std::fs::write(&path, serde_json::to_vec_pretty(&log).unwrap()).unwrap();
-        assert_eq!(load(&path), log); // read the legacy array
-        rewrite_jsonl(&path, &log).unwrap(); // migrate in place
-        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 2);
-        assert_eq!(load(&path), log); // now JSONL, same contents
         let _ = std::fs::remove_file(&path);
     }
 
