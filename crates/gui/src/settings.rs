@@ -124,18 +124,25 @@ pub struct Settings {
     pub protocol: Protocol,
     /// If set, replay this WAV instead of opening the live capture device.
     pub wav: Option<PathBuf>,
+    /// TX audio output device (the rig's data-in); `None` = system default.
+    /// Persisted in dm420.toml `[audio]` (no env var).
+    pub audio_output: Option<String>,
 }
 
 impl Settings {
     /// Read the `DM420_*` environment into a `Settings`. Never fails: bad values
     /// log a warning and fall back to a sensible default.
     pub fn from_env() -> Self {
+        // Persisted audio device selections (dm420.toml [audio]); the env var still
+        // wins for the input, for quick overrides.
+        let (toml_in, toml_out) = read_audio_config(Path::new("dm420.toml"));
         Settings {
             real: env_flag("DM420_REAL"),
-            audio_input: env_nonempty("DM420_AUDIO_INPUT"),
+            audio_input: env_nonempty("DM420_AUDIO_INPUT").or(toml_in),
             serial: serial_from_env(),
             protocol: protocol_from_env(),
             wav: wav_from_env(),
+            audio_output: toml_out,
         }
     }
 
@@ -149,9 +156,7 @@ impl Settings {
     pub fn hardware(&self) -> HardwareConfig {
         HardwareConfig {
             audio_input: self.audio_input.clone(),
-            // No startup source for the TX output (no env, not persisted yet); the
-            // operator picks it in the unlocked panel. System default until then.
-            audio_output: None,
+            audio_output: self.audio_output.clone(),
             serial: self.serial.clone(),
             protocol: self.protocol,
         }
@@ -177,6 +182,7 @@ impl Settings {
             allow_transmit: true,
             decode,
             serial: Some(self.serial.clone()),
+            tx_output: self.audio_output.clone(),
         }
     }
 }
@@ -201,77 +207,87 @@ fn read_station_config(path: &Path) -> (Option<String>, Option<String>) {
     }
 }
 
-/// Pull `callsign` / `grid` from a `[station]` table. **Not** a full TOML parser —
-/// it deliberately avoids adding a dependency for a format that is still TBD (see
-/// `joels-notes.md`); swap in the `toml` crate when the config grows.
-fn parse_station_config(text: &str) -> (Option<String>, Option<String>) {
-    let (mut call, mut grid) = (None, None);
-    let mut in_station = false;
+/// Read the persisted `(input, output)` audio device names from `dm420.toml`.
+fn read_audio_config(path: &Path) -> (Option<String>, Option<String>) {
+    match std::fs::read_to_string(path) {
+        Ok(text) => parse_audio_config(&text),
+        Err(_) => (None, None),
+    }
+}
+
+/// Read a single string value from `table`'s `key`. **Not** a full TOML parser —
+/// it deliberately avoids a dependency for a format that is still TBD (see
+/// `joels-notes.md`); swap in the `toml` crate when the config grows. An empty
+/// value counts as unset.
+fn parse_table_value(text: &str, table: &str, key: &str) -> Option<String> {
+    let mut in_table = false;
     for line in text.lines() {
         let line = line.split('#').next().unwrap_or("").trim();
         if line.is_empty() {
             continue;
         }
-        if let Some(table) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
-            in_station = table.trim() == "station";
+        if let Some(t) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            in_table = t.trim() == table;
             continue;
         }
-        if !in_station {
-            continue;
-        }
-        if let Some((key, val)) = line.split_once('=') {
+        if in_table
+            && let Some((k, val)) = line.split_once('=')
+            && k.trim() == key
+        {
             let val = val.trim().trim_matches('"').trim();
-            if val.is_empty() {
-                continue;
-            }
-            match key.trim() {
-                "callsign" | "call" => call = Some(val.to_string()),
-                "grid" => grid = Some(val.to_string()),
-                _ => {}
-            }
+            return (!val.is_empty()).then(|| val.to_string());
         }
     }
+    None
+}
+
+/// Pull `callsign` (or `call`) / `grid` from the `[station]` table.
+fn parse_station_config(text: &str) -> (Option<String>, Option<String>) {
+    let call = parse_table_value(text, "station", "callsign")
+        .or_else(|| parse_table_value(text, "station", "call"));
+    let grid = parse_table_value(text, "station", "grid");
     (call, grid)
 }
 
-/// Rewrite `dm420.toml` content to carry `call`/`grid`, **preserving comments** and
-/// every other line: existing `callsign`/`grid` in `[station]` are updated in place
-/// (inline comments kept), any missing key is appended to the table, and a
-/// `[station]` table — or the whole file — is created if absent. Pairs with
-/// [`parse_station_config`]; a real `toml_edit` swap-in would subsume both.
-fn update_station_config(existing: Option<&str>, call: &str, grid: &str) -> String {
-    let Some(text) = existing else {
-        return default_station_toml(call, grid);
-    };
+/// Pull the `input` / `output` audio device names from the `[audio]` table.
+fn parse_audio_config(text: &str) -> (Option<String>, Option<String>) {
+    (
+        parse_table_value(text, "audio", "input"),
+        parse_table_value(text, "audio", "output"),
+    )
+}
+
+/// Rewrite TOML `text` so `table` carries `kvs` (`key`, `value` pairs),
+/// **preserving comments** and every other line: existing keys are updated in
+/// place (inline comments kept), missing keys are appended to the table, and the
+/// `[table]` is created if absent — leaving any other tables untouched. A real
+/// `toml_edit` swap-in would subsume this (see `joels-notes.md`).
+fn update_toml_table(text: &str, table: &str, kvs: &[(&str, &str)]) -> String {
     let mut out: Vec<String> = Vec::new();
-    let mut in_station = false;
-    let mut seen_station = false;
-    let mut wrote_call = false;
-    let mut wrote_grid = false;
-    let mut insert_at: Option<usize> = None; // after the last meaningful [station] line
+    let mut in_table = false;
+    let mut seen = false;
+    let mut written = vec![false; kvs.len()];
+    let mut insert_at: Option<usize> = None; // after the last meaningful [table] line
 
     for raw in text.lines() {
         let code = raw.split('#').next().unwrap_or("").trim();
-        if let Some(table) = code.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
-            in_station = table.trim() == "station";
-            seen_station |= in_station;
+        if let Some(t) = code.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            in_table = t.trim() == table;
+            seen |= in_table;
             out.push(raw.to_string());
-            if in_station {
+            if in_table {
                 insert_at = Some(out.len());
             }
             continue;
         }
-        if in_station {
-            match code.split_once('=').map(|(k, _)| k.trim()) {
-                Some("callsign") | Some("call") => {
-                    out.push(rewrite_kv(raw, call));
-                    wrote_call = true;
+        if in_table {
+            let key = code.split_once('=').map(|(k, _)| k.trim());
+            match key.and_then(|k| kvs.iter().position(|(kk, _)| *kk == k)) {
+                Some(i) => {
+                    out.push(rewrite_kv(raw, kvs[i].1));
+                    written[i] = true;
                 }
-                Some("grid") => {
-                    out.push(rewrite_kv(raw, grid));
-                    wrote_grid = true;
-                }
-                _ => out.push(raw.to_string()),
+                None => out.push(raw.to_string()),
             }
             if !raw.trim().is_empty() {
                 insert_at = Some(out.len());
@@ -282,14 +298,13 @@ fn update_station_config(existing: Option<&str>, call: &str, grid: &str) -> Stri
     }
 
     let mut missing = Vec::new();
-    if !wrote_call {
-        missing.push(format!("callsign = \"{call}\""));
-    }
-    if !wrote_grid {
-        missing.push(format!("grid = \"{grid}\""));
+    for (i, (k, v)) in kvs.iter().enumerate() {
+        if !written[i] {
+            missing.push(format!("{k} = \"{v}\""));
+        }
     }
     if !missing.is_empty() {
-        if let (true, Some(at)) = (seen_station, insert_at) {
+        if let (true, Some(at)) = (seen, insert_at) {
             for (i, line) in missing.into_iter().enumerate() {
                 out.insert(at + i, line);
             }
@@ -297,7 +312,7 @@ fn update_station_config(existing: Option<&str>, call: &str, grid: &str) -> Stri
             if out.last().is_some_and(|l| !l.trim().is_empty()) {
                 out.push(String::new());
             }
-            out.push("[station]".to_string());
+            out.push(format!("[{table}]"));
             out.extend(missing);
         }
     }
@@ -305,6 +320,37 @@ fn update_station_config(existing: Option<&str>, call: &str, grid: &str) -> Stri
     let mut s = out.join("\n");
     s.push('\n');
     s
+}
+
+/// Comment-preserving `[station]` update, or a fresh commented file when none
+/// exists yet.
+fn update_station_config(existing: Option<&str>, call: &str, grid: &str) -> String {
+    match existing {
+        Some(text) => update_toml_table(text, "station", &[("callsign", call), ("grid", grid)]),
+        None => default_station_toml(call, grid),
+    }
+}
+
+/// Persist the audio device selections to `dm420.toml`'s `[audio]` table,
+/// preserving comments and the rest of the file (e.g. `[station]`). Errors are
+/// logged, not fatal. Empty selections are written as `""` (system default).
+pub fn save_audio_config(cfg: &HardwareConfig) {
+    let path = Path::new("dm420.toml");
+    let kvs = [
+        ("input", cfg.audio_input.as_deref().unwrap_or("")),
+        ("output", cfg.audio_output.as_deref().unwrap_or("")),
+    ];
+    let text = match std::fs::read_to_string(path) {
+        Ok(existing) => update_toml_table(&existing, "audio", &kvs),
+        Err(_) => format!(
+            "# DM420 config — written from the UI; safe to hand-edit.\n\n[audio]\n\
+             input = \"{}\"\noutput = \"{}\"\n",
+            kvs[0].1, kvs[1].1
+        ),
+    };
+    if let Err(e) = std::fs::write(path, &text) {
+        eprintln!("dm420: could not write {}: {e}", path.display());
+    }
 }
 
 /// Rewrite a `key = value` line with a new quoted value, preserving the key, its

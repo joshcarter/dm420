@@ -9,3 +9,10 @@
 [station]
 callsign = "YOURCALL"   # e.g. W4LL
 grid     = "AA00"       # your Maidenhead grid, e.g. EM73
+
+# Audio device selections. Usually set from the unlocked Radio Setup panel and
+# written here automatically; empty = system default. For a Kenwood-style rig both
+# are typically "USB Audio CODEC".
+[audio]
+input  = ""   # RX capture device (DM420_AUDIO_INPUT env overrides this)
+output = ""   # TX output device (the rig's data-in)

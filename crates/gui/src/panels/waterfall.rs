@@ -375,6 +375,8 @@ impl Panel for Waterfall {
             if self.form.loaded {
                 let edited = self.form.to_config();
                 if edited != ctx.bus.current_config() {
+                    // Persist the audio device choices to dm420.toml, then apply.
+                    crate::settings::save_audio_config(&edited);
                     ctx.bus.apply_config(edited);
                 }
                 self.form.loaded = false; // re-sync to applied config on next unlock

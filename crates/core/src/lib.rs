@@ -126,6 +126,9 @@ pub struct CoreConfig {
     pub decode: DecodeSource,
     /// How to reach the rig. `None` ⇒ no rig producer (mock/headless).
     pub serial: Option<SerialConfig>,
+    /// Initial TX audio output device; `None` = system default. Live-editable
+    /// afterward via [`CoreControl::tx`].
+    pub tx_output: Option<String>,
 }
 
 impl Default for CoreConfig {
@@ -135,6 +138,7 @@ impl Default for CoreConfig {
             allow_transmit: false,
             decode: DecodeSource::None,
             serial: None,
+            tx_output: None,
         }
     }
 }
@@ -153,6 +157,7 @@ pub fn spawn(bus: &BusHandle, cfg: CoreConfig) -> CoreControl {
         allow_transmit,
         decode,
         serial,
+        tx_output,
     } = cfg;
 
     let mut control = CoreControl::default();
@@ -166,7 +171,7 @@ pub fn spawn(bus: &BusHandle, cfg: CoreConfig) -> CoreControl {
     // TX path: the audio-TX service that synthesizes, keys, and plays. Its output
     // device is live-editable from the UI via `control.tx`. Spawned whenever
     // transmit is permitted (the operator still keys it explicitly, per over).
-    let tx_control = Arc::new(control::TxControl::new(None));
+    let tx_control = Arc::new(control::TxControl::new(tx_output));
     if allow_transmit {
         tx::spawn(bus, radio.clone(), tx_control.clone());
     }
