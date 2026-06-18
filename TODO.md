@@ -1,8 +1,7 @@
-# Immediate
-
-Regenerate CLAUDE.md
-
 # Soon
+
+Need to determine actual limits of audio offset for
+transmit--currently a hard window, something like 1000-2000Hz.
 
 FT4/FT8 mode switch. Also switch calling frequency for each band.
 
