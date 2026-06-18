@@ -19,7 +19,7 @@ use eframe::egui::{
 };
 
 use crate::theme::Palette;
-use crate::waterslide_sim::{column_values, Sim, COL_H};
+use crate::waterslide_sim::{COL_H, Sim, column_values};
 
 // FFT half is W×H px in model space; 30 s spans W px → PPS px/sec.
 const W: usize = 520;
@@ -81,7 +81,7 @@ impl WaterslideTheme {
 /// 6-stop colormap builder. Stops are (position 0..1, [r,g,b]).
 pub fn build_cmap(stops: &[(f32, [u8; 3])]) -> [Color32; 256] {
     let mut lut = [Color32::BLACK; 256];
-    for i in 0..256 {
+    for (i, slot) in lut.iter_mut().enumerate() {
         let v = i as f32 / 255.0;
         let mut a = stops[0];
         let mut b = stops[stops.len() - 1];
@@ -98,7 +98,11 @@ pub fn build_cmap(stops: &[(f32, [u8; 3])]) -> [Color32; 256] {
             (v - a.0) / (b.0 - a.0)
         };
         let lerp = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * tt) as u8;
-        lut[i] = Color32::from_rgb(lerp(a.1[0], b.1[0]), lerp(a.1[1], b.1[1]), lerp(a.1[2], b.1[2]));
+        *slot = Color32::from_rgb(
+            lerp(a.1[0], b.1[0]),
+            lerp(a.1[1], b.1[1]),
+            lerp(a.1[2], b.1[2]),
+        );
     }
     lut
 }
@@ -162,7 +166,10 @@ impl Target {
     fn clamp_off(self, lim: i32) -> Self {
         match self {
             Target::Offset(o) => Target::Offset(o.clamp(-lim, lim)),
-            Target::Station { call, off } => Target::Station { call, off: off.clamp(-lim, lim) },
+            Target::Station { call, off } => Target::Station {
+                call,
+                off: off.clamp(-lim, lim),
+            },
         }
     }
 }
@@ -220,8 +227,8 @@ impl WaterslidePanel {
         let mut vals = [0f32; COL_H];
         let col_id = (ts * PPS).round() as i64;
         column_values(ts, col_id, &mut vals);
-        for y in 0..H {
-            self.intensity[y * W + cx] = vals[y].clamp(0.0, 1.0);
+        for (y, &val) in vals.iter().take(H).enumerate() {
+            self.intensity[y * W + cx] = val.clamp(0.0, 1.0);
         }
     }
 
@@ -281,7 +288,10 @@ impl WaterslidePanel {
         match &mut self.tex {
             Some(t) => t.set(img, TextureOptions::LINEAR),
             None => {
-                self.tex = Some(ui.ctx().load_texture("waterslide", img, TextureOptions::LINEAR))
+                self.tex = Some(
+                    ui.ctx()
+                        .load_texture("waterslide", img, TextureOptions::LINEAR),
+                )
             }
         }
         let tex = self.tex.as_ref().unwrap();
@@ -301,9 +311,16 @@ impl WaterslidePanel {
         // (resolved in the text loop below); any other click sets the offset
         // from the vertical position. The cursor hints the lane is tunable.
         let resp = ui
-            .interact(rect, egui::Id::new("waterslide_tx_tune"), egui::Sense::click())
+            .interact(
+                rect,
+                egui::Id::new("waterslide_tx_tune"),
+                egui::Sense::click(),
+            )
             .on_hover_cursor(egui::CursorIcon::PointingHand);
-        let click_pos = resp.clicked().then(|| resp.interact_pointer_pos()).flatten();
+        let click_pos = resp
+            .clicked()
+            .then(|| resp.interact_pointer_pos())
+            .flatten();
         // A click that lands on a decoded line records that station (call + its
         // offset); resolved in the text loop below, applied in step 6.
         let mut snap: Option<(Option<String>, i32)> = None;
@@ -355,22 +372,36 @@ impl WaterslidePanel {
                 theme.dim
             };
             // message (right-aligned so the newest char sits at "now")
-            let msg_rect =
-                tp.text(pos, Align2::RIGHT_CENTER, &rec.msg, FontId::monospace(12.0 * fscale), theme.text);
+            let msg_rect = tp.text(
+                pos,
+                Align2::RIGHT_CENTER,
+                &rec.msg,
+                FontId::monospace(12.0 * fscale),
+                theme.text,
+            );
             let msg_w = msg_rect.width();
             // clicking the line targets that station (and snaps to its offset)
-            if let Some(cp) = click_pos {
-                if msg_rect.expand(4.0).contains(cp) {
-                    snap = Some((target_call(&rec.msg), rec.off));
-                }
+            if let Some(cp) = click_pos
+                && msg_rect.expand(4.0).contains(cp)
+            {
+                snap = Some((target_call(&rec.msg), rec.off));
             }
             // reception SNR just to the left of the message
             let snr_pos = Pos2::new(pos.x - msg_w - 8.0 * sx, pos.y);
-            tp.text(snr_pos, Align2::RIGHT_CENTER, sgn(rec.rsnr), FontId::monospace(10.5 * fscale), snr_col);
+            tp.text(
+                snr_pos,
+                Align2::RIGHT_CENTER,
+                sgn(rec.rsnr),
+                FontId::monospace(10.5 * fscale),
+                snr_col,
+            );
         }
 
         // 5) NOW divider at the centre
-        painter.line_segment([p(521.0, 0.0), p(521.0, H as f32)], Stroke::new(2.0, theme.accent));
+        painter.line_segment(
+            [p(521.0, 0.0), p(521.0, H as f32)],
+            Stroke::new(2.0, theme.accent),
+        );
 
         // 6) resolve a click into the outgoing target: a decoded line becomes a
         // Station (work that call); empty spectrum becomes a bare Offset read off
@@ -394,8 +425,14 @@ impl WaterslidePanel {
         let oy = Self::y_of(off);
         let band = Rect::from_min_max(p(0.0, oy - TX_BAND_HALF), p(X_FFT_R, oy + TX_BAND_HALF));
         painter.rect_filled(band, 0.0, theme.accent.gamma_multiply(0.10));
-        painter.line_segment([band.left_top(), band.right_top()], Stroke::new(1.5, theme.accent));
-        painter.line_segment([band.left_bottom(), band.right_bottom()], Stroke::new(1.5, theme.accent));
+        painter.line_segment(
+            [band.left_top(), band.right_top()],
+            Stroke::new(1.5, theme.accent),
+        );
+        painter.line_segment(
+            [band.left_bottom(), band.right_bottom()],
+            Stroke::new(1.5, theme.accent),
+        );
         let tx_label = format!(
             "TX {}{}",
             if off >= 0 { "+" } else { "\u{2212}" },

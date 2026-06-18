@@ -132,11 +132,7 @@ pub fn dd_to_int(s: &str, max_len: usize) -> i32 {
         result = result * 10 + (c - b'0') as i32;
         i += 1;
     }
-    if negative {
-        -result
-    } else {
-        result
-    }
+    if negative { -result } else { result }
 }
 
 #[cfg(test)]

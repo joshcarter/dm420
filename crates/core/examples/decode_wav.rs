@@ -27,7 +27,9 @@ fn resample_to_12k(samples: Vec<f32>, rate: u32) -> Vec<f32> {
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let path = args.next().map_or_else(|| PathBuf::from(DEFAULT_WAV), PathBuf::from);
+    let path = args
+        .next()
+        .map_or_else(|| PathBuf::from(DEFAULT_WAV), PathBuf::from);
     let proto = match args.next().as_deref() {
         Some("ft4") => Protocol::Ft4,
         _ => Protocol::Ft8,

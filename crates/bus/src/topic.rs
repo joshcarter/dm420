@@ -135,7 +135,8 @@ impl Topic {
             ["clock", "status"] => Topic::ClockStatus,
             ["station", sid, "snapshot"] => Topic::StationSnapshot(StationId(sid.to_string())),
             ["health", id] => {
-                let sid = SubsystemId::parse(id).ok_or_else(|| BusError::BadTopic(s.to_string()))?;
+                let sid =
+                    SubsystemId::parse(id).ok_or_else(|| BusError::BadTopic(s.to_string()))?;
                 Topic::Health(sid)
             }
             _ => return Err(BusError::BadTopic(s.to_string())),
@@ -233,20 +234,34 @@ mod tests {
             (Topic::ScannerState, DeliveryClass::State),
             (Topic::ScannerCandidates, DeliveryClass::State),
             (Topic::ClockStatus, DeliveryClass::State),
-            (Topic::StationSnapshot(StationId("s1".into())), DeliveryClass::State),
+            (
+                Topic::StationSnapshot(StationId("s1".into())),
+                DeliveryClass::State,
+            ),
             (Topic::Health(SubsystemId::Rig), DeliveryClass::State),
             (Topic::Health(SubsystemId::Audio), DeliveryClass::State),
         ];
         for (topic, class) in cases {
             let s = topic.canonical();
-            assert_eq!(Topic::parse(&s).unwrap(), topic, "round-trip failed for {s}");
+            assert_eq!(
+                Topic::parse(&s).unwrap(),
+                topic,
+                "round-trip failed for {s}"
+            );
             assert_eq!(topic.delivery_class(), class, "wrong class for {s}");
         }
     }
 
     #[test]
     fn parse_rejects_garbage() {
-        for bad in ["", "radio", "radio/k1", "radio/k1/nope", "bogus/topic", "logbook/nope"] {
+        for bad in [
+            "",
+            "radio",
+            "radio/k1",
+            "radio/k1/nope",
+            "bogus/topic",
+            "logbook/nope",
+        ] {
             assert!(Topic::parse(bad).is_err(), "expected error for {bad:?}");
         }
     }

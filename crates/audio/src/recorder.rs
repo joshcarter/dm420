@@ -4,16 +4,16 @@
 //! levels, and writes uncompressed 16-bit PCM via hound. The drain loop is a free
 //! function so tests can drive it with synthetic buffers — no hardware needed.
 
-use crate::device::{open_cpal_device, DeviceKind};
+use crate::AudioError;
+use crate::device::{DeviceKind, open_cpal_device};
 use crate::dsp;
 use crate::meta::{RadioSnapshot, RecordingMeta};
-use crate::AudioError;
 use chrono::{DateTime, Utc};
 use cpal::traits::{DeviceTrait, StreamTrait};
-use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use tracing::{debug, info, warn};
 

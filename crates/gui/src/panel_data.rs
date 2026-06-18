@@ -10,17 +10,17 @@
 // ============================================================ LAYOUT
 pub const PANEL_W: f32 = 960.0;
 pub const PANEL_H: f32 = 600.0;
-pub const TOPBAR_H: f32 = 46.0;     // full-width metal top bar
-pub const GROOVE_H: f32 = 2.0;      // accent groove under the top bar
-pub const MAIN_H: f32 = 552.0;      // body height (TOPBAR_H + GROOVE_H + MAIN_H = 600)
+pub const TOPBAR_H: f32 = 46.0; // full-width metal top bar
+pub const GROOVE_H: f32 = 2.0; // accent groove under the top bar
+pub const MAIN_H: f32 = 552.0; // body height (TOPBAR_H + GROOVE_H + MAIN_H = 600)
 
-pub const LEFT_COL_W: f32 = 470.0;  // waterfall column; padding 8/10/8/14 (t/r/b/l)
-pub const VGROOVE_W: f32 = 2.0;     // vertical groove between columns
+pub const LEFT_COL_W: f32 = 470.0; // waterfall column; padding 8/10/8/14 (t/r/b/l)
+pub const VGROOVE_W: f32 = 2.0; // vertical groove between columns
 // right column: flex (fills remainder ≈ 486 wide); padding 8/14/8/12
 
-pub const GAP: f32 = 8.0;           // vertical gap between stacked panels
+pub const GAP: f32 = 8.0; // vertical gap between stacked panels
 pub const HEADER_ROW_H: f32 = 24.0; // each panel's title row
-pub const HEADER_GAP: f32 = 6.0;    // gap between title row and recessed screen
+pub const HEADER_GAP: f32 = 6.0; // gap between title row and recessed screen
 
 // Right-column panel heights (top→bottom). MAP is flex and fills the rest (~228).
 pub const LOG_H: f32 = 142.0;
@@ -59,15 +59,21 @@ pub const TICKER_H: f32 = 30.0;
 // so the map can auto-fit any cluster of contacts on Earth. `map_x`/`map_y` give
 // world units; `draw_map` recomputes scale + offset each frame to fit the
 // plotted points, so these full-globe constants are just the unit system.
-pub const LON0: f32 = -180.0;   // left edge longitude
-pub const LAT_TOP: f32 = 90.0;  // top edge latitude
-pub const KX: f32 = 1.0;        // no longitude compression (true plate carrée)
-pub const S: f32 = 5.0;         // units per degree
-pub const MAP_W: f32 = 1800.0;  // (= (180 − LON0) * KX * S)
-pub const MAP_H: f32 = 900.0;   // (= (LAT_TOP − (−90)) * S)
+pub const LON0: f32 = -180.0; // left edge longitude
+pub const LAT_TOP: f32 = 90.0; // top edge latitude
+pub const KX: f32 = 1.0; // no longitude compression (true plate carrée)
+pub const S: f32 = 5.0; // units per degree
+pub const MAP_W: f32 = 1800.0; // (= (180 − LON0) * KX * S)
+pub const MAP_H: f32 = 900.0; // (= (LAT_TOP − (−90)) * S)
 
-#[inline] pub fn map_x(lon: f32) -> f32 { (lon - LON0) * KX * S }
-#[inline] pub fn map_y(lat: f32) -> f32 { (LAT_TOP - lat) * S }
+#[inline]
+pub fn map_x(lon: f32) -> f32 {
+    (lon - LON0) * KX * S
+}
+#[inline]
+pub fn map_y(lat: f32) -> f32 {
+    (LAT_TOP - lat) * S
+}
 
 // Fallback QTH (Lafayette, CO ≈ grid DN70KA), used by the Contacts map only when
 // the operator's configured grid can't be decoded. Normally home is derived from
@@ -76,8 +82,10 @@ pub const HOME_LAT: f32 = 40.00;
 pub const HOME_LON: f32 = -105.10;
 
 // Graticule: world meridians/parallels every 30° (edges ±180/±90 omitted).
-pub const MERIDIANS: &[f32] = &[-150.0,-120.0,-90.0,-60.0,-30.0,0.0,30.0,60.0,90.0,120.0,150.0];
-pub const PARALLELS: &[f32] = &[-60.0,-30.0,0.0,30.0,60.0];
+pub const MERIDIANS: &[f32] = &[
+    -150.0, -120.0, -90.0, -60.0, -30.0, 0.0, 30.0, 60.0, 90.0, 120.0, 150.0,
+];
+pub const PARALLELS: &[f32] = &[-60.0, -30.0, 0.0, 30.0, 60.0];
 // Home range rings (great-circle approx as ellipses); the 85 km/° is lon spacing
 // at the home latitude (111·cos 40°): for km d, rx = (d / 85.0) * KX * S,
 //   ry = (d / 111.0) * S.
@@ -95,7 +103,12 @@ pub const RELIEF_LAT1: f32 = 90.0;
 // ============================================================ MAIDENHEAD GRID → LON/LAT
 /// A decoded Maidenhead locator: cell CENTER plus the size of the smallest cell
 /// that was parsed (used to spread co-grid stations without leaving the square).
-pub struct GridLoc { pub lon: f32, pub lat: f32, pub lon_size: f32, pub lat_size: f32 }
+pub struct GridLoc {
+    pub lon: f32,
+    pub lat: f32,
+    pub lon_size: f32,
+    pub lat_size: f32,
+}
 
 /// Parse a Maidenhead grid (e.g. `FN31`, `DN70KA`, `DN70KA12`) to a `GridLoc` at
 /// the cell center. Accepts the 4-, 6-, and 8-char forms FT8 carries, decoding to
@@ -110,10 +123,14 @@ pub fn grid_to_lonlat(grid: &str) -> Option<GridLoc> {
     };
     let field_lon = (g[0].to_ascii_uppercase() as i32) - b'A' as i32; // A..R
     let field_lat = (g[1].to_ascii_uppercase() as i32) - b'A' as i32;
-    if !(0..18).contains(&field_lon) || !(0..18).contains(&field_lat) { return None; }
+    if !(0..18).contains(&field_lon) || !(0..18).contains(&field_lat) {
+        return None;
+    }
     let sq_lon = (g[2] as i32) - b'0' as i32; // 0..9
     let sq_lat = (g[3] as i32) - b'0' as i32;
-    if !(0..10).contains(&sq_lon) || !(0..10).contains(&sq_lat) { return None; }
+    if !(0..10).contains(&sq_lon) || !(0..10).contains(&sq_lat) {
+        return None;
+    }
 
     // SW corner after field + square.
     let mut lon = -180.0 + field_lon as f32 * 20.0 + sq_lon as f32 * 2.0;
@@ -123,14 +140,21 @@ pub fn grid_to_lonlat(grid: &str) -> Option<GridLoc> {
     if g.len() == 6 {
         let sub_lon = (g[4].to_ascii_uppercase() as i32) - b'A' as i32; // A..X
         let sub_lat = (g[5].to_ascii_uppercase() as i32) - b'A' as i32;
-        if !(0..24).contains(&sub_lon) || !(0..24).contains(&sub_lat) { return None; }
+        if !(0..24).contains(&sub_lon) || !(0..24).contains(&sub_lat) {
+            return None;
+        }
         lon_size = 2.0 / 24.0; // 5′
         lat_size = 1.0 / 24.0; // 2.5′
         lon += sub_lon as f32 * lon_size;
         lat += sub_lat as f32 * lat_size;
     }
     // Move from SW corner to cell center.
-    Some(GridLoc { lon: lon + lon_size * 0.5, lat: lat + lat_size * 0.5, lon_size, lat_size })
+    Some(GridLoc {
+        lon: lon + lon_size * 0.5,
+        lat: lat + lat_size * 0.5,
+        lon_size,
+        lat_size,
+    })
 }
 
 /// Position a station from its callsign + grid: the grid-cell center plus a small
@@ -138,7 +162,12 @@ pub fn grid_to_lonlat(grid: &str) -> Option<GridLoc> {
 /// overlap. Stable across redraws (hash-based, no randomness). `None` if the grid
 /// can't be parsed.
 pub fn station_lonlat(call: &str, grid: &str) -> Option<(f32, f32)> {
-    let GridLoc { lon, lat, lon_size, lat_size } = grid_to_lonlat(grid)?;
+    let GridLoc {
+        lon,
+        lat,
+        lon_size,
+        lat_size,
+    } = grid_to_lonlat(grid)?;
     // Two independent hashes (distinct seeds) so the lon/lat offsets don't share a
     // bit window — a single 32-bit FNV word concentrates entropy in its low bits.
     let frac = |h: u32| ((h & 0xffff) as f32 / 65535.0 - 0.5) * 0.8; // −0.4..0.4
@@ -162,24 +191,69 @@ fn fnv1a(s: &str, seed: u32) -> u32 {
 
 // ============================================================ LOG BOOK SPOTS (fake)
 /// A worked station as it appears on the map; position is inferred from `grid`.
-pub struct LogSpot { pub call: &'static str, pub grid: &'static str }
+pub struct LogSpot {
+    pub call: &'static str,
+    pub grid: &'static str,
+}
 // Phase 1: all entries are worked (filled marker). ~13 stations spread across
 // North America. Phase 2 adds a separate unworked/heard list with last-heard times.
 pub const WORKED: &[LogSpot] = &[
-    LogSpot{call:"K7RA", grid:"CN87"}, // Seattle, WA
-    LogSpot{call:"K6XX", grid:"CM97"}, // Bay Area, CA
-    LogSpot{call:"W7PH", grid:"DM33"}, // Phoenix, AZ
-    LogSpot{call:"K0DEN",grid:"DM79"}, // Denver, CO
-    LogSpot{call:"K5ED", grid:"EM12"}, // Dallas, TX
-    LogSpot{call:"N5JR", grid:"EL29"}, // Houston, TX
-    LogSpot{call:"W9XYZ",grid:"EN61"}, // Detroit, MI
-    LogSpot{call:"K1ABC",grid:"FN31"}, // Connecticut
-    LogSpot{call:"W2NYC",grid:"FN20"}, // New York, NY
-    LogSpot{call:"N4FL", grid:"EL96"}, // Miami, FL
-    LogSpot{call:"VE3EN",grid:"FN25"}, // Toronto, ON
-    LogSpot{call:"VE6AO",grid:"DO21"}, // Calgary, AB
-    LogSpot{call:"XE2OK",grid:"DL95"}, // Monterrey, MX
-    LogSpot{call:"XE1RC",grid:"EK09"}, // Mexico City, MX
+    LogSpot {
+        call: "K7RA",
+        grid: "CN87",
+    }, // Seattle, WA
+    LogSpot {
+        call: "K6XX",
+        grid: "CM97",
+    }, // Bay Area, CA
+    LogSpot {
+        call: "W7PH",
+        grid: "DM33",
+    }, // Phoenix, AZ
+    LogSpot {
+        call: "K0DEN",
+        grid: "DM79",
+    }, // Denver, CO
+    LogSpot {
+        call: "K5ED",
+        grid: "EM12",
+    }, // Dallas, TX
+    LogSpot {
+        call: "N5JR",
+        grid: "EL29",
+    }, // Houston, TX
+    LogSpot {
+        call: "W9XYZ",
+        grid: "EN61",
+    }, // Detroit, MI
+    LogSpot {
+        call: "K1ABC",
+        grid: "FN31",
+    }, // Connecticut
+    LogSpot {
+        call: "W2NYC",
+        grid: "FN20",
+    }, // New York, NY
+    LogSpot {
+        call: "N4FL",
+        grid: "EL96",
+    }, // Miami, FL
+    LogSpot {
+        call: "VE3EN",
+        grid: "FN25",
+    }, // Toronto, ON
+    LogSpot {
+        call: "VE6AO",
+        grid: "DO21",
+    }, // Calgary, AB
+    LogSpot {
+        call: "XE2OK",
+        grid: "DL95",
+    }, // Monterrey, MX
+    LogSpot {
+        call: "XE1RC",
+        grid: "EK09",
+    }, // Mexico City, MX
 ];
 
 /// Great-circle distance (km) — used to label "Best DX".
@@ -201,22 +275,39 @@ pub fn haversine_km(la1: f32, lo1: f32, la2: f32, lo2: f32) -> f32 {
 //   y_px = ((1 − f / 3000) * RAILH − 7).clamp(2, RAILH − 16)   with RAILH = 438
 pub const FMAX_HZ: f32 = 3000.0;
 pub const RAILH: f32 = 438.0;
-pub const DECODES: &[(f32, &str, &str)] = &[ // (audio_hz, callsign, snr)
-    (2680.0,"OH8X","−08"),(2510.0,"JA1NUT","−15"),(2360.0,"K1ABC","−02"),(2200.0,"DL3XYZ","−19"),
-    (2050.0,"VK3WE","−21"),(1880.0,"W7GH","−11"),(1720.0,"EA7KW","−17"),(1560.0,"N5JR","−05"),
-    (1400.0,"PY2OG","−23"),(1240.0,"G4ABC","−13"),(1080.0,"VE3EN","−09"),(920.0,"ZL2AB","−24"),
-    (600.0,"UA9XYZ","−18"),
+pub const DECODES: &[(f32, &str, &str)] = &[
+    // (audio_hz, callsign, snr)
+    (2680.0, "OH8X", "−08"),
+    (2510.0, "JA1NUT", "−15"),
+    (2360.0, "K1ABC", "−02"),
+    (2200.0, "DL3XYZ", "−19"),
+    (2050.0, "VK3WE", "−21"),
+    (1880.0, "W7GH", "−11"),
+    (1720.0, "EA7KW", "−17"),
+    (1560.0, "N5JR", "−05"),
+    (1400.0, "PY2OG", "−23"),
+    (1240.0, "G4ABC", "−13"),
+    (1080.0, "VE3EN", "−09"),
+    (920.0, "ZL2AB", "−24"),
+    (600.0, "UA9XYZ", "−18"),
 ];
 
 // ============================================================ LOG BOOK (fake, last 4)
-pub const LOGS: &[(&str,&str,&str,&str,&str)] = &[ // (utc, call, grid, sent, rcvd)
-    ("2358","W7GH","CN94","−11","−09"),("2355","JA1NUT","PM95","−15","−13"),
-    ("2351","G4ABC","IO91","−13","−07"),("2347","VE3EN","FN25","−09","−02"),
+pub const LOGS: &[(&str, &str, &str, &str, &str)] = &[
+    // (utc, call, grid, sent, rcvd)
+    ("2358", "W7GH", "CN94", "−11", "−09"),
+    ("2355", "JA1NUT", "PM95", "−15", "−13"),
+    ("2351", "G4ABC", "IO91", "−13", "−07"),
+    ("2347", "VE3EN", "FN25", "−09", "−02"),
 ];
 
 // ============================================================ BAND SCAN (fake)
-pub const BANDS: &[(&str,u32,u32)] = &[ // (band, heard, unworked)
-    ("40m",23,7),("20m",41,12),("15m",18,9),("10m",6,4),
+pub const BANDS: &[(&str, u32, u32)] = &[
+    // (band, heard, unworked)
+    ("40m", 23, 7),
+    ("20m", 41, 12),
+    ("15m", 18, 9),
+    ("10m", 6, 4),
 ];
 // Columns: left = [40m, 20m], right = [15m, 10m].
 // Scan cycles activeBand 0→3 every 2.5 s, then returns to idle ("Last scan: just now").
@@ -225,7 +316,9 @@ pub const BANDS: &[(&str,u32,u32)] = &[ // (band, heard, unworked)
 mod tests {
     use super::*;
 
-    fn near(a: f32, b: f32, tol: f32) -> bool { (a - b).abs() <= tol }
+    fn near(a: f32, b: f32, tol: f32) -> bool {
+        (a - b).abs() <= tol
+    }
 
     #[test]
     fn grid_centers() {
@@ -246,7 +339,10 @@ mod tests {
         let e = grid_to_lonlat("DN70KA12").unwrap();
         assert!(near(e.lon, s.lon, 1e-6) && near(e.lat, s.lat, 1e-6));
         // Case-insensitive: lowercase field/subsquare letters decode identically.
-        assert_eq!(grid_to_lonlat("fn31").unwrap().lon, grid_to_lonlat("FN31").unwrap().lon);
+        assert_eq!(
+            grid_to_lonlat("fn31").unwrap().lon,
+            grid_to_lonlat("FN31").unwrap().lon
+        );
     }
 
     #[test]

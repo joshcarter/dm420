@@ -49,7 +49,14 @@ impl Panel for LogBook {
             0
         };
         let logs = ctx.bus.recent_logs(capacity);
-        panel_header(painter, header, pal, "Log Book", &format!("last {} · FT8", logs.len()), ctx.active);
+        panel_header(
+            painter,
+            header,
+            pal,
+            "Log Book",
+            &format!("last {} · FT8", logs.len()),
+            ctx.active,
+        );
         painter.text(
             Pos2::new(header.right() - 2.0, header.center().y),
             Align2::RIGHT_CENTER,
@@ -78,7 +85,13 @@ impl Panel for LogBook {
             ("SNT", x_snt, Align2::RIGHT_CENTER),
             ("RCV", x_rcv, Align2::RIGHT_CENTER),
         ] {
-            painter.text(Pos2::new(x, hy), align, tracked(text), dimf.clone(), pal.dim);
+            painter.text(
+                Pos2::new(x, hy),
+                align,
+                tracked(text),
+                dimf.clone(),
+                pal.dim,
+            );
         }
         painter.line_segment(
             [Pos2::new(l, sep_y), Pos2::new(r, sep_y)],
@@ -102,7 +115,13 @@ impl Panel for LogBook {
                 heading(10.0),
                 pal.body,
             );
-            painter.text(Pos2::new(x_grid, ry), Align2::LEFT_CENTER, grid, mono(10.0), pal.dim);
+            painter.text(
+                Pos2::new(x_grid, ry),
+                Align2::LEFT_CENTER,
+                grid,
+                mono(10.0),
+                pal.dim,
+            );
             painter.text(
                 Pos2::new(x_snt, ry),
                 Align2::RIGHT_CENTER,

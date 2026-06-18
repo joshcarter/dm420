@@ -160,7 +160,10 @@ mod tests {
             (argmax as i32 - expected as i32).abs() <= 1,
             "peak at bin {argmax}, expected ~{expected}"
         );
-        assert_eq!(mags[argmax], 255, "strongest bin should normalize to full scale");
+        assert_eq!(
+            mags[argmax], 255,
+            "strongest bin should normalize to full scale"
+        );
     }
 
     #[test]
@@ -181,7 +184,15 @@ mod tests {
             .collect();
         let col = spectrum_column(&samples, fft_size, fft_size / 2);
         let bin = (freq / (rate / fft_size as f32)).round() as usize;
-        assert!(col[bin] > 200, "tone bin should be bright, got {}", col[bin]);
-        assert!(col[bin / 4] < 64, "off-tone bin should be dim, got {}", col[bin / 4]);
+        assert!(
+            col[bin] > 200,
+            "tone bin should be bright, got {}",
+            col[bin]
+        );
+        assert!(
+            col[bin / 4] < 64,
+            "off-tone bin should be dim, got {}",
+            col[bin / 4]
+        );
     }
 }

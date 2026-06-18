@@ -3,14 +3,14 @@
 //! stream (cpal streams are `!Send`); the caller gets a handle with progress
 //! counters and a stop channel.
 
-use crate::device::{open_cpal_device, DeviceKind};
-use crate::dsp::{downmix_to_mono, Resampler};
 use crate::AudioError;
+use crate::device::{DeviceKind, open_cpal_device};
+use crate::dsp::{Resampler, downmix_to_mono};
 use cpal::traits::{DeviceTrait, StreamTrait};
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, bounded};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{info, warn};
 
 /// Load a WAV file as mono f32 samples plus its sample rate. Handles 16/24/32-bit
@@ -30,7 +30,7 @@ pub fn load_wav_mono(path: &Path) -> Result<(Vec<f32>, u32), AudioError> {
         (fmt, bits) => {
             return Err(AudioError::Unsupported(format!(
                 "WAV format {fmt:?}/{bits}-bit"
-            )))
+            )));
         }
     };
     let mono = downmix_to_mono(&interleaved, spec.channels.max(1));

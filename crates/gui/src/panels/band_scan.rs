@@ -107,7 +107,15 @@ impl Panel for BandScan {
             Pos2::new(track.left() + 2.0, track.top() + 2.0),
             Pos2::new(track.right() - 2.0, track.bottom() - 2.0),
         );
-        let resp = key_cell(ctx.ui, painter, pal, cell, label, true, ctx.ui.id().with("scan_btn"));
+        let resp = key_cell(
+            ctx.ui,
+            painter,
+            pal,
+            cell,
+            label,
+            true,
+            ctx.ui.id().with("scan_btn"),
+        );
         if resp.clicked() {
             if self.running {
                 self.running = false;
@@ -186,7 +194,13 @@ impl BandScan {
             let text_x = num_x + 40.0 + 9.0;
             let n1 = format!("{heard}");
             let w1 = painter
-                .text(Pos2::new(text_x, bcy - 7.0), Align2::LEFT_CENTER, &n1, mono(11.0), pal.legend)
+                .text(
+                    Pos2::new(text_x, bcy - 7.0),
+                    Align2::LEFT_CENTER,
+                    &n1,
+                    mono(11.0),
+                    pal.legend,
+                )
                 .width();
             painter.text(
                 Pos2::new(text_x + w1 + 3.0, bcy - 7.0),
@@ -197,7 +211,13 @@ impl BandScan {
             );
             let n2 = format!("{unworked}");
             let w2 = painter
-                .text(Pos2::new(text_x, bcy + 7.0), Align2::LEFT_CENTER, &n2, mono(11.0), pal.accent)
+                .text(
+                    Pos2::new(text_x, bcy + 7.0),
+                    Align2::LEFT_CENTER,
+                    &n2,
+                    mono(11.0),
+                    pal.accent,
+                )
                 .width();
             painter.text(
                 Pos2::new(text_x + w2 + 3.0, bcy + 7.0),

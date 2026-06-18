@@ -7,8 +7,7 @@
 
 use eframe::egui;
 use egui::{
-    Align2, Color32, CornerRadius, Mesh, Pos2, Rect, Shape, Stroke, StrokeKind, TextureHandle,
-    Vec2,
+    Align2, Color32, CornerRadius, Mesh, Pos2, Rect, Shape, Stroke, StrokeKind, TextureHandle, Vec2,
 };
 
 use super::{Panel, PanelCtx};
@@ -48,7 +47,14 @@ impl Panel for Contacts {
             block.min,
             Pos2::new(block.right(), block.top() + pd::HEADER_ROW_H),
         );
-        panel_header(painter, header, pal, "Contacts", &format!("World · {}", ctx.grid), ctx.active);
+        panel_header(
+            painter,
+            header,
+            pal,
+            "Contacts",
+            &format!("World · {}", ctx.grid),
+            ctx.active,
+        );
         painter.text(
             Pos2::new(header.right() - 2.0, header.center().y),
             Align2::RIGHT_CENTER,
@@ -73,12 +79,19 @@ impl Panel for Contacts {
 
 impl Contacts {
     /// Flat tactical footer: square toggles (solid = on, hollow = off) + SNR bars.
-    fn draw_footer(&mut self, ui: &mut egui::Ui, painter: &egui::Painter, rect: Rect, pal: &Palette) {
+    fn draw_footer(
+        &mut self,
+        ui: &mut egui::Ui,
+        painter: &egui::Painter,
+        rect: Rect,
+        pal: &Palette,
+    ) {
         let cy = rect.center().y;
         let labels = ["DX ONLY", "CQ", "ALERT", "LOG"];
         let mut x = rect.left();
-        for i in 0..4 {
-            let sq = Rect::from_center_size(Pos2::new(x + TOGGLE_SQ * 0.5, cy), Vec2::splat(TOGGLE_SQ));
+        for (i, label_text) in labels.iter().enumerate() {
+            let sq =
+                Rect::from_center_size(Pos2::new(x + TOGGLE_SQ * 0.5, cy), Vec2::splat(TOGGLE_SQ));
             let resp = ui.interact(
                 sq.expand(2.0),
                 ui.id().with(("footer_toggle", i)),
@@ -99,8 +112,14 @@ impl Contacts {
             }
             let label_color = if self.toggles[i] { pal.legend } else { pal.sub };
             let tx = sq.right() + 6.0;
-            let label = tracked(labels[i]);
-            painter.text(Pos2::new(tx, cy), Align2::LEFT_CENTER, &label, heading(8.5), label_color);
+            let label = tracked(label_text);
+            painter.text(
+                Pos2::new(tx, cy),
+                Align2::LEFT_CENTER,
+                &label,
+                heading(8.5),
+                label_color,
+            );
             x = tx + measure(painter, &label, heading(8.5)) + 18.0;
         }
 
@@ -111,11 +130,21 @@ impl Contacts {
         for (j, h) in heights.iter().enumerate() {
             let on = j < 4;
             let bar = Rect::from_min_max(Pos2::new(bx, base - h), Pos2::new(bx + 3.0, base));
-            let col = if on { pal.accent } else { pal.sub.gamma_multiply(0.45) };
+            let col = if on {
+                pal.accent
+            } else {
+                pal.sub.gamma_multiply(0.45)
+            };
             painter.rect_filled(bar, CornerRadius::ZERO, col);
             bx += 5.0;
         }
-        painter.text(Pos2::new(bx + 4.0, cy), Align2::LEFT_CENTER, "SNR", mono(7.5), pal.sub);
+        painter.text(
+            Pos2::new(bx + 4.0, cy),
+            Align2::LEFT_CENTER,
+            "SNR",
+            mono(7.5),
+            pal.sub,
+        );
     }
 }
 
@@ -200,18 +229,25 @@ fn draw_map(
     pts.push(Vec2::new(pd::map_x(home_ll.0), pd::map_y(home_ll.1)));
     let (mut minx, mut miny, mut maxx, mut maxy) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
     for v in &pts {
-        minx = minx.min(v.x); miny = miny.min(v.y);
-        maxx = maxx.max(v.x); maxy = maxy.max(v.y);
+        minx = minx.min(v.x);
+        miny = miny.min(v.y);
+        maxx = maxx.max(v.x);
+        maxy = maxy.max(v.y);
     }
     // Pad ~8% and guard against a degenerate (single-point) box.
     let bw = (maxx - minx).max(1.0);
     let bh = (maxy - miny).max(1.0);
-    minx -= bw * 0.08; maxx += bw * 0.08;
-    miny -= bh * 0.08; maxy += bh * 0.08;
+    minx -= bw * 0.08;
+    maxx += bw * 0.08;
+    miny -= bh * 0.08;
+    maxy += bh * 0.08;
     let (bcx, bcy) = ((minx + maxx) * 0.5, (miny + maxy) * 0.5);
     let scale = (content.width() / (maxx - minx)).min(content.height() / (maxy - miny));
     let p = |sx: f32, sy: f32| {
-        Pos2::new(content.center().x + (sx - bcx) * scale, content.center().y + (sy - bcy) * scale)
+        Pos2::new(
+            content.center().x + (sx - bcx) * scale,
+            content.center().y + (sy - bcy) * scale,
+        )
     };
     let proj = |lon: f32, lat: f32| p(pd::map_x(lon), pd::map_y(lat));
     let sl = |v: f32| v * scale; // svg length -> px
@@ -242,15 +278,31 @@ fn draw_map(
     let land_pos = project(geo_data::LAND_VERTS);
     let mut land_mesh = Mesh::with_texture(relief.id());
     for (i, &(la, lo)) in geo_data::LAND_VERTS.iter().enumerate() {
-        let uv = Pos2::new((lo - pd::RELIEF_LON0) / lon_span, (pd::RELIEF_LAT1 - la) / lat_span);
-        land_mesh.vertices.push(egui::epaint::Vertex { pos: land_pos[i], uv, color: land_base });
+        let uv = Pos2::new(
+            (lo - pd::RELIEF_LON0) / lon_span,
+            (pd::RELIEF_LAT1 - la) / lat_span,
+        );
+        land_mesh.vertices.push(egui::epaint::Vertex {
+            pos: land_pos[i],
+            uv,
+            color: land_base,
+        });
     }
     land_mesh.indices.extend_from_slice(geo_data::LAND_IDX);
     painter.add(Shape::mesh(land_mesh));
-    stroke_rings(&land_pos, geo_data::LAND_RINGS, Stroke::new(sl(0.5).max(0.6), pal.map_coast));
+    stroke_rings(
+        &land_pos,
+        geo_data::LAND_RINGS,
+        Stroke::new(sl(0.5).max(0.6), pal.map_coast),
+    );
 
     // Lakes: translucent dark fill punches the land back down to water tone.
-    let lake_fill = Color32::from_rgba_unmultiplied(pal.screen_bg.r(), pal.screen_bg.g(), pal.screen_bg.b(), 220);
+    let lake_fill = Color32::from_rgba_unmultiplied(
+        pal.screen_bg.r(),
+        pal.screen_bg.g(),
+        pal.screen_bg.b(),
+        220,
+    );
     let lake_pos = project(geo_data::LAKES_VERTS);
     let mut lake_mesh = Mesh::default();
     for pos in &lake_pos {
@@ -260,7 +312,11 @@ fn draw_map(
         lake_mesh.add_triangle(t[0], t[1], t[2]);
     }
     painter.add(Shape::mesh(lake_mesh));
-    stroke_rings(&lake_pos, geo_data::LAKES_RINGS, Stroke::new(sl(0.4).max(0.5), pal.map_coast.gamma_multiply(0.7)));
+    stroke_rings(
+        &lake_pos,
+        geo_data::LAKES_RINGS,
+        Stroke::new(sl(0.4).max(0.5), pal.map_coast.gamma_multiply(0.7)),
+    );
 
     // 2) graticule
     let grat = pal.dim.gamma_multiply(0.25);
@@ -276,7 +332,7 @@ fn draw_map(
         painter.text(
             Pos2::new(content.left() + 2.0, p(0.0, y).y - 1.5),
             Align2::LEFT_BOTTOM,
-            &format!("{lat:.0}°"),
+            format!("{lat:.0}°"),
             font(4.6),
             pal.dim.gamma_multiply(0.65),
         );
@@ -302,7 +358,9 @@ fn draw_map(
     let spot_r = sl(2.4).clamp(2.0, 3.6);
     let label_font = mono(sl(4.8).clamp(5.0, 8.0));
     for (call, grid) in spots {
-        let Some((lon, lat)) = pd::station_lonlat(call, grid) else { continue };
+        let Some((lon, lat)) = pd::station_lonlat(call, grid) else {
+            continue;
+        };
         let pos = proj(lon, lat);
         painter.circle_filled(pos, spot_r, pal.accent);
         // Flip the label to the inboard side near the right/top edges so it stays on-screen.
@@ -310,18 +368,49 @@ fn draw_map(
         let near_top = pos.y < content.top() + 12.0;
         let off = Vec2::new(
             if right { -(spot_r + 1.5) } else { spot_r + 1.5 },
-            if near_top { spot_r + 5.0 } else { -(spot_r + 1.0) },
+            if near_top {
+                spot_r + 5.0
+            } else {
+                -(spot_r + 1.0)
+            },
         );
-        let align = if right { Align2::RIGHT_BOTTOM } else { Align2::LEFT_BOTTOM };
+        let align = if right {
+            Align2::RIGHT_BOTTOM
+        } else {
+            Align2::LEFT_BOTTOM
+        };
         painter.text(pos + off, align, call, label_font.clone(), pal.body);
     }
 
     // 5) home / QTH marker — the strongest indicator, drawn last so it sits on top.
     let ring_r = sl(4.6).clamp(5.0, 7.0);
     let arm = ring_r + 2.5;
-    painter.circle(home, ring_r, Color32::TRANSPARENT, Stroke::new(1.4, pal.accent));
-    painter.line_segment([Pos2::new(home.x - arm, home.y), Pos2::new(home.x + arm, home.y)], Stroke::new(1.0, pal.accent));
-    painter.line_segment([Pos2::new(home.x, home.y - arm), Pos2::new(home.x, home.y + arm)], Stroke::new(1.0, pal.accent));
+    painter.circle(
+        home,
+        ring_r,
+        Color32::TRANSPARENT,
+        Stroke::new(1.4, pal.accent),
+    );
+    painter.line_segment(
+        [
+            Pos2::new(home.x - arm, home.y),
+            Pos2::new(home.x + arm, home.y),
+        ],
+        Stroke::new(1.0, pal.accent),
+    );
+    painter.line_segment(
+        [
+            Pos2::new(home.x, home.y - arm),
+            Pos2::new(home.x, home.y + arm),
+        ],
+        Stroke::new(1.0, pal.accent),
+    );
     painter.circle_filled(home, (spot_r + 0.8).max(2.6), pal.accent);
-    painter.text(Pos2::new(home.x + arm, home.y - arm), Align2::LEFT_BOTTOM, "QTH", heading(sl(4.8).clamp(6.0, 9.0)), pal.accent);
+    painter.text(
+        Pos2::new(home.x + arm, home.y - arm),
+        Align2::LEFT_BOTTOM,
+        "QTH",
+        heading(sl(4.8).clamp(6.0, 9.0)),
+        pal.accent,
+    );
 }

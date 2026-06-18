@@ -156,7 +156,13 @@ fn publish_slot(
 }
 
 /// Replay a WAV recording onto the decodes topic.
-pub fn spawn_wav(bus: &BusHandle, radio: t::RadioId, path: PathBuf, proto: Protocol, looping: bool) {
+pub fn spawn_wav(
+    bus: &BusHandle,
+    radio: t::RadioId,
+    path: PathBuf,
+    proto: Protocol,
+    looping: bool,
+) {
     let bus = bus.clone();
     tokio::spawn(async move {
         let slots = match tokio::task::spawn_blocking(move || load_slots(&path, proto)).await {
@@ -177,9 +183,10 @@ pub fn spawn_wav(bus: &BusHandle, radio: t::RadioId, path: PathBuf, proto: Proto
             for slot in &slots {
                 tick.tick().await;
                 let samples = slot.clone();
-                let decs = tokio::task::spawn_blocking(move || decode(&samples, DECODE_RATE, proto))
-                    .await
-                    .unwrap_or_default();
+                let decs =
+                    tokio::task::spawn_blocking(move || decode(&samples, DECODE_RATE, proto))
+                        .await
+                        .unwrap_or_default();
                 publish_slot(&bus, &radio, proto, now_ms(), decs);
             }
             if !looping {
@@ -387,8 +394,8 @@ mod tests {
     #[test]
     fn decodes_fixture_wav() {
         // A known-good single-signal FT8 fixture vendored with the decoder.
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../modes/tests/fixtures/cq_k1abc_1000.wav");
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../modes/tests/fixtures/cq_k1abc_1000.wav");
         let slots = load_slots(&path, Protocol::Ft8).expect("load fixture");
         assert!(!slots.is_empty(), "fixture produced no slots");
 

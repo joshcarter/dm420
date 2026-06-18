@@ -60,7 +60,12 @@ fn rig_state(id: &RadioId) -> RigState {
 fn temp_path(tag: &str) -> PathBuf {
     static N: AtomicU64 = AtomicU64::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("dm420_bus_{}_{}_{}.ndjson", tag, std::process::id(), n))
+    std::env::temp_dir().join(format!(
+        "dm420_bus_{}_{}_{}.ndjson",
+        tag,
+        std::process::id(),
+        n
+    ))
 }
 
 fn read_envelopes(p: &Path) -> Vec<Envelope> {
@@ -195,7 +200,10 @@ async fn lossless_slow_subscriber_disconnected() {
             Err(e) => panic!("unexpected error: {e:?}"),
         }
     }
-    assert!(closed, "a stalled lossless subscriber should be disconnected");
+    assert!(
+        closed,
+        "a stalled lossless subscriber should be disconnected"
+    );
 
     // Re-subscribing yields a fresh snapshot (retained ring) plus live messages.
     let mut fresh = bus
@@ -209,7 +217,10 @@ async fn lossless_slow_subscriber_disconnected() {
             break;
         }
     }
-    assert!(got_live, "re-subscribe should resume receiving live messages");
+    assert!(
+        got_live,
+        "re-subscribe should resume receiving live messages"
+    );
 }
 
 // ------------------------------------------------------------- #7 Request/reply
@@ -286,9 +297,12 @@ async fn record_replay_golden() {
         },
     )
     .unwrap();
-    bus1.publish(&Topic::Decodes(id.clone()), decode(&id, 1)).unwrap();
-    bus1.publish(&Topic::Decodes(id.clone()), decode(&id, 2)).unwrap();
-    bus1.publish(&Topic::RigState(id.clone()), rig_state(&id)).unwrap();
+    bus1.publish(&Topic::Decodes(id.clone()), decode(&id, 1))
+        .unwrap();
+    bus1.publish(&Topic::Decodes(id.clone()), decode(&id, 2))
+        .unwrap();
+    bus1.publish(&Topic::RigState(id.clone()), rig_state(&id))
+        .unwrap();
     rec1.stop().await;
 
     let env1 = read_envelopes(&path1);

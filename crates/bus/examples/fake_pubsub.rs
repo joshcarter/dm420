@@ -75,7 +75,8 @@ async fn main() {
                 },
             },
         };
-        bus.publish(&Topic::Decodes(id.clone()), d).expect("publish decode");
+        bus.publish(&Topic::Decodes(id.clone()), d)
+            .expect("publish decode");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 

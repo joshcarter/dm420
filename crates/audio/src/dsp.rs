@@ -124,7 +124,7 @@ impl Resampler {
             return Vec::new();
         }
         self.buf
-            .extend(std::iter::repeat(0.0).take(self.half_width + 1));
+            .extend(std::iter::repeat_n(0.0, self.half_width + 1));
         self.produce()
     }
 

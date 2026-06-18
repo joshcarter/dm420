@@ -20,10 +20,10 @@ pub mod mock;
 pub mod ports;
 pub mod probe;
 
-pub use actor::{spawn, RigEvent, RigHandle, RigRequest, RigResponse};
-pub use catrig::{mock_rig, open_serial, CatRig, KenwoodRig, MockRig};
+pub use actor::{RigEvent, RigHandle, RigRequest, RigResponse, spawn};
+pub use catrig::{CatRig, KenwoodRig, MockRig, mock_rig, open_serial};
 pub use codec::{CodecError, Mode, RigState, Vfo};
-pub use ports::{list_ports, PortInfo};
+pub use ports::{PortInfo, list_ports};
 pub use probe::LineProfile;
 
 use std::time::Duration;

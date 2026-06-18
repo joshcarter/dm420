@@ -103,7 +103,8 @@ fn supervise(
                 backoff = BACKOFF_START; // a good connection resets the backoff
 
                 // Block here polling state until the link drops or config changes.
-                let reason = run_until_lost(&bus, &radio, &handle, &mut last_health, &control, cfg_gen);
+                let reason =
+                    run_until_lost(&bus, &radio, &handle, &mut last_health, &control, cfg_gen);
 
                 // Release the device before retrying: clear the shared handle and
                 // drop ours so the actor thread (and its serial port) shut down.
@@ -205,7 +206,8 @@ fn open(serial: &SerialConfig) -> Result<(String, rig::KenwoodRig), String> {
 /// Sweep the likely-radio ports × standard Kenwood bauds × line profiles for a
 /// responding radio, then open the winner.
 fn autodetect_open() -> Result<(String, rig::KenwoodRig), String> {
-    let ports = rig::probe::candidate_ports(false).map_err(|e| format!("listing serial ports: {e}"))?;
+    let ports =
+        rig::probe::candidate_ports(false).map_err(|e| format!("listing serial ports: {e}"))?;
     if ports.is_empty() {
         return Err("no serial ports found to autodetect".into());
     }
@@ -222,7 +224,12 @@ fn autodetect_open() -> Result<(String, rig::KenwoodRig), String> {
     let dev = rig::open_serial(&w.port, w.baud, w.profile)
         .map_err(|e| format!("open {} @ {} baud: {e}", w.port, w.baud))?;
     Ok((
-        format!("{} @ {} baud [{}] (autodetected)", w.port, w.baud, w.profile.label()),
+        format!(
+            "{} @ {} baud [{}] (autodetected)",
+            w.port,
+            w.baud,
+            w.profile.label()
+        ),
         dev,
     ))
 }
@@ -238,14 +245,14 @@ fn publish_state(bus: &BusHandle, radio: &t::RadioId, handle: &RigHandle) {
 }
 
 fn serve_commands(bus: &BusHandle, radio: t::RadioId, shared: SharedHandle) {
-    let mut server = match bus.serve::<t::RigCommand, CommandResult>(&Topic::RigCommand(radio.clone()))
-    {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!("rig command server not started: {e}");
-            return;
-        }
-    };
+    let mut server =
+        match bus.serve::<t::RigCommand, CommandResult>(&Topic::RigCommand(radio.clone())) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("rig command server not started: {e}");
+                return;
+            }
+        };
     let bus = bus.clone();
     tokio::spawn(async move {
         while let Some((cmd, responder)) = server.next().await {
@@ -271,7 +278,12 @@ fn serve_commands(bus: &BusHandle, radio: t::RadioId, shared: SharedHandle) {
 
 /// Apply one command to the rig and, on success, publish fresh state so the UI
 /// reflects the change without waiting for the next poll.
-fn apply(handle: &RigHandle, cmd: &t::RigCommand, radio: &t::RadioId, bus: &BusHandle) -> CommandResult {
+fn apply(
+    handle: &RigHandle,
+    cmd: &t::RigCommand,
+    radio: &t::RadioId,
+    bus: &BusHandle,
+) -> CommandResult {
     let res = match cmd {
         t::RigCommand::SetFreq(t::AbsHz(hz)) => handle.set_freq(Vfo::A, *hz),
         t::RigCommand::SetRigMode(m) => {

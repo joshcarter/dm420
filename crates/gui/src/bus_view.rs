@@ -507,14 +507,14 @@ fn pump_health(
 /// are visible at once. A `Vec<BandActivity>` snapshot payload would let us drop
 /// this accumulation — a question for whoever finalizes the scanner seam.
 fn pump_bands(bus: &BusHandle, bands: Arc<Mutex<HashMap<Band, BandActivity>>>, ctx: egui::Context) {
-    let mut sub = match bus.subscribe::<BandActivity>(TopicSelector::Exact(Topic::ScannerCandidates))
-    {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("bus_view: candidates subscribe failed: {e:?}");
-            return;
-        }
-    };
+    let mut sub =
+        match bus.subscribe::<BandActivity>(TopicSelector::Exact(Topic::ScannerCandidates)) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("bus_view: candidates subscribe failed: {e:?}");
+                return;
+            }
+        };
     tokio::spawn(async move {
         loop {
             match sub.recv().await {

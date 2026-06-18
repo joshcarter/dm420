@@ -10,8 +10,8 @@
 //! This deliberately bypasses [`crate::CatRig`] and the actor: it needs raw,
 //! unframed bytes and direct control of one short-lived port open per attempt.
 
-use crate::ports::{self, PortInfo};
 use crate::RigError;
+use crate::ports::{self, PortInfo};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};

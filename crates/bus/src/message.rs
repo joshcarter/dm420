@@ -25,8 +25,8 @@ macro_rules! bus_message {
     };
 }
 
-use types::*;
 use DeliveryClass::*;
+use types::*;
 
 // --- StreamLossy ---
 bus_message!(SpectrumRow, StreamLossy);

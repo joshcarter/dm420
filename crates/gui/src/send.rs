@@ -138,8 +138,18 @@ mod tests {
 
     #[test]
     fn parses_frequency_verbs_and_aliases() {
-        for s in ["/f 14.074", ":f 14.074", "/freq 14.074", "/frequency 14.074", "  /F  14.074 "] {
-            assert_eq!(parse_command(s), Some(Command::SetFrequency(14.074)), "input {s:?}");
+        for s in [
+            "/f 14.074",
+            ":f 14.074",
+            "/freq 14.074",
+            "/frequency 14.074",
+            "  /F  14.074 ",
+        ] {
+            assert_eq!(
+                parse_command(s),
+                Some(Command::SetFrequency(14.074)),
+                "input {s:?}"
+            );
         }
     }
 
@@ -163,7 +173,10 @@ mod tests {
         let cq = next_message(&Target::Offset(300), "N0JDC", "DN70");
         assert_eq!(cq, "CQ N0JDC DN70");
         let answer = next_message(
-            &Target::Station { call: "K1ABC".into(), off: 1180 },
+            &Target::Station {
+                call: "K1ABC".into(),
+                off: 1180,
+            },
             "N0JDC",
             "DN70",
         );
@@ -173,7 +186,10 @@ mod tests {
     #[test]
     fn typing_only_accepts_slash_commands() {
         // standing auto message in the box
-        let mut s = SendState { buf: "CQ N0JDC DN70".into(), ..Default::default() };
+        let mut s = SendState {
+            buf: "CQ N0JDC DN70".into(),
+            ..Default::default()
+        };
         // Arbitrary text is ignored — the box can't hold free text.
         s.type_text("hello");
         assert!(!s.entering);
@@ -185,17 +201,26 @@ mod tests {
         s.type_text("f 14.074");
         assert_eq!(s.buf, "/f 14.074");
         // Enter parses, applies, and leaves command entry.
-        assert_eq!(s.activate(), Activation::Command(Command::SetFrequency(14.074)));
+        assert_eq!(
+            s.activate(),
+            Activation::Command(Command::SetFrequency(14.074))
+        );
         assert!(!s.entering);
         assert!(s.buf.is_empty());
         // `:` is an equivalent command prefix.
         s.type_text(":freq 7.074");
-        assert_eq!(s.activate(), Activation::Command(Command::SetFrequency(7.074)));
+        assert_eq!(
+            s.activate(),
+            Activation::Command(Command::SetFrequency(7.074))
+        );
     }
 
     #[test]
     fn enter_is_a_toggle_when_not_composing() {
-        let mut s = SendState { buf: "CQ N0JDC DN70".into(), ..Default::default() };
+        let mut s = SendState {
+            buf: "CQ N0JDC DN70".into(),
+            ..Default::default()
+        };
         // Outside command entry, Enter toggles the engine — the panel resolves
         // arm-vs-abort from the live QsoState phase.
         assert_eq!(s.activate(), Activation::Toggle);

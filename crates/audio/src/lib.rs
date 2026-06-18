@@ -19,13 +19,13 @@ pub mod meta;
 pub mod player;
 pub mod recorder;
 
-pub use device::{list_devices, preferred_input, select, DeviceInfo, DeviceKind};
-pub use dsp::{dbfs, level_bar, Resampler};
-pub use meta::{default_recording_path, RadioSnapshot, RecordingMeta};
-pub use player::{load_wav_mono, play, Playback};
+pub use device::{DeviceInfo, DeviceKind, list_devices, preferred_input, select};
+pub use dsp::{Resampler, dbfs, level_bar};
+pub use meta::{RadioSnapshot, RecordingMeta, default_recording_path};
+pub use player::{Playback, load_wav_mono, play};
 pub use recorder::{
-    capture_stream, capture_window, measure_level, CaptureStream, LevelMeasurement, Recorder,
-    RecordingSummary,
+    CaptureStream, LevelMeasurement, Recorder, RecordingSummary, capture_stream, capture_window,
+    measure_level,
 };
 
 /// Errors from audio operations.

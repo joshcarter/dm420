@@ -73,9 +73,9 @@ pub fn clearc() -> Color32 {
     Color32::from_rgba_unmultiplied(0, 0, 0, 0)
 }
 
-/// A recessed LCD surface (clock chips, switch tracks, Scan track): lcd gradient
-/// + a short top inset shadow + a 1px edge ring. No inset-shadow primitive in
-/// egui, so we fake the bevel.
+/// A recessed LCD surface (clock chips, switch tracks, Scan track): lcd
+/// gradient plus a short top inset shadow plus a 1px edge ring. No inset-shadow
+/// primitive in egui, so we fake the bevel.
 pub fn lcd_panel(painter: &egui::Painter, rect: Rect, pal: &Palette, radius: u8) {
     vertical_gradient(painter, rect, pal.lcd_top, pal.lcd_bottom);
     let sh_h = (rect.height() * 0.5).min(9.0);
@@ -107,6 +107,7 @@ pub fn key_cell(
 /// Like [`key_cell`] but with an explicit fill color for the lit state — used
 /// where a key needs a non-primary accent (e.g. the Send button turning cyan
 /// when armed). Identical geometry/typography so it matches the Scan key.
+#[allow(clippy::too_many_arguments)]
 pub fn key_cell_accent(
     ui: &mut egui::Ui,
     painter: &egui::Painter,
@@ -145,7 +146,7 @@ pub fn key_cell_accent(
     painter.text(
         rect.center(),
         Align2::CENTER_CENTER,
-        &tracked(label),
+        tracked(label),
         font,
         color,
     );

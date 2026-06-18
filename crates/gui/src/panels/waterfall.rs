@@ -82,13 +82,21 @@ impl Waterfall {
             for ev in &events {
                 match ev {
                     egui::Event::Text(t) => self.send.type_text(t),
-                    egui::Event::Key { key: egui::Key::Enter, pressed: true, .. } => activate = true,
-                    egui::Event::Key { key: egui::Key::Backspace, pressed: true, .. } => {
-                        self.send.backspace()
-                    }
-                    egui::Event::Key { key: egui::Key::Escape, pressed: true, .. } => {
-                        self.send.escape()
-                    }
+                    egui::Event::Key {
+                        key: egui::Key::Enter,
+                        pressed: true,
+                        ..
+                    } => activate = true,
+                    egui::Event::Key {
+                        key: egui::Key::Backspace,
+                        pressed: true,
+                        ..
+                    } => self.send.backspace(),
+                    egui::Event::Key {
+                        key: egui::Key::Escape,
+                        pressed: true,
+                        ..
+                    } => self.send.escape(),
                     _ => {}
                 }
             }
@@ -107,7 +115,11 @@ impl Waterfall {
         // message > the local preview.
         let display = if self.send.entering {
             self.send.buf.clone()
-        } else if let Some(text) = qso.as_ref().and_then(|s| s.next_tx.as_ref()).map(|m| &m.text) {
+        } else if let Some(text) = qso
+            .as_ref()
+            .and_then(|s| s.next_tx.as_ref())
+            .map(|m| &m.text)
+        {
             text.clone()
         } else {
             self.send.buf.clone()
@@ -195,7 +207,8 @@ impl Waterfall {
                     if active_qso {
                         ctx.bus.abort_qso();
                     } else if let Some(call) = target.station() {
-                        ctx.bus.answer_station(target.off() as f32, call.to_string());
+                        ctx.bus
+                            .answer_station(target.off() as f32, call.to_string());
                     } else {
                         ctx.bus.call_cq(target.off() as f32);
                     }
@@ -219,11 +232,24 @@ impl Panel for Waterfall {
             block.min,
             Pos2::new(block.right(), block.top() + pd::HEADER_ROW_H),
         );
-        panel_header(painter, header, pal, "FT8", "0–3000 Hz · time → left", ctx.active);
+        panel_header(
+            painter,
+            header,
+            pal,
+            "FT8",
+            "0–3000 Hz · time → left",
+            ctx.active,
+        );
         // right side: prominent tuned-frequency readout
         let cy = header.center().y;
         let mut rx = header.right() - 2.0;
-        painter.text(Pos2::new(rx, cy), Align2::RIGHT_CENTER, "MHz", mono(8.5), pal.sub);
+        painter.text(
+            Pos2::new(rx, cy),
+            Align2::RIGHT_CENTER,
+            "MHz",
+            mono(8.5),
+            pal.sub,
+        );
         rx -= measure(painter, "MHz", mono(8.5)) + 5.0;
         // When the rig is faulted, don't show a (possibly stale) frequency as if
         // it were live — show a dashed, dimmed placeholder instead.
@@ -334,12 +360,19 @@ impl Panel for Waterfall {
                     } else {
                         crate::waterslide_panel::martian_cmap_light()
                     };
-                    self.spectro
-                        .update_and_paint(ctx.ui, right, ctx.dt, ctx.bus.spectrum().as_ref(), &cmap);
+                    self.spectro.update_and_paint(
+                        ctx.ui,
+                        right,
+                        ctx.dt,
+                        ctx.bus.spectrum().as_ref(),
+                        &cmap,
+                    );
                     // Left half: decodes sliding left from centre, drawn over the
                     // spectrogram (graticule, NOW line, and Hz labels included).
                     draw_waterslide(painter, body, pal, &ctx.bus.recent_decodes(64), now_ms);
-                    ctx.ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
+                    ctx.ui
+                        .ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(33));
                 }
             } else if body_big {
                 // Mock mode only: Live Waterslide simulation as the screen body
@@ -445,7 +478,8 @@ impl Spectrogram {
             dx = dx.min(self.w);
             for r in 0..self.h {
                 let base = r * self.w;
-                self.intensity.copy_within(base..base + (self.w - dx), base + dx);
+                self.intensity
+                    .copy_within(base..base + (self.w - dx), base + dx);
             }
             for c in 0..dx {
                 match latest {
@@ -465,7 +499,12 @@ impl Spectrogram {
         let img = self.image.clone();
         match &mut self.tex {
             Some(t) => t.set(img, TextureOptions::LINEAR),
-            None => self.tex = Some(ui.ctx().load_texture("spectrogram", img, TextureOptions::LINEAR)),
+            None => {
+                self.tex = Some(
+                    ui.ctx()
+                        .load_texture("spectrogram", img, TextureOptions::LINEAR),
+                )
+            }
         }
         let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
         ui.painter_at(rect)
@@ -547,7 +586,10 @@ fn draw_waterslide(
 
     // NOW line at the centre.
     painter.line_segment(
-        [Pos2::new(now_x, rect.top()), Pos2::new(now_x, rect.bottom())],
+        [
+            Pos2::new(now_x, rect.top()),
+            Pos2::new(now_x, rect.bottom()),
+        ],
         egui::Stroke::new(2.0, pal.accent),
     );
 }
@@ -625,7 +667,11 @@ impl ConfigForm {
             self.load(bus);
         }
         ui.spacing_mut().item_spacing = egui::vec2(10.0, 8.0);
-        ui.label(egui::RichText::new("RADIO SETUP").color(pal.legend).strong());
+        ui.label(
+            egui::RichText::new("RADIO SETUP")
+                .color(pal.legend)
+                .strong(),
+        );
 
         // Audio device + decode mode are pushed to the live capture producer; in
         // WAV replay (or rig-only) there is none, so they're fixed at startup and
@@ -773,7 +819,13 @@ fn profile_label(p: LineProfile) -> &'static str {
 
 /// A simple two-line centred note in the screen body (used when the settings form
 /// has nothing to drive, e.g. mock mode).
-fn draw_centered_note(painter: &egui::Painter, screen: Rect, pal: &Palette, title: &str, detail: &str) {
+fn draw_centered_note(
+    painter: &egui::Painter,
+    screen: Rect,
+    pal: &Palette,
+    title: &str,
+    detail: &str,
+) {
     let painter = painter.with_clip_rect(screen.shrink(6.0));
     let c = screen.center();
     painter.text(
@@ -827,4 +879,3 @@ fn draw_fault_body(painter: &egui::Painter, screen: Rect, pal: &Palette, health:
         pal.dim,
     );
 }
-

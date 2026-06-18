@@ -96,7 +96,7 @@ pub const GRAPHITE: Palette = Palette {
     face_bottom: rgb(0x17, 0x13, 0x10),
     edge: rgb(0x10, 0x0C, 0x08),
     stripe_light: rgba(255, 255, 255, 6), // ~0.022
-    stripe_dark: rgba(0, 0, 0, 8),         // ~0.03
+    stripe_dark: rgba(0, 0, 0, 8),        // ~0.03
     legend: rgb(0xF6, 0xE6, 0xCF),
     sub: rgba(202, 180, 150, 184), // 0.72
     accent: rgb(0xF7, 0x92, 0x0F),
@@ -120,7 +120,7 @@ pub const SILVER: Palette = Palette {
     face_bottom: rgb(0xCD, 0xC6, 0xB7),
     edge: rgb(0xA3, 0x98, 0x80),
     stripe_light: rgba(255, 255, 255, 140), // 0.55
-    stripe_dark: rgba(0, 0, 0, 9),            // 0.035
+    stripe_dark: rgba(0, 0, 0, 9),          // 0.035
     legend: rgb(0x36, 0x26, 0x0F),
     sub: rgba(95, 68, 32, 199), // 0.78
     accent: rgb(0xC2, 0x66, 0x0F),
@@ -250,7 +250,13 @@ pub fn engraved_text(
     shadow: Color32,
     anchor: egui::Align2,
 ) -> Rect {
-    painter.text(pos + Vec2::new(0.0, 1.0), anchor, text, font.clone(), shadow);
+    painter.text(
+        pos + Vec2::new(0.0, 1.0),
+        anchor,
+        text,
+        font.clone(),
+        shadow,
+    );
     painter.text(pos, anchor, text, font, color)
 }
 

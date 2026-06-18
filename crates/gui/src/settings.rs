@@ -61,8 +61,12 @@ impl Station {
     /// station. Both are upper-cased to FT8/Maidenhead convention.
     pub fn from_env() -> Self {
         Station {
-            call: env_nonempty("DM420_CALLSIGN").unwrap_or_else(|| "N0JDC".into()).to_uppercase(),
-            grid: env_nonempty("DM420_GRID").unwrap_or_else(|| "DN70KA".into()).to_uppercase(),
+            call: env_nonempty("DM420_CALLSIGN")
+                .unwrap_or_else(|| "N0JDC".into())
+                .to_uppercase(),
+            grid: env_nonempty("DM420_GRID")
+                .unwrap_or_else(|| "DN70KA".into())
+                .to_uppercase(),
         }
     }
 
@@ -148,7 +152,9 @@ impl Settings {
 
 /// True if the var is set to a non-empty value other than `"0"`.
 fn env_flag(key: &str) -> bool {
-    std::env::var(key).map(|v| !v.is_empty() && v != "0").unwrap_or(false)
+    std::env::var(key)
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false)
 }
 
 /// The var's value if set and non-empty, else `None`.
@@ -206,7 +212,10 @@ fn wav_from_env() -> Option<PathBuf> {
     if p.exists() {
         Some(p)
     } else {
-        eprintln!("dm420: DM420_WAV='{}' does not exist; using live capture", p.display());
+        eprintln!(
+            "dm420: DM420_WAV='{}' does not exist; using live capture",
+            p.display()
+        );
         None
     }
 }

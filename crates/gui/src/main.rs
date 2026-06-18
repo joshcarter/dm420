@@ -24,9 +24,7 @@ mod waterslide_panel;
 mod waterslide_sim;
 
 use eframe::egui;
-use egui::{
-    Align2, CornerRadius, FontData, FontDefinitions, FontFamily, Pos2, Rect, Stroke, Vec2,
-};
+use egui::{Align2, CornerRadius, FontData, FontDefinitions, FontFamily, Pos2, Rect, Stroke, Vec2};
 use egui_tiles::{Behavior, Container, Tile, TileId, Tiles, Tree, UiResponse};
 
 use app::App;
@@ -146,11 +144,16 @@ impl<'a> Behavior<Box<dyn Panel>> for Tactical<'a> {
         // Focus-on-click: a press anywhere in the pane focuses it. We test the
         // press position rather than adding a click-sensing widget, so panels'
         // own interactions (waterslide tuning, send button) keep their clicks.
-        let press = ui.input(|i| i.pointer.any_pressed().then(|| i.pointer.interact_pos()).flatten());
-        if let Some(pos) = press {
-            if ui.max_rect().contains(pos) {
-                *self.clicked = Some(id);
-            }
+        let press = ui.input(|i| {
+            i.pointer
+                .any_pressed()
+                .then(|| i.pointer.interact_pos())
+                .flatten()
+        });
+        if let Some(pos) = press
+            && ui.max_rect().contains(pos)
+        {
+            *self.clicked = Some(id);
         }
         let painter = ui.painter().clone();
         let mut ctx = PanelCtx {
@@ -195,7 +198,9 @@ impl<'a> Behavior<Box<dyn Panel>> for Tactical<'a> {
     fn resize_stroke(&self, _style: &egui::Style, state: egui_tiles::ResizeState) -> Stroke {
         match state {
             egui_tiles::ResizeState::Idle => Stroke::NONE,
-            egui_tiles::ResizeState::Hovering => Stroke::new(1.0, self.pal.accent.gamma_multiply(0.5)),
+            egui_tiles::ResizeState::Hovering => {
+                Stroke::new(1.0, self.pal.accent.gamma_multiply(0.5))
+            }
             egui_tiles::ResizeState::Dragging => Stroke::new(2.0, self.pal.accent),
         }
     }
@@ -239,7 +244,8 @@ fn build_tree() -> (Tree<Box<dyn Panel>>, TreeIds) {
     if let Some(Tile::Container(Container::Linear(lin))) = tiles.get_mut(right) {
         lin.shares.set_share(log, pd::LOG_H);
         lin.shares.set_share(band, pd::BANDSCAN_H);
-        lin.shares.set_share(contacts, pd::PANEL_H - pd::LOG_H - pd::BANDSCAN_H);
+        lin.shares
+            .set_share(contacts, pd::PANEL_H - pd::LOG_H - pd::BANDSCAN_H);
     }
 
     let root = tiles.insert_horizontal_tile(vec![waterfall, right]);
@@ -249,7 +255,14 @@ fn build_tree() -> (Tree<Box<dyn Panel>>, TreeIds) {
     }
     (
         Tree::new("martian_tree", root, tiles),
-        TreeIds { root, right, band, waterfall, log, contacts },
+        TreeIds {
+            root,
+            right,
+            band,
+            waterfall,
+            log,
+            contacts,
+        },
     )
 }
 
@@ -373,10 +386,15 @@ impl eframe::App for App {
             if !i.modifiers.command {
                 return None;
             }
-            [egui::Key::Num1, egui::Key::Num2, egui::Key::Num3, egui::Key::Num4]
-                .iter()
-                .position(|k| i.key_pressed(*k))
-                .map(|idx| idx + 1)
+            [
+                egui::Key::Num1,
+                egui::Key::Num2,
+                egui::Key::Num3,
+                egui::Key::Num4,
+            ]
+            .iter()
+            .position(|k| i.key_pressed(*k))
+            .map(|idx| idx + 1)
         });
         if let Some(id) = focus_num.and_then(|n| self.tree_ids.by_number(n)) {
             self.focused = id;
@@ -400,7 +418,12 @@ impl eframe::App for App {
                     focused: self.focused,
                     clicked: &mut clicked,
                 };
-                enforce_min_width(&mut self.tree, self.tree_ids.root, pd::MIN_PANEL_W, pd::VGROOVE_W);
+                enforce_min_width(
+                    &mut self.tree,
+                    self.tree_ids.root,
+                    pd::MIN_PANEL_W,
+                    pd::VGROOVE_W,
+                );
                 pin_band_height(&mut self.tree, &self.tree_ids, pd::VGROOVE_W);
                 self.tree.ui(&mut behavior, ui);
                 // Apply a click-to-focus once the tree has been walked.
@@ -485,7 +508,7 @@ impl App {
             painter.text(
                 Pos2::new(grid_x, cy + 1.0),
                 Align2::LEFT_CENTER,
-                &tracked(&self.station.grid),
+                tracked(&self.station.grid),
                 mono(9.0),
                 pal.sub,
             );
@@ -544,6 +567,7 @@ impl App {
 
     /// A segmented switch (micro-label above a recessed track of key cells),
     /// flush to `right_x`. Returns its left edge and a per-cell click flag.
+    #[allow(clippy::too_many_arguments)]
     fn segmented(
         &self,
         ui: &mut egui::Ui,
@@ -564,7 +588,8 @@ impl App {
             .iter()
             .map(|(t, _)| measure(painter, &tracked(t), heading(9.0)) + CELL_PAD_X * 2.0)
             .collect();
-        let track_w: f32 = PAD * 2.0 + widths.iter().sum::<f32>() + GAP * (cells.len() as f32 - 1.0);
+        let track_w: f32 =
+            PAD * 2.0 + widths.iter().sum::<f32>() + GAP * (cells.len() as f32 - 1.0);
 
         let track_cy = cy + 5.0;
         let track = Rect::from_min_max(
@@ -576,7 +601,7 @@ impl App {
         painter.text(
             Pos2::new(track.left(), track.top() - 3.0),
             Align2::LEFT_BOTTOM,
-            &tracked(micro),
+            tracked(micro),
             mono(7.0),
             pal.sub,
         );
@@ -586,7 +611,15 @@ impl App {
         let mut clicks = Vec::with_capacity(cells.len());
         for (i, ((label, active), w)) in cells.iter().zip(widths.iter()).enumerate() {
             let cell = Rect::from_min_size(Pos2::new(x, track.top() + PAD), Vec2::new(*w, cell_h));
-            let resp = key_cell(ui, painter, pal, cell, label, *active, ui.id().with((id_src, i)));
+            let resp = key_cell(
+                ui,
+                painter,
+                pal,
+                cell,
+                label,
+                *active,
+                ui.id().with((id_src, i)),
+            );
             clicks.push(resp.clicked());
             x += w + GAP;
         }
@@ -595,7 +628,14 @@ impl App {
 }
 
 /// One recessed LCD clock chip flush to `right_x`; returns its left edge.
-fn lcd_clock(painter: &egui::Painter, pal: &Palette, right_x: f32, cy: f32, label: &str, value: &str) -> f32 {
+fn lcd_clock(
+    painter: &egui::Painter,
+    pal: &Palette,
+    right_x: f32,
+    cy: f32,
+    label: &str,
+    value: &str,
+) -> f32 {
     const READOUT_W: f32 = 79.0;
     const PAD_X: f32 = 12.0;
     const GAP: f32 = 8.0;
@@ -623,7 +663,19 @@ fn lcd_clock(painter: &egui::Painter, pal: &Palette, right_x: f32, cy: f32, labe
         Pos2::new(lx + label_w + GAP + READOUT_W, chip.bottom()),
     );
     // faint glow under the readout
-    painter.text(cell.center(), Align2::CENTER_CENTER, value, heading_bold(16.0), pal.accent.gamma_multiply(0.18));
-    painter.text(cell.center(), Align2::CENTER_CENTER, value, heading_bold(16.0), pal.lcd_text);
+    painter.text(
+        cell.center(),
+        Align2::CENTER_CENTER,
+        value,
+        heading_bold(16.0),
+        pal.accent.gamma_multiply(0.18),
+    );
+    painter.text(
+        cell.center(),
+        Align2::CENTER_CENTER,
+        value,
+        heading_bold(16.0),
+        pal.lcd_text,
+    );
     chip.left()
 }

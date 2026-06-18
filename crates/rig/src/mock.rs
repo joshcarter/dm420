@@ -4,9 +4,9 @@
 //! no hardware. It is also the seed of the design doc's "replay rig manager":
 //! `kenctl --mock` is a usable offline demo.
 
+use crate::RigError;
 use crate::channel::{CatChannel, Expect};
 use crate::codec::{self, Mode, Vfo};
-use crate::RigError;
 use std::collections::VecDeque;
 use std::time::Duration;
 use tracing::trace;

@@ -7,7 +7,7 @@
 //! session-lived table so hashed `<CALL>` references resolve across slots.
 
 use crate::crc;
-use crate::text::{charn, dd_to_int, int_to_dd, nchar, trim, Table};
+use crate::text::{Table, charn, dd_to_int, int_to_dd, nchar, trim};
 use std::collections::HashMap;
 
 const MAX22: u32 = 4_194_304;

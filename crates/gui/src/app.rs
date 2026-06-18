@@ -10,8 +10,8 @@ use egui_tiles::Tree;
 use crate::bus_view::BusView;
 use crate::panels::Panel;
 use crate::settings::Station;
-use crate::theme::{Palette, GRAPHITE, SILVER};
-use crate::{build_tree, TreeIds};
+use crate::theme::{GRAPHITE, Palette, SILVER};
+use crate::{TreeIds, build_tree};
 
 pub struct App {
     pub dark: bool,
@@ -85,7 +85,9 @@ impl App {
         });
         if let Some(image) = shot {
             let [w, h] = image.size;
-            if let Some(buf) = image::RgbaImage::from_raw(w as u32, h as u32, image.as_raw().to_vec()) {
+            if let Some(buf) =
+                image::RgbaImage::from_raw(w as u32, h as u32, image.as_raw().to_vec())
+            {
                 let _ = buf.save(&path);
                 eprintln!("saved screenshot: {path} ({w}x{h})");
             }

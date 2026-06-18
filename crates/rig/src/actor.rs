@@ -11,7 +11,7 @@
 
 use crate::codec::{Mode, RigState, Vfo};
 use crate::{Rig, RigError};
-use crossbeam_channel::{bounded, unbounded, Receiver, RecvTimeoutError, Sender};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded, unbounded};
 use serde::{Deserialize, Serialize};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -263,9 +263,9 @@ fn drain_and_publish(rig: &mut dyn Rig, subs: &mut Vec<Sender<RigEvent>>, timeou
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::CatRig;
     use crate::catrig::mock_rig;
     use crate::mock::MockChannel;
-    use crate::CatRig;
 
     #[test]
     fn actor_request_response() {

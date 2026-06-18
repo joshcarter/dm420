@@ -209,7 +209,8 @@ impl BusHandle {
     /// serialization cost is paid only while the returned [`RecorderHandle`] (or a
     /// clone of this bus's recorder slot) is attached. Replaces any prior recorder.
     pub fn attach_recorder(&self, path: &Path) -> Result<RecorderHandle, BusError> {
-        let file = std::fs::File::create(path).map_err(|e| BusError::Serialization(e.to_string()))?;
+        let file =
+            std::fs::File::create(path).map_err(|e| BusError::Serialization(e.to_string()))?;
         let (tx, mut rx) = mpsc::unbounded_channel::<Envelope>();
         let join = tokio::spawn(async move {
             use tokio::io::AsyncWriteExt;
@@ -303,11 +304,12 @@ impl BusHandle {
         let (exact, wild) = {
             let mut guard = self.inner.reg.lock().unwrap();
             let reg = &mut *guard;
-            let exact = goc_lossless::<M, String>(&mut reg.exact, key.to_string(), ring_capacity(kind))?;
+            let exact =
+                goc_lossless::<M, String>(&mut reg.exact, key.to_string(), ring_capacity(kind))?;
             let wild = match reg.wild.get(&kind) {
-                Some(Entry::Lossless(b)) => b
-                    .downcast_ref::<Arc<Mutex<LosslessInner<M>>>>()
-                    .cloned(),
+                Some(Entry::Lossless(b)) => {
+                    b.downcast_ref::<Arc<Mutex<LosslessInner<M>>>>().cloned()
+                }
                 _ => None,
             };
             (exact, wild)
@@ -426,7 +428,8 @@ impl BusHandle {
         Req: BusMessage,
         Rep: BusMessage,
     {
-        if topic.delivery_class() != DeliveryClass::Command || Req::CLASS != DeliveryClass::Command {
+        if topic.delivery_class() != DeliveryClass::Command || Req::CLASS != DeliveryClass::Command
+        {
             return Err(BusError::ClassMismatch);
         }
         let key = topic.canonical();
@@ -451,7 +454,8 @@ impl BusHandle {
         Req: BusMessage,
         Rep: BusMessage,
     {
-        if topic.delivery_class() != DeliveryClass::Command || Req::CLASS != DeliveryClass::Command {
+        if topic.delivery_class() != DeliveryClass::Command || Req::CLASS != DeliveryClass::Command
+        {
             return Err(BusError::ClassMismatch);
         }
         // Minted for the recorder/envelope and future network parity; in-process
@@ -489,7 +493,9 @@ fn goc_lossless<M: BusMessage, K: Eq + Hash>(
     ring_cap: usize,
 ) -> Result<Arc<Mutex<LosslessInner<M>>>, BusError> {
     let entry = map.entry(key).or_insert_with(|| {
-        Entry::Lossless(Box::new(Arc::new(Mutex::new(LosslessInner::<M>::new(ring_cap)))))
+        Entry::Lossless(Box::new(Arc::new(Mutex::new(LosslessInner::<M>::new(
+            ring_cap,
+        )))))
     });
     let Entry::Lossless(b) = entry else {
         return Err(BusError::ClassMismatch);

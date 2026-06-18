@@ -4,9 +4,9 @@
 
 use crate::constants::{FT4_COSTAS, FT4_GRAY, FT4_XOR, FT8_COSTAS, FT8_GRAY};
 use crate::crc;
-use crate::ldpc::{bp_decode, N};
+use crate::ldpc::{N, bp_decode};
 use crate::message::{self, CallHash, MessageType};
-use crate::waterfall::{mag_db, Monitor, Protocol, Waterfall};
+use crate::waterfall::{Monitor, Protocol, Waterfall, mag_db};
 use std::collections::HashSet;
 
 const MIN_SCORE: i32 = 10;
@@ -132,11 +132,7 @@ fn ft8_sync_score(wf: &Waterfall, c: &Candidate) -> i32 {
             }
         }
     }
-    if num > 0 {
-        score / num
-    } else {
-        0
-    }
+    if num > 0 { score / num } else { 0 }
 }
 
 #[allow(clippy::needless_range_loop)]
@@ -174,11 +170,7 @@ fn ft4_sync_score(wf: &Waterfall, c: &Candidate) -> i32 {
             }
         }
     }
-    if num > 0 {
-        score / num
-    } else {
-        0
-    }
+    if num > 0 { score / num } else { 0 }
 }
 
 fn find_candidates(wf: &Waterfall) -> Vec<Candidate> {
@@ -225,11 +217,7 @@ fn find_candidates(wf: &Waterfall) -> Vec<Candidate> {
 
 #[inline]
 fn max2(a: f32, b: f32) -> f32 {
-    if a >= b {
-        a
-    } else {
-        b
-    }
+    if a >= b { a } else { b }
 }
 #[inline]
 fn max4(a: f32, b: f32, c: f32, d: f32) -> f32 {
@@ -382,7 +370,7 @@ pub fn decode(samples: &[f32], sample_rate: u32, protocol: Protocol) -> Vec<Deco
 mod tests {
     use super::*;
     use crate::encode::synth_ft8;
-    use crate::message::{encode_std, CallHash as Ch};
+    use crate::message::{CallHash as Ch, encode_std};
 
     // Deterministic white-ish noise via a simple LCG (no Math.random).
     fn add_noise(sig: &mut [f32], amp: f32, mut state: u64) {
