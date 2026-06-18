@@ -106,6 +106,7 @@ fn publish_envelope(bus: &BusHandle, env: &Envelope) -> Result<(), BusError> {
         TopicKind::RigCommand
         | TopicKind::SessionCommand
         | TopicKind::AudioTx
+        | TopicKind::Interlock
         | TopicKind::QsoCommand
         | TopicKind::LogbookQuery
         | TopicKind::ScannerCommand

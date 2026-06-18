@@ -26,6 +26,7 @@ use bus::types::RadioId;
 mod control;
 mod decode;
 mod health;
+mod interlock;
 mod map;
 mod parse;
 mod rig_adapter;
@@ -143,12 +144,18 @@ pub fn spawn(bus: &BusHandle, cfg: CoreConfig) -> CoreControl {
 
     let mut control = CoreControl::default();
 
+    // The interlock granter owns the single PTT token — the authority
+    // `allow_transmit` ultimately unlocks. Serve it for bus clients (the QSO
+    // shell) and share it into the rig adapter for in-process key-up validation.
+    let granter = interlock::Granter::default();
+    interlock::serve(bus, radio.clone(), granter.clone());
+
     // The rig producer is optional: with no serial config there's simply no rig
     // on the bus (the GUI shows it as down). A present config never panics —
     // `rig_adapter` supervises the connection and reports health.
     if let Some(serial) = serial {
         let rig = Arc::new(RigControl::new(serial));
-        rig_adapter::spawn(bus, radio.clone(), allow_transmit, rig.clone());
+        rig_adapter::spawn(bus, radio.clone(), allow_transmit, rig.clone(), granter.clone());
         control.rig = Some(rig);
     }
 
