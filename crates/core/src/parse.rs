@@ -8,7 +8,9 @@
 //! `crates/modes/ATTRIBUTION.md` and the catalog §3 `[Joel owns]` note). Keep the
 //! `Raw` fallback: never drop text the grammar doesn't cover.
 
-use bus::types::{Callsign, ContestTag, ExchangePayload, GridSquare, ParsedMessage, Section, Signoff};
+use bus::types::{
+    Callsign, ContestTag, ExchangePayload, GridSquare, ParsedMessage, Section, Signoff,
+};
 
 /// Parse one decoded FT8/FT4 message line into a [`ParsedMessage`].
 pub fn parse_message(text: &str) -> ParsedMessage {
@@ -76,6 +78,17 @@ fn parse_directed(to: &str, from: &str, rest: &[&str], text: &str) -> ParsedMess
             from,
             payload: ExchangePayload::Report(report(tok).unwrap()),
         },
+        // ARRL Field Day exchange, rogered form: "R 3A CO" — both rogers the
+        // partner's exchange and sends ours (the FD analogue of `R-09`).
+        ["R", class, section] if is_fd_class(class) => ParsedMessage::Exchange {
+            to,
+            from,
+            payload: ExchangePayload::FieldDay {
+                class: (*class).to_string(),
+                section: Section((*section).to_string()),
+                rogered: true,
+            },
+        },
         // ARRL Field Day exchange: class + section, e.g. "3A CO".
         [class, section] if is_fd_class(class) => ParsedMessage::Exchange {
             to,
@@ -83,6 +96,7 @@ fn parse_directed(to: &str, from: &str, rest: &[&str], text: &str) -> ParsedMess
             payload: ExchangePayload::FieldDay {
                 class: (*class).to_string(),
                 section: Section((*section).to_string()),
+                rogered: false,
             },
         },
         _ => ParsedMessage::Free(text.to_string()),
@@ -147,7 +161,11 @@ mod tests {
     #[test]
     fn cq_with_grid() {
         match parse_message("CQ K1ABC FN42") {
-            ParsedMessage::Cq { caller, contest, grid } => {
+            ParsedMessage::Cq {
+                caller,
+                contest,
+                grid,
+            } => {
                 assert_eq!(caller.0, "K1ABC");
                 assert!(contest.is_none());
                 assert_eq!(grid.unwrap().0, "FN42");
@@ -171,15 +189,24 @@ mod tests {
     fn exchange_report_and_signoff() {
         assert!(matches!(
             parse_message("K1ABC W9XYZ -15"),
-            ParsedMessage::Exchange { payload: ExchangePayload::Report(-15), .. }
+            ParsedMessage::Exchange {
+                payload: ExchangePayload::Report(-15),
+                ..
+            }
         ));
         assert!(matches!(
             parse_message("W9XYZ K1ABC RR73"),
-            ParsedMessage::Signoff { kind: Signoff::Rr73, .. }
+            ParsedMessage::Signoff {
+                kind: Signoff::Rr73,
+                ..
+            }
         ));
         assert!(matches!(
             parse_message("K1ABC W9XYZ R-09"),
-            ParsedMessage::Exchange { payload: ExchangePayload::RogerReport(-9), .. }
+            ParsedMessage::Exchange {
+                payload: ExchangePayload::RogerReport(-9),
+                ..
+            }
         ));
     }
 
@@ -187,7 +214,18 @@ mod tests {
     fn field_day_exchange() {
         assert!(matches!(
             parse_message("K1ABC W9XYZ 3A CO"),
-            ParsedMessage::Exchange { payload: ExchangePayload::FieldDay { .. }, .. }
+            ParsedMessage::Exchange {
+                payload: ExchangePayload::FieldDay { rogered: false, .. },
+                ..
+            }
+        ));
+        // Rogered form: "R 3A CO" both rogers and sends the exchange.
+        assert!(matches!(
+            parse_message("K1ABC W9XYZ R 3A CO"),
+            ParsedMessage::Exchange {
+                payload: ExchangePayload::FieldDay { rogered: true, .. },
+                ..
+            }
         ));
     }
 

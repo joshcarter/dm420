@@ -224,8 +224,19 @@ pub enum ExchangePayload {
     Report(i8),
     /// R-report.
     RogerReport(i8),
-    /// ARRL Field Day exchange.
-    FieldDay { class: String, section: Section },
+    /// ARRL Field Day exchange (`<count><class> <section>`, e.g. `3A WI`).
+    ///
+    /// `rogered` marks the `R`-prefixed form (`R 3A WI`) that both rogers the
+    /// partner's exchange *and* sends ours — the Field Day analogue of
+    /// [`ExchangePayload::Report`] vs [`ExchangePayload::RogerReport`]. The QSO
+    /// engine derives the FD transition from this bit (content-driven, per
+    /// `docs/wsjtx_qso_sequencing.md` §5), so it must live in the type, not be
+    /// re-inferred from a step counter. **[Joel owns]** the final taxonomy.
+    FieldDay {
+        class: String,
+        section: Section,
+        rogered: bool,
+    },
 }
 
 /// Contest tag carried on a CQ. **[Joel owns]** final taxonomy.
@@ -363,8 +374,13 @@ pub struct QsoState {
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum QsoPhase {
     Idle,
+    /// DM420's wait-for-CQ state: armed to a target, receive-only until it calls
+    /// CQ (`docs/qso_flow.md` §4). No WSJT-X equivalent — WSJT-X replies at once.
+    Armed,
     Calling,
-    InExchange { step: u8 },
+    InExchange {
+        step: u8,
+    },
     Complete,
     TimedOut,
 }
@@ -473,7 +489,10 @@ pub enum WorkedStatus {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum ScannerCommand {
     /// `dwell_slots >= 2` (even/odd slots).
-    StartSurvey { bands: Vec<Band>, dwell_slots: u8 },
+    StartSurvey {
+        bands: Vec<Band>,
+        dwell_slots: u8,
+    },
     Cancel,
 }
 
@@ -735,6 +754,12 @@ mod tests {
         round_trip(ExchangePayload::FieldDay {
             class: "2A".into(),
             section: Section("CO".into()),
+            rogered: false,
+        });
+        round_trip(ExchangePayload::FieldDay {
+            class: "3A".into(),
+            section: Section("WI".into()),
+            rogered: true,
         });
         round_trip(EnrichedDecode {
             decode: sample_decode(),

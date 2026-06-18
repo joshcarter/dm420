@@ -9,3 +9,9 @@ description = "Contact state machine / QSO engine: computes the next message to 
 [dependencies]
 bus.workspace = true
 types.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "time"] }

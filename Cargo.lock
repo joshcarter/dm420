@@ -2951,6 +2951,9 @@ name = "qso"
 version = "0.1.0"
 dependencies = [
  "bus",
+ "serde",
+ "tokio",
+ "tracing",
  "types",
 ]
 
