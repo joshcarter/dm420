@@ -137,9 +137,7 @@ fn playback_thread(
     let setup = (|| {
         let device = open_cpal_device(DeviceKind::Output, output_name.as_deref())?;
         let name = device.name().unwrap_or_else(|_| "<unknown>".into());
-        let config = device
-            .default_output_config()
-            .map_err(|e| AudioError::Device(e.to_string()))?;
+        let config = crate::device::resolve_output_config(&device)?;
         if config.sample_format() != cpal::SampleFormat::F32 {
             return Err(AudioError::Unsupported(format!(
                 "output sample format {:?} (only f32 supported)",
