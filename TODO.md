@@ -1,3 +1,8 @@
+# Next
+
+'/f' command not working in real mode
+
+
 # Soon
 
 Need to determine actual limits of audio offset for
