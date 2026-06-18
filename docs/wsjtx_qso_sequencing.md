@@ -56,7 +56,7 @@ messages (FT4/FT8/FST4/Q65/MSK144) are:
 
 | Slot | Content | Example | Role |
 |------|---------|---------|------|
-| `Tx1` | `<his> <mine> <grid>` | `K1ABC W9XYZ EM48` | Answer a CQ |
+| `Tx1` | `<his> <mine> <grid>` | `K1ABC W9XYZ EM48` | Answer a CQ (normal mode only — disabled in contest modes; see §5) |
 | `Tx2` | `<his> <mine> <report>` | `K1ABC W9XYZ -07` | Send signal report |
 | `Tx3` | `<his> <mine> R<report>` | `K1ABC W9XYZ R-09` | Roger + report |
 | `Tx4` | `<his> <mine> RRR`/`RR73` | `K1ABC W9XYZ RR73` | Roger |
@@ -220,23 +220,61 @@ stored as `m_config.Field_Day_Exchange()`.
 ### Message differences
 
 - **CQ** (`genCQMsg()` ~9491): the contest tag `FD` is inserted →
-  `CQ FD W9XYZ EM48`.
+  `CQ FD W9XYZ EM48` (the grid is retained).
+- **`Tx1` is disabled** — this is the single biggest difference from the normal
+  flow. In `guiUpdate()` ~8215, whenever `m_specOp` is `FIELD_DAY` (or any other
+  contest mode except `EU_VHF`), WSJT-X does `ui->tx1->setEnabled(false)`; the
+  source comment is literally *"start QSO with Tx2."* The answering station
+  therefore **never sends the `<his> <mine> <grid>` message** — it opens the QSO
+  with `Tx2` (its exchange). The grid is only ever advertised in the CQ itself.
 - **`Tx2`/`Tx3`** (`genStdMsgs()` ~9614): `sent = Field_Day_Exchange()` instead
-  of a signal report. So:
-  - `Tx2` = `K1ABC W9XYZ 3A WI`
-  - `Tx3` = `K1ABC W9XYZ R 3A WI`  (note the space: `sent != rpt` → `"R " + sent`)
-- `Tx1`, `Tx4` (`RR73`), `Tx5` (`73`) are unchanged.
+  of a signal report:
+  - `Tx2` = `K1ABC W9XYZ 3A WI`  (plain exchange — this is now the *opening* msg)
+  - `Tx3` = `K1ABC W9XYZ R 3A WI`  (`sent != rpt` → `"R " + sent`; this single
+    message both **rogers** the partner's exchange and **sends your own**)
+- `Tx4` (`RR73`) and `Tx5` (`73`) keep their normal content.
 
 ### Flow
 
+Because the grid step is skipped, each side's exchange is one message shorter,
+and the sequence shifts by one slot. The practical consequence: the **`RR73` and
+final-`73` roles are reversed** relative to normal operation — here the
+*answering* station (K1ABC) sends `RR73` (`Tx4`) and the *CQ-calling* station
+(W9XYZ) sends the final `73` (`Tx5`) and logs. (In the normal flow it is the
+other way round; see §3b.)
+
+W9XYZ calls CQ with exchange `3A WI`; K1ABC answers with exchange `2B IL`:
+
 ```
-            K1ABC transmits          W9XYZ transmits        W9XYZ state after
-  ──────────────────────────────────────────────────────────────────────────
-  (1)                              CQ FD W9XYZ EM48  (Tx6)   CALLING
-  (2)  W9XYZ K1ABC EN37        →   W9XYZ K1ABC 3A WI (Tx2)   REPORT
-  (3)  W9XYZ K1ABC R 2B IL     →   W9XYZ K1ABC RR73  (Tx4)   ROGERS
-  (4)  W9XYZ K1ABC 73 / (none) →   [log, → Tx6 CQ]           SIGNOFF
+            K1ABC transmits           W9XYZ transmits          W9XYZ state after
+  ────────────────────────────────────────────────────────────────────────────
+  (1)                              CQ FD W9XYZ EM48    (Tx6)   CALLING
+  (2)  W9XYZ K1ABC 2B IL       →   K1ABC W9XYZ R 3A WI (Tx3)   ROGER_REPORT
+  (3)  W9XYZ K1ABC RR73        →   K1ABC W9XYZ 73      (Tx5)   SIGNOFF → log
 ```
+
+Step (2) is the key asymmetry: K1ABC double-clicks the CQ and, because `Tx1` is
+disabled, the "just work them" path in `processMessage()` falls through to
+`m_ntx=2`, so K1ABC's *first* transmission is its plain exchange `W9XYZ K1ABC
+2B IL` — never a grid. W9XYZ then answers that with the combined roger+exchange
+`Tx3`, and the QSO completes in two more overs.
+
+This matches the ARRL/WSJT-X documented Field Day FT8/FT4 sequence:
+`CQ FD` (with grid) → bare exchange → `R` + exchange → `RR73` → `73`.
+
+> **The final `73` (Tx5) is a courtesy, not a protocol requirement.** The contact
+> is complete at `RR73`. `message_is_73()` (~315) counts `RR73` as a "73", so the
+> *answering* station's `RR73` is its own "first 73": it **logs and stops auto-Tx
+> the instant it sends `RR73`** and never needs the `73` back. The *CQ-calling*
+> station, having sent `Tx3` (`ROGER_REPORT`), still queues and transmits `Tx5`
+> on receiving the `RR73` — the `RR73` branch in `processMessage()` (~9186) sets
+> `m_ntx=5`, and the dead `if(false)` block just above it (~9170) is commented
+> *"Always Send 73 ... even in contest mode,"* i.e. the 73 is intentionally kept
+> in contest modes. So WSJT-X **does** put a final `73` on the air from the CQ
+> side by default; ARRL docs that end the diagram at `RR73` are describing the
+> minimal complete exchange, not contradicting this. (If you implement the CQ
+> role and stop at `RR73`, WSJT-X will still log fine — it logs when it sends its
+> own `73`, and an un-answered `73` just times out into the next CQ.)
 
 ### Inbound parsing (`processMessage()` ~9050)
 
@@ -336,9 +374,13 @@ distinct protocol if you implement it, not a tweak of the normal flow.
 4. **Drive transitions by content, not by your own internal step** — WSJT-X
    re-derives state from each decode, so a correctly-formatted `R-report` will
    advance it regardless of what it expected.
-5. **For Field Day**, send `CQ FD ...`, then `<count><class> <section>` as the
-   exchange, and `R <count><class> <section>` for the roger; finish with `RR73`
-   then `73`.
+5. **For Field Day**, the grid step is omitted — do **not** send a
+   `<his> <mine> <grid>` opener (WSJT-X disables `Tx1` in contest modes). When
+   answering a `CQ FD`, your first transmission is the bare exchange
+   `<his> <mine> <count><class> <section>`. The flow is `CQ FD …` (with grid) →
+   bare exchange → `R <count><class> <section>` → `RR73` → `73`. Note this shifts
+   the `RR73`/`73` roles vs. the normal flow: the station that *answered* the CQ
+   sends `RR73`, and the station that *called* CQ sends the final `73` (see §5).
 6. The QSO state is also fed to the Fortran decoder (`commons.h:30`
    `nQSOProgress`) for a-priori ("AP") decoding, which improves weak-signal
    decoding of expected replies — not required for interop, but explains why

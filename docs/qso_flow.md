@@ -96,9 +96,25 @@ received.
 `Tx6 CQ → (rcv grid) → Tx2 report → (rcv R-report) → Tx4 RR73 → (rcv 73)`. Log
 on RR73 sent.
 
-**Field Day** replaces the signal report with `<count><class> <section>` (e.g.
-`3A WI`) and the CQ string becomes `CQ FD …`. No signal report is exchanged. We
-send `RR73` and accept both `RR73` and `RRR` inbound.
+**Field Day** is *not* just "swap the report for the exchange." Two things change
+versus the two flows above (`wsjtx_qso_sequencing.md` §5): the **grid step
+(`Tx1`) is skipped**, and the **`RR73`/`73` roles — and therefore the logging
+trigger — reverse**. The CQ string becomes `CQ FD …` (grid retained), the
+exchange is `<count><class> <section>` (e.g. `3A WI`), and no signal report is
+sent.
+
+- **Answering a station** (we are W9XYZ, working K1ABC): open directly with the
+  bare exchange — there is no grid opener —
+  `Tx2 exchange → (rcv R-exchange) → Tx4 RR73`. **We** send `RR73` and **log on
+  RR73 sent**; there is no final `73` to wait for.
+- **Calling CQ** (we call, K1ABC answers):
+  `Tx6 CQ FD → (rcv exchange) → Tx3 R-exchange → (rcv RR73) → Tx5 73`. We send
+  the combined roger+exchange (`Tx3` = `R 3A WI`, one message that both rogers
+  the partner and sends our own exchange) and the final `73`; **log on RR73
+  received**.
+
+We send `RR73` (accept both `RR73` and `RRR` inbound) whenever we hold the roger
+slot — in Field Day that is the *answering* side, the mirror of normal mode.
 
 **Slot alignment.** Transmit in the *opposite* T/R slot from the station we
 heard (FT8 = 15 s, FT4 = 7.5 s). Match the six message strings exactly and
@@ -116,8 +132,9 @@ double-click and never waits for a busy station. Our model:
    **`Armed { target }`**. We publish our intent on the bus (§6) and otherwise
    stay **receive-only** — no transmissions while armed and waiting.
 2. When the target **calls CQ**, we answer: snap our Tx offset to the target's
-   offset (§5), transmit `Tx1` in the opposite slot, and proceed through the
-   normal exchange.
+   offset (§5), transmit our opener in the opposite slot (`Tx1` grid in normal
+   mode; `Tx2` exchange in Field Day, where the grid step is skipped — §3), and
+   proceed through the exchange.
 3. **If the target answers someone else** (we lost the race — their next Tx
    addresses a different call): **stop transmitting immediately** (good-citizen
    QRM avoidance, matching WSJT-X auto-stop) and **re-arm** to wait for their
@@ -186,7 +203,7 @@ dupe for the group (Field Day is one group entry). Auto-pick excludes
 | Enter while armed | Disarm / stop transmitting. |
 | Repeat policy | Keep repeating the current message every period until content advances it or the operator disarms. |
 | CQ with no answer | Keep calling CQ indefinitely. |
-| When to log | On `RR73` **received** (we answered) or `RR73` **sent** (we called CQ). |
+| When to log | **Normal:** `RR73` **received** (we answered) or `RR73` **sent** (we called CQ). **Field Day mirrors this:** we answered → log on `RR73` **sent** (our `Tx4`); we called CQ → log on `RR73` **received** (we then send the final `Tx5` `73`). |
 | After completed QSO | Resume CQ if we started by calling CQ (same offset); go **idle** if we were answering a station. |
 | `RR73` vs `RRR` | Send `RR73`; accept both inbound. |
 
