@@ -131,6 +131,10 @@ DM420_REAL=1 DM420_AUDIO_INPUT="USB PnP" DM420_SERIAL_PORT=/dev/cu.usbserial-120
 - **The `core` crate-name footgun:** this workspace has a member literally named `core`,
   which shadows Rust's `core` prelude path *inside that crate*. Use `::core::…` if you
   need the std `core` from within `crates/core`.
+- **Prefer `ct` over shell tools for code intelligence.** Use the `ct` daemon
+  (`mcp__ct__*`: search, read, outline, references, callers/callees, edits) over `bash`
+  `grep`/`find`/`cat`/`sed` for navigating and reading code — it serves from an in-memory
+  index with structural context. `bash` stays the tool for builds, git, and filesystem ops.
 - **Commit directly to `main`** for this project — no feature branch (per repo convention).
 - **Pin the egui stack** to the versions in the root `Cargo.toml` (egui/eframe 0.34.3,
   egui_tiles 0.15.0, egui_extras 0.34.3). APIs shift across egui minors.
