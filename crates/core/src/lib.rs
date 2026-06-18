@@ -160,6 +160,14 @@ pub fn spawn(bus: &BusHandle, cfg: CoreConfig) -> CoreControl {
         tx_output,
     } = cfg;
 
+    tracing::info!(
+        radio = ?radio,
+        allow_transmit,
+        tx_output = ?tx_output,
+        has_serial = serial.is_some(),
+        "core: launching producers",
+    );
+
     let mut control = CoreControl::default();
 
     // The interlock granter owns the single PTT token — the authority

@@ -15,6 +15,7 @@ mod app;
 mod bus_view;
 mod chrome;
 mod geo_data;
+mod logging;
 mod panel_data;
 mod panels;
 mod send;
@@ -35,6 +36,11 @@ use panels::{BandScan, Contacts, LogBook, Panel, PanelCtx, Waterfall};
 use theme::*;
 
 fn main() -> eframe::Result<()> {
+    // Install file logging first so everything after it is captured. The guard
+    // must live for the whole run (it flushes the writer on drop).
+    let _log_guard = logging::init();
+    tracing::info!(version = env!("CARGO_PKG_VERSION"), "DM420 starting");
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([pd::PANEL_W, pd::PANEL_H])

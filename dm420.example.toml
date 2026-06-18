@@ -16,3 +16,10 @@ grid     = "AA00"       # your Maidenhead grid, e.g. EM73
 [audio]
 input  = ""   # RX capture device (DM420_AUDIO_INPUT env overrides this)
 output = ""   # TX output device (the rig's data-in)
+
+# Logging verbosity for DM420's own crates: trace | debug | info | warn | error.
+# Default is "info". Logs are appended to dm420.log in the launch directory (each
+# run opens with a timestamped "DM420 starting" line). RUST_LOG overrides this when
+# set (standard EnvFilter syntax, e.g. RUST_LOG=core::tx=debug,info).
+[logging]
+level = "info"

@@ -68,6 +68,7 @@ pub fn spawn(
     let control = QsoControl {
         station: shared.clone(),
     };
+    tracing::info!(radio = ?radio, allow_transmit, "qso: engine spawned");
     tokio::spawn(run(bus.clone(), radio, station, shared, allow_transmit));
     control
 }
@@ -202,6 +203,10 @@ fn apply(
 /// the engine loop keeps servicing decodes/clock through the ~13 s over.
 fn spawn_transmit(bus: BusHandle, radio: RadioId, tx: TxIntent) {
     tokio::spawn(async move {
+        tracing::debug!(
+            offset = ?tx.offset, slot = ?tx.slot, message = %tx.message.text,
+            "qso: starting over (acquiring PTT token)",
+        );
         let token = match bus
             .request::<InterlockRequest, InterlockReply>(
                 &Topic::Interlock(radio.clone()),
@@ -221,6 +226,7 @@ fn spawn_transmit(bus: BusHandle, radio: RadioId, tx: TxIntent) {
             }
         };
 
+        tracing::debug!(?token, "qso: PTT token acquired; handing over to audio-tx");
         let req = TxRequest::SlottedMessage {
             radio: radio.clone(),
             // TODO: derive the mode from OperatingState (FT4 = 7.5 s slots) once it

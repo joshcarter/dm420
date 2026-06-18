@@ -52,6 +52,13 @@ pub fn spawn(bus: &BusHandle, radio: t::RadioId, tx: Arc<crate::control::TxContr
             // Read the (live-editable) output device fresh for each over.
             let output = tx.snapshot();
             let (slot, outcome) = transmit(&bus, &radio, output, req, &abort_gen).await;
+            match &outcome {
+                t::TxOutcome::Sent => tracing::info!(?slot, "audio-tx: over sent"),
+                t::TxOutcome::Failed(e) => tracing::warn!(?slot, error = %e, "audio-tx: over failed"),
+                t::TxOutcome::Denied(d) => {
+                    tracing::warn!(?slot, denial = ?d, "audio-tx: over denied")
+                }
+            }
             let _ = bus.publish(
                 &Topic::TxReport(radio.clone()),
                 t::TxReport {
@@ -121,6 +128,8 @@ async fn transmit(
         );
     };
 
+    tracing::debug!(?slot, ?mode, offset = offset.0, message = %message.text, "audio-tx: begin over");
+
     // FT8 only for now: the encoder has no FT4 synth yet.
     if mode != t::OverAirMode::Ft8 {
         return (
@@ -141,12 +150,18 @@ async fn transmit(
     while samples.last().is_some_and(|&s| s.abs() < 1e-4) {
         samples.pop();
     }
+    tracing::debug!(
+        samples = samples.len(),
+        secs = samples.len() as f32 / TX_SAMPLE_RATE as f32,
+        "audio-tx: synthesized FT8 waveform",
+    );
 
     // Baseline the abort counter before keying up, so only a Stop that lands
     // during *this* over aborts it.
     let base = abort_gen.load(Ordering::Acquire);
 
     // Key up — validated against the interlock grant by the rig adapter.
+    tracing::debug!(?token, "audio-tx: keying up (TX1 / data route)");
     if let Err(e) = key(bus, radio, token, true).await {
         let _ = key(bus, radio, token, false).await; // best-effort safety
         return (Some(slot), classify_key_error(e));
@@ -169,6 +184,7 @@ async fn transmit(
 
     // Always key down (key-down is never gated).
     let _ = key(bus, radio, token, false).await;
+    tracing::debug!("audio-tx: keyed down");
     (Some(slot), outcome)
 }
 
@@ -188,6 +204,7 @@ async fn wait_keyed(
     let mut since_refresh = Duration::ZERO;
     while !playback.is_done() && elapsed < MAX_TX {
         if abort_gen.load(Ordering::Acquire) != base {
+            tracing::debug!("audio-tx: Stop detected mid-over; aborting carrier");
             return true; // operator hit Stop — abort the over now
         }
         tokio::time::sleep(tick).await;
@@ -196,6 +213,7 @@ async fn wait_keyed(
         if since_refresh >= PTT_REFRESH {
             // Refresh the watchdog; key-down on the next slot edge / the cap
             // recovers from an unexpected denial, so the result is best-effort.
+            tracing::debug!("audio-tx: PTT refresh (staying inside rig watchdog)");
             let _ = key(bus, radio, token, true).await;
             since_refresh = Duration::ZERO;
         }

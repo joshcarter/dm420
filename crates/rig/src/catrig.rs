@@ -57,6 +57,7 @@ impl<C: CatChannel> Rig for CatRig<C> {
         // the USB audio we play, independent of the rig's "source of SEND/PTT"
         // (FRONT/REAR) menu. Key-down (`RX`) is route-independent.
         let cmd = if tx { "TX1" } else { "RX" };
+        tracing::debug!(cmd, "rig: set_ptt");
         self.ch.exchange(cmd, Expect::NoReply)?;
         Ok(())
     }

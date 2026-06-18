@@ -11,7 +11,7 @@ use crossbeam_channel::{Receiver, Sender, bounded};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Load a WAV file as mono f32 samples plus its sample rate. Handles 16/24/32-bit
 /// integer and 32-bit float, any channel count (downmixed by averaging).
@@ -168,7 +168,7 @@ fn playback_thread(
         buffer_size: cpal::BufferSize::Default,
     };
     let channels = channels as usize;
-    eprintln!("dm420 audio-tx: opening output {name:?} @ {device_rate} Hz / {channels} ch");
+    debug!(device = %name, rate = device_rate, channels, "audio-tx: opening output stream");
 
     // Resample the whole file up front (memory is cheap at these sizes, and it
     // keeps the audio callback trivial). Track progress in *file* frames so the
@@ -189,6 +189,7 @@ fn playback_thread(
     let samples_cb = Arc::clone(&samples);
     let done_cb = done_tx.clone();
     let progress_cb = Arc::clone(&progress);
+    let err_name = name.clone(); // for the stream-error callback (catches device dropouts)
 
     let stream = device.build_output_stream(
         &stream_config,
@@ -209,25 +210,24 @@ fn playback_thread(
                 let _ = done_cb.try_send(());
             }
         },
-        |e| warn!(error = %e, "audio output stream error"),
+        move |e| warn!(device = %err_name, error = %e, "audio-tx: output stream error (device dropout?)"),
         None,
     );
 
     let stream = match stream {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("dm420 audio-tx: FAILED to build output stream on {name:?}: {e}");
+            warn!(device = %name, error = %e, "audio-tx: failed to build output stream");
             let _ = ready_tx.send(Err(AudioError::Stream(e.to_string())));
             return;
         }
     };
     if let Err(e) = stream.play() {
-        eprintln!("dm420 audio-tx: FAILED to start output stream on {name:?}: {e}");
+        warn!(device = %name, error = %e, "audio-tx: failed to start output stream");
         let _ = ready_tx.send(Err(AudioError::Stream(e.to_string())));
         return;
     }
-    eprintln!("dm420 audio-tx: playing on {name:?}");
-    info!(device = %name, device_rate, channels, frames = samples.len(), "playback started");
+    info!(device = %name, device_rate, channels, frames = samples.len(), "audio-tx: playback started");
     let _ = ready_tx.send(Ok(name));
 
     // Hold the stream until stopped (wait() sends stop after done arrives).

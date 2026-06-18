@@ -309,6 +309,7 @@ fn apply(
         // block releasing TX. The actor's gate + 10 s watchdog still apply beneath.
         t::RigCommand::PttRequest { on, token } => {
             if *on && !granter.validate(*token) {
+                tracing::warn!(?token, "rig: PTT key-up denied (no live interlock grant)");
                 return CommandResult::Err("interlock: no live PTT grant for this token".into());
             }
             handle.set_ptt(*on)

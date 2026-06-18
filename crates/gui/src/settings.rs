@@ -36,6 +36,18 @@ pub(crate) const DEFAULT_BAUD: u32 = 19_200;
 /// vendor's rate table.
 pub(crate) const KENWOOD_BAUDS: &[u32] = &[115_200, 57_600, 38_400, 19_200, 9_600, 4_800];
 
+/// Default log level when neither `RUST_LOG` nor `[logging] level` is set.
+pub(crate) const DEFAULT_LOG_LEVEL: &str = "info";
+
+/// The configured log level for DM420's crates: the `[logging] level` key in
+/// `dm420.toml`, or [`DEFAULT_LOG_LEVEL`] if unset. Read once at startup by
+/// [`crate::logging::init`] — before the subscriber exists, so it logs nothing
+/// itself. `RUST_LOG` (handled in `logging`) overrides this when present.
+pub fn log_level() -> String {
+    let text = std::fs::read_to_string("dm420.toml").unwrap_or_default();
+    parse_table_value(&text, "logging", "level").unwrap_or_else(|| DEFAULT_LOG_LEVEL.to_string())
+}
+
 /// The subset of [`Settings`] the operator can edit live from the UI (the rig +
 /// audio hardware bindings). Held by `BusView` as the source of truth for the
 /// settings form, and pushed to the running producers on apply.
@@ -93,7 +105,7 @@ impl Station {
         let existing = std::fs::read_to_string(path).ok();
         let text = update_station_config(existing.as_deref(), &self.call, &self.grid);
         if let Err(e) = std::fs::write(path, &text) {
-            eprintln!("dm420: could not write {}: {e}", path.display());
+            tracing::warn!(path = %path.display(), error = %e, "could not write station config");
         }
     }
 
@@ -349,7 +361,7 @@ pub fn save_audio_config(cfg: &HardwareConfig) {
         ),
     };
     if let Err(e) = std::fs::write(path, &text) {
-        eprintln!("dm420: could not write {}: {e}", path.display());
+        tracing::warn!(path = %path.display(), error = %e, "could not write audio config");
     }
 }
 
@@ -383,7 +395,7 @@ fn serial_from_env() -> SerialConfig {
 
     let baud = match env_nonempty("DM420_SERIAL_BAUD") {
         Some(s) => s.parse::<u32>().unwrap_or_else(|_| {
-            eprintln!("dm420: DM420_SERIAL_BAUD='{s}' is not a number; using {DEFAULT_BAUD}");
+            tracing::warn!(value = %s, "DM420_SERIAL_BAUD is not a number; using {DEFAULT_BAUD}");
             DEFAULT_BAUD
         }),
         None => DEFAULT_BAUD,
@@ -391,8 +403,9 @@ fn serial_from_env() -> SerialConfig {
 
     let profile = match env_nonempty("DM420_SERIAL_PROFILE") {
         Some(s) => LineProfile::parse(&s).unwrap_or_else(|| {
-            eprintln!(
-                "dm420: DM420_SERIAL_PROFILE='{s}' unknown (use none|dtr-rts|rtscts); using default"
+            tracing::warn!(
+                value = %s,
+                "DM420_SERIAL_PROFILE unknown (use none|dtr-rts|rtscts); using default"
             );
             LineProfile::Default
         }),
@@ -415,7 +428,7 @@ fn protocol_from_env() -> Protocol {
             "ft8" => Protocol::Ft8,
             "ft4" => Protocol::Ft4,
             _ => {
-                eprintln!("dm420: DM420_MODE='{s}' unknown (use ft8|ft4); using ft8");
+                tracing::warn!(value = %s, "DM420_MODE unknown (use ft8|ft4); using ft8");
                 Protocol::Ft8
             }
         },
@@ -428,10 +441,7 @@ fn wav_from_env() -> Option<PathBuf> {
     if p.exists() {
         Some(p)
     } else {
-        eprintln!(
-            "dm420: DM420_WAV='{}' does not exist; using live capture",
-            p.display()
-        );
+        tracing::warn!(path = %p.display(), "DM420_WAV does not exist; using live capture");
         None
     }
 }

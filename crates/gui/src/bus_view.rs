@@ -131,6 +131,13 @@ impl BusView {
         // active runtime context; hold the guard while we wire everything up.
         let settings = crate::settings::Settings::from_env();
         let real = settings.is_real();
+        tracing::info!(
+            mode = if real { "real" } else { "mock" },
+            audio_input = ?settings.audio_input,
+            audio_output = ?settings.audio_output,
+            protocol = ?settings.protocol,
+            "bus_view: starting producers",
+        );
         let applied = Arc::new(Mutex::new(settings.hardware()));
         let _guard = rt.enter();
         let control = if real {
@@ -429,7 +436,7 @@ fn pump_state<T: BusMessage>(bus: &BusHandle, topic: Topic, cell: Cell<T>, ctx: 
     let mut sub = match bus.subscribe::<T>(TopicSelector::Exact(topic)) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("bus_view: state subscribe failed: {e:?}");
+            tracing::error!(error = ?e, "bus_view: state subscribe failed");
             return;
         }
     };
@@ -458,7 +465,7 @@ fn pump_stream<T: BusMessage>(
     let mut sub = match bus.subscribe::<T>(sel) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("bus_view: stream subscribe failed: {e:?}");
+            tracing::error!(error = ?e, "bus_view: stream subscribe failed");
             return;
         }
     };
@@ -488,7 +495,7 @@ fn pump_health(
     let mut sub = match bus.subscribe::<SubsystemHealth>(TopicSelector::Exact(Topic::Health(id))) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("bus_view: health subscribe failed: {e:?}");
+            tracing::error!(error = ?e, "bus_view: health subscribe failed");
             return;
         }
     };
@@ -518,7 +525,7 @@ fn pump_bands(bus: &BusHandle, bands: Arc<Mutex<HashMap<Band, BandActivity>>>, c
         match bus.subscribe::<BandActivity>(TopicSelector::Exact(Topic::ScannerCandidates)) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("bus_view: candidates subscribe failed: {e:?}");
+                tracing::error!(error = ?e, "bus_view: candidates subscribe failed");
                 return;
             }
         };

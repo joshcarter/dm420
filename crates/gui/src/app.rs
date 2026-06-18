@@ -91,7 +91,7 @@ impl App {
                 image::RgbaImage::from_raw(w as u32, h as u32, image.as_raw().to_vec())
             {
                 let _ = buf.save(&path);
-                eprintln!("saved screenshot: {path} ({w}x{h})");
+                tracing::info!("saved screenshot {path} ({w}x{h})");
             }
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }

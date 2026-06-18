@@ -110,6 +110,13 @@ pub fn serve(bus: &BusHandle, radio: t::RadioId, granter: Granter) {
                 t::InterlockRequest::Acquire => granter.acquire(),
                 t::InterlockRequest::Release(token) => granter.release(token),
             };
+            match &reply {
+                t::InterlockReply::Granted { token, .. } => {
+                    tracing::debug!(?token, "interlock: token granted")
+                }
+                t::InterlockReply::Released => tracing::debug!("interlock: token released"),
+                t::InterlockReply::Denied(d) => tracing::debug!(reason = ?d, "interlock: denied"),
+            }
             responder.reply(reply);
         }
     });

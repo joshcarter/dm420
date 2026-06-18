@@ -4,6 +4,25 @@ Running notes, gotchas, and reminders. Newest at the top.
 
 ## 2026-06-18
 
+- **Real logging to `dm420.log` (done; standard tracing levels):** the app installs a
+  `tracing` subscriber (`gui/src/logging.rs`) that writes **`dm420.log`** in the launch
+  dir, **appended across runs** (each run opens with a timestamped `DM420 starting`
+  line, so sessions are easy to tell apart). Levels are the
+  standard TRACE/DEBUG/INFO/WARN/ERROR. **Default is INFO; your `dm420.toml` is set to
+  `[logging] level = "debug"`.** Third-party crates (egui/winit/wgpu/tokio/cpal) are
+  pinned at `warn` so the log stays readable; only DM420's crates follow the level.
+  `RUST_LOG` overrides everything when set (e.g. `RUST_LOG=core::tx=debug,info`).
+  - **TX path is DEBUG-instrumented** end to end — qso (starting over / token acquired) →
+    interlock (grant/release/deny) → core::tx (begin/synth/key-up/PTT refresh/key-down/
+    abort, plus an INFO/WARN per over) → rig (`set_ptt` TX1/RX, key-up deny) → audio
+    (output device opened, playback started, stream-error on a dropout). ~12 lines/over.
+  - **INFO seams:** app start + version, producer mode (real/mock) + audio devices,
+    `core: launching producers`, `qso: engine spawned`. Every old `eprintln!` diagnostic
+    is gone, replaced by a real log record at the right level.
+  - **To use:** run as usual; `dm420.log` appears next to `dm420.toml`. Hand it to me and
+    I can read the whole session — at `debug` (which yours is) the TX dropout will show as
+    an `audio-tx: output stream error (device dropout?)` line with the device name.
+
 - **Idea: a "radio configuration check" easter egg.** The mic-vs-USB saga below would
   have been a 5-second diagnosis if DM420 could *audit the rig's setup* and tell the
   operator exactly what's wrong. Proposal: a hidden self-test (an easter egg — e.g. a
