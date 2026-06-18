@@ -42,6 +42,22 @@ pub fn list_devices() -> Result<Vec<DeviceInfo>, AudioError> {
         .map_err(|e| AudioError::Device(e.to_string()))?
     {
         let name = device.name().unwrap_or_else(|_| "<unknown>".into());
+        // TEMP diagnostic (remove once enumeration is sorted): dump exactly what
+        // cpal reports per device, so we can see why a duplex device may not
+        // surface as an output.
+        eprintln!(
+            "dm420 audio-probe: {name:?}  in(default={} ranges={})  out(default={} ranges={})",
+            device.default_input_config().is_ok(),
+            device
+                .supported_input_configs()
+                .map(|mut c| c.next().is_some())
+                .unwrap_or(false),
+            device.default_output_config().is_ok(),
+            device
+                .supported_output_configs()
+                .map(|mut c| c.next().is_some())
+                .unwrap_or(false),
+        );
         if let Some((rate, channels)) = probe_config(&device, DeviceKind::Input) {
             out.push(DeviceInfo {
                 name: name.clone(),
