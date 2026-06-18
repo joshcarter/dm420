@@ -11,7 +11,7 @@ use app_core::{LineProfile, Protocol, SerialConfig};
 
 use super::{Panel, PanelCtx};
 use crate::bus_view::BusView;
-use crate::chrome::{measure, panel_header, shadow};
+use crate::chrome::{key_cell_accent, lcd_panel, measure, panel_header, shadow};
 use crate::panel_data as pd;
 use crate::send::{ArmState, Command, SendState};
 use crate::settings::{DEFAULT_BAUD, HardwareConfig, KENWOOD_BAUDS};
@@ -65,23 +65,48 @@ impl Waterfall {
         }
     }
 
-    /// The bottom "Send" row: `Send:` label, black message box (auto-filled with
-    /// the next outgoing message), and a right-aligned state button — orange
-    /// when idle, cyan when armed, "Cancel" while transmitting. Slash/colon
-    /// commands typed into the box are parsed on Enter; anything else toggles arm.
+    /// The bottom "Send" row: `Send:` label, black message box (mirrors the next
+    /// outgoing message), and a right-aligned Scan-style lit key — orange `SEND`
+    /// when idle/armed, cyan `CANCEL` while transmitting (cyan also signals the
+    /// armed state). The box is not a free text field: only `/`/`:` (start a slash
+    /// command) and Enter (activate the button) are accepted; see `send.rs`.
     fn draw_send_row(&mut self, ctx: &mut PanelCtx, row: Rect) {
         const MYCALL: &str = "N0JDC";
         const MYGRID: &str = "DN70";
 
+        // Keyboard: only the active panel acts on typed input / Enter. `/` or `:`
+        // begins a slash command; Backspace/Escape edit/abort it; Enter activates
+        // (run the command, else toggle arm). Anything else is ignored.
+        let mut activate = false;
+        if ctx.active {
+            let events = ctx.ui.input(|i| i.events.clone());
+            for ev in &events {
+                match ev {
+                    egui::Event::Text(t) => self.send.type_text(t),
+                    egui::Event::Key { key: egui::Key::Enter, pressed: true, .. } => activate = true,
+                    egui::Event::Key { key: egui::Key::Backspace, pressed: true, .. } => {
+                        self.send.backspace()
+                    }
+                    egui::Event::Key { key: egui::Key::Escape, pressed: true, .. } => {
+                        self.send.escape()
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Keep the box mirroring the engine's next message (unless mid-command).
+        let target = self.slide.outgoing().clone();
+        self.send.refresh_auto(&target, MYCALL, MYGRID);
+
         let pal = ctx.pal;
         let painter = ctx.painter;
 
-        // Layout: [Send:] [────── box ──────] [button]
+        // Layout: [Send:] [────── box ──────] [ SEND ]
         let pad = 8.0;
         let label = "Send:";
         let label_font = mono(11.0);
         let label_w = measure(painter, label, label_font.clone());
-        let btn_w = 64.0;
         let cy = row.center().y;
 
         painter.text(
@@ -92,17 +117,21 @@ impl Waterfall {
             pal.sub,
         );
 
-        let box_left = row.left() + pad + label_w + pad;
-        let btn_rect = Rect::from_min_max(
-            Pos2::new(row.right() - pad - btn_w, row.top() + 3.0),
-            Pos2::new(row.right() - pad, row.bottom() - 3.0),
+        // Scan-style lit key (lcd track + key_cell), sized to its label.
+        let btn_label = self.send.button_label();
+        let cell_w = measure(painter, &tracked(btn_label), heading_bold(9.0)) + 22.0;
+        let track_w = cell_w + 4.0;
+        let track = Rect::from_min_max(
+            Pos2::new(row.right() - pad - track_w, cy - 11.0),
+            Pos2::new(row.right() - pad, cy + 11.0),
         );
+        let box_left = row.left() + pad + label_w + pad;
         let box_rect = Rect::from_min_max(
-            Pos2::new(box_left, row.top() + 3.0),
-            Pos2::new(btn_rect.left() - pad, row.bottom() - 3.0),
+            Pos2::new(box_left, cy - 11.0),
+            Pos2::new(track.left() - pad, cy + 11.0),
         );
 
-        // Black message box with a 1px edge.
+        // Black message box with a 1px edge; text vertically centered.
         painter.rect_filled(box_rect, corner_radius(2), Color32::BLACK);
         painter.rect_stroke(
             box_rect,
@@ -110,41 +139,35 @@ impl Waterfall {
             egui::Stroke::new(1.0, pal.edge),
             egui::StrokeKind::Inside,
         );
-
-        // Keep the box mirroring the engine's next message while idle/unfocused.
-        let box_id = egui::Id::new("ft8_send_box");
-        let focused = ctx.ui.memory(|m| m.has_focus(box_id));
-        let target = self.slide.outgoing().clone();
-        self.send.sync_auto(focused, &target, MYCALL, MYGRID);
-
         let text_color = if self.send.armed == ArmState::Idle { pal.body } else { pal.accent2 };
-        let resp = ctx.ui.put(
-            box_rect.shrink2(egui::vec2(6.0, 0.0)),
-            egui::TextEdit::singleline(&mut self.send.buf)
-                .id(box_id)
-                .frame(egui::Frame::NONE)
-                .desired_width(f32::INFINITY)
-                .font(egui::FontId::monospace(12.0))
-                .text_color(text_color),
+        painter.with_clip_rect(box_rect).text(
+            Pos2::new(box_rect.left() + 6.0, cy),
+            Align2::LEFT_CENTER,
+            &self.send.buf,
+            egui::FontId::monospace(12.0),
+            text_color,
         );
-        let enter = resp.lost_focus() && ctx.ui.input(|i| i.key_pressed(egui::Key::Enter));
 
-        // State button.
-        let btn = ctx
-            .ui
-            .interact(btn_rect, egui::Id::new("ft8_send_btn"), egui::Sense::click());
-        let fill = if self.send.armed == ArmState::Idle { pal.accent } else { pal.accent2 };
-        painter.rect_filled(btn_rect, corner_radius(2), fill);
-        painter.text(
-            btn_rect.center(),
-            Align2::CENTER_CENTER,
-            &tracked(self.send.button_label()),
-            heading_bold(9.0),
-            pal.on_accent,
+        // Lit key in its recessed track. Cyan fill while armed/transmitting.
+        lcd_panel(painter, track, pal, 4);
+        let cell = Rect::from_min_max(
+            Pos2::new(track.left() + 2.0, track.top() + 2.0),
+            Pos2::new(track.right() - 2.0, track.bottom() - 2.0),
+        );
+        let accent = if self.send.armed == ArmState::Idle { pal.accent } else { pal.accent2 };
+        let btn = key_cell_accent(
+            ctx.ui,
+            painter,
+            pal,
+            cell,
+            btn_label,
+            true,
+            accent,
+            ctx.ui.id().with("ft8_send_btn"),
         );
 
         // Enter or a button click activates: apply a command, else toggle arm.
-        if enter || btn.clicked() {
+        if activate || btn.clicked() {
             if let Some(Command::SetFrequency(mhz)) = self.send.activate() {
                 self.vfo_override_hz = Some((mhz * 1_000_000.0).round() as u64);
             }
@@ -302,15 +325,19 @@ impl Panel for Waterfall {
             }
         }
 
-        // Mock arm→transmit cadence: step the send lifecycle each slot boundary.
-        // `now_slot` only advances under the mock sim (locked mock mode), which is
-        // the only place the send row is functional for now.
-        let slot = self.slide.now_slot();
-        if slot != self.last_slot {
-            self.last_slot = slot;
-            self.send.slot_tick();
+        // The send row is the operating control, shown only when locked. When
+        // unlocked the bottom strip is the settings/edit surface, not the radio.
+        if !ctx.unlocked {
+            // Mock arm→transmit cadence: step the lifecycle each slot boundary.
+            // `now_slot` only advances under the mock sim, the only place the
+            // send row is functional for now.
+            let slot = self.slide.now_slot();
+            if slot != self.last_slot {
+                self.last_slot = slot;
+                self.send.slot_tick();
+            }
+            self.draw_send_row(ctx, send_row);
         }
-        self.draw_send_row(ctx, send_row);
     }
 }
 

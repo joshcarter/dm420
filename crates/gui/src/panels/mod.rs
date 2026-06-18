@@ -36,6 +36,10 @@ pub struct PanelCtx<'a> {
     /// is the normal operating view. Each panel decides what unlocking means for
     /// it — most ignore it.
     pub unlocked: bool,
+    /// True when this panel is the active keyboard target. Only the active panel
+    /// should act on Enter / typed input; others ignore keyboard events so the
+    /// same key means different things per panel. The FT8 panel is active for now.
+    pub active: bool,
 }
 
 /// A drawable instrument. Implementers own their view state and render into the

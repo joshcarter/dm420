@@ -126,10 +126,13 @@ struct Tactical<'a> {
     dt: f64,
     bus: &'a BusView,
     unlocked: bool,
+    /// The pane that currently receives keyboard input. Panels compare their own
+    /// tile id against this to decide whether Enter/typing is theirs to handle.
+    active_tile: TileId,
 }
 
 impl<'a> Behavior<Box<dyn Panel>> for Tactical<'a> {
-    fn pane_ui(&mut self, ui: &mut egui::Ui, _id: TileId, pane: &mut Box<dyn Panel>) -> UiResponse {
+    fn pane_ui(&mut self, ui: &mut egui::Ui, id: TileId, pane: &mut Box<dyn Panel>) -> UiResponse {
         // The chassis is already painted behind the whole tree. Inset the pane
         // so the recessed screen has chassis breathing room around it (and the
         // grooves between panes read as metal).
@@ -143,6 +146,7 @@ impl<'a> Behavior<Box<dyn Panel>> for Tactical<'a> {
             dt: self.dt,
             bus: self.bus,
             unlocked: self.unlocked,
+            active: id == self.active_tile,
         };
         pane.ui(&mut ctx, block);
         UiResponse::None
@@ -186,6 +190,8 @@ pub struct TreeIds {
     pub root: TileId,
     pub right: TileId,
     pub band: TileId,
+    /// The FT8/Waterfall pane — the one panel that holds keyboard focus for now.
+    pub waterfall: TileId,
 }
 
 fn build_tree() -> (Tree<Box<dyn Panel>>, TreeIds) {
@@ -211,7 +217,7 @@ fn build_tree() -> (Tree<Box<dyn Panel>>, TreeIds) {
     }
     (
         Tree::new("martian_tree", root, tiles),
-        TreeIds { root, right, band },
+        TreeIds { root, right, band, waterfall },
     )
 }
 
@@ -341,6 +347,7 @@ impl eframe::App for App {
                     dt: dt as f64,
                     bus: &self.view,
                     unlocked: self.edit_mode,
+                    active_tile: self.tree_ids.waterfall,
                 };
                 enforce_min_width(&mut self.tree, self.tree_ids.root, pd::MIN_PANEL_W, pd::VGROOVE_W);
                 pin_band_height(&mut self.tree, &self.tree_ids, pd::VGROOVE_W);

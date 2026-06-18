@@ -31,13 +31,6 @@ pub enum Command {
     SetFrequency(f64),
 }
 
-/// True if `input` looks like a command attempt (a leading `/` or `:`), so the
-/// caller can route Enter to the parser rather than the arm/disarm toggle.
-pub fn is_command(input: &str) -> bool {
-    let s = input.trim_start();
-    s.starts_with('/') || s.starts_with(':')
-}
-
 /// Parse a slash/colon command. Returns `None` if it isn't a command or the
 /// verb/argument isn't recognized. Verb matching is case-insensitive; the
 /// frequency verb accepts `f`, `freq`, or `frequency`.
@@ -64,31 +57,73 @@ pub fn next_message(target: &Target, mycall: &str, grid: &str) -> String {
     }
 }
 
-/// State of the send row: the edit buffer plus where we are in the lifecycle.
+/// State of the send row: the displayed/edit buffer plus where we are in the
+/// lifecycle.
+///
+/// The box is **not** a free text field. Normally `buf` mirrors the engine's
+/// next outgoing message (read-only). The operator can only do two things:
+/// press `/` or `:` to start typing a slash command (which replaces the buffer),
+/// or press Enter to activate the Send/Cancel button. `entering` distinguishes
+/// "showing the auto message" from "the operator is composing a command".
 #[derive(Default)]
 pub struct SendState {
     pub armed: ArmState,
-    /// What's shown in / typed into the box. Auto-refreshed from the selection
-    /// while idle and unfocused; left alone while the operator is typing.
     pub buf: String,
+    /// True while composing a slash command (`buf` is the operator's input, not
+    /// the auto message). Set by `/`/`:`, cleared on Enter/Escape/empty backspace.
+    pub entering: bool,
 }
 
 impl SendState {
-    /// While idle and not being typed into, keep the box mirroring the message
-    /// the engine would send next. Skipped when focused so typing isn't clobbered.
-    pub fn sync_auto(&mut self, focused: bool, target: &Target, mycall: &str, grid: &str) {
-        if !focused && self.armed == ArmState::Idle {
+    /// Keep the box mirroring the engine's next message, unless the operator is
+    /// mid-command. Independent of arm state — the box always shows what we'd send.
+    pub fn refresh_auto(&mut self, target: &Target, mycall: &str, grid: &str) {
+        if !self.entering {
             self.buf = next_message(target, mycall, grid);
         }
     }
 
-    /// Handle Enter or a button press. If the buffer holds a command, parse it
-    /// and return it for the caller to apply (the buffer is cleared so it
-    /// re-syncs to the auto message next frame). Otherwise toggle arm/disarm and
-    /// return `None`.
+    /// Feed typed text (an egui `Event::Text` payload). Outside command entry,
+    /// only a leading `/` or `:` does anything — it starts a command and clears
+    /// the box. While composing, characters append. Everything else is ignored,
+    /// so the box can never hold arbitrary free text.
+    pub fn type_text(&mut self, text: &str) {
+        for ch in text.chars() {
+            if self.entering {
+                self.buf.push(ch);
+            } else if ch == '/' || ch == ':' {
+                self.entering = true;
+                self.buf.clear();
+                self.buf.push(ch);
+            }
+        }
+    }
+
+    /// Backspace while composing a command. Backing out the last character exits
+    /// command entry (the box returns to showing the auto message next frame).
+    pub fn backspace(&mut self) {
+        if self.entering {
+            self.buf.pop();
+            if self.buf.is_empty() {
+                self.entering = false;
+            }
+        }
+    }
+
+    /// Abandon a command in progress.
+    pub fn escape(&mut self) {
+        if self.entering {
+            self.entering = false;
+            self.buf.clear();
+        }
+    }
+
+    /// Handle Enter or a button press. While composing a command, parse and
+    /// return it (then leave command entry). Otherwise toggle arm/disarm.
     pub fn activate(&mut self) -> Option<Command> {
-        if is_command(&self.buf) {
+        if self.entering {
             let cmd = parse_command(&self.buf);
+            self.entering = false;
             self.buf.clear();
             return cmd;
         }
@@ -111,11 +146,11 @@ impl SendState {
         };
     }
 
-    /// Button label for the current state.
+    /// Button label for the current state (all caps to match the Scan key).
     pub fn button_label(&self) -> &'static str {
         match self.armed {
-            ArmState::Transmitting => "Cancel",
-            _ => "Send",
+            ArmState::Transmitting => "CANCEL",
+            _ => "SEND",
         }
     }
 }
@@ -147,14 +182,6 @@ mod tests {
     }
 
     #[test]
-    fn is_command_detects_prefixes() {
-        assert!(is_command("/f 14.074"));
-        assert!(is_command("  :freq 7.074"));
-        assert!(!is_command("CQ N0JDC DN70"));
-        assert!(!is_command(""));
-    }
-
-    #[test]
     fn auto_message_reflects_selection() {
         let cq = next_message(&Target::Offset(300), "N0JDC", "DN70");
         assert_eq!(cq, "CQ N0JDC DN70");
@@ -167,18 +194,48 @@ mod tests {
     }
 
     #[test]
-    fn enter_toggles_arm_and_command_does_not() {
+    fn typing_only_accepts_slash_commands() {
+        let mut s = SendState::default();
+        s.buf = "CQ N0JDC DN70".into(); // standing auto message
+        // Arbitrary text is ignored — the box can't hold free text.
+        s.type_text("hello");
+        assert!(!s.entering);
+        assert_eq!(s.buf, "CQ N0JDC DN70");
+        // A leading `/` starts a command and replaces the box.
+        s.type_text("/");
+        assert!(s.entering);
+        assert_eq!(s.buf, "/");
+        s.type_text("f 14.074");
+        assert_eq!(s.buf, "/f 14.074");
+        // Enter parses, applies, and leaves command entry.
+        assert_eq!(s.activate(), Some(Command::SetFrequency(14.074)));
+        assert!(!s.entering);
+        assert!(s.buf.is_empty());
+        // `:` is an equivalent command prefix.
+        s.type_text(":freq 7.074");
+        assert_eq!(s.activate(), Some(Command::SetFrequency(7.074)));
+    }
+
+    #[test]
+    fn enter_toggles_arm_when_not_composing() {
         let mut s = SendState::default();
         s.buf = "CQ N0JDC DN70".into();
         assert_eq!(s.activate(), None);
         assert_eq!(s.armed, ArmState::Armed);
-        // Enter again disarms.
+        // Enter again disarms (the single Stop control).
         assert_eq!(s.activate(), None);
         assert_eq!(s.armed, ArmState::Idle);
-        // A command applies and clears the buffer without arming.
-        s.buf = "/f 14.074".into();
-        assert_eq!(s.activate(), Some(Command::SetFrequency(14.074)));
-        assert_eq!(s.armed, ArmState::Idle);
+    }
+
+    #[test]
+    fn backspace_and_escape_exit_command_entry() {
+        let mut s = SendState::default();
+        s.type_text("/");
+        s.backspace(); // backing out the last char exits entry
+        assert!(!s.entering);
+        s.type_text("/f");
+        s.escape();
+        assert!(!s.entering);
         assert!(s.buf.is_empty());
     }
 

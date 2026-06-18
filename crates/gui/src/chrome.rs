@@ -101,8 +101,24 @@ pub fn key_cell(
     active: bool,
     id: egui::Id,
 ) -> egui::Response {
+    key_cell_accent(ui, painter, pal, rect, label, active, pal.accent, id)
+}
+
+/// Like [`key_cell`] but with an explicit fill color for the lit state — used
+/// where a key needs a non-primary accent (e.g. the Send button turning cyan
+/// when armed). Identical geometry/typography so it matches the Scan key.
+pub fn key_cell_accent(
+    ui: &mut egui::Ui,
+    painter: &egui::Painter,
+    pal: &Palette,
+    rect: Rect,
+    label: &str,
+    active: bool,
+    accent: Color32,
+    id: egui::Id,
+) -> egui::Response {
     if active {
-        painter.rect_filled(rect, corner_radius(2), pal.accent);
+        painter.rect_filled(rect, corner_radius(2), accent);
         // raised: 1px top highlight + 1px bottom shadow.
         let hl = Color32::from_rgba_unmultiplied(255, 255, 255, 72);
         let sh = Color32::from_rgba_unmultiplied(0, 0, 0, 115);
