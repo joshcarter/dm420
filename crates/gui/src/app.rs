@@ -17,6 +17,8 @@ pub struct App {
     pub edit_mode: bool, // GUI LOCK/EDIT
     pub tree: Tree<Box<dyn Panel>>,
     pub tree_ids: TreeIds,
+    /// The pane that currently has keyboard focus (click or Cmd/Ctrl-1..4).
+    pub focused: egui_tiles::TileId,
     pub brushed: Option<TextureHandle>,
     pub brushed_is_dark: bool,
     pub relief: Option<TextureHandle>,
@@ -34,11 +36,13 @@ impl App {
     pub fn new(egui_ctx: &egui::Context) -> Self {
         let dark = std::env::var("MARTIAN_LIGHT").is_err();
         let (tree, tree_ids) = build_tree();
+        let focused = tree_ids.waterfall; // FT8 panel holds focus at startup
         Self {
             dark,
             edit_mode: false,
             tree,
             tree_ids,
+            focused,
             brushed: None,
             brushed_is_dark: !dark,
             relief: None,

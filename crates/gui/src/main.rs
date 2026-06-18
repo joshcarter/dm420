@@ -128,7 +128,10 @@ struct Tactical<'a> {
     unlocked: bool,
     /// The pane that currently receives keyboard input. Panels compare their own
     /// tile id against this to decide whether Enter/typing is theirs to handle.
-    active_tile: TileId,
+    focused: TileId,
+    /// Set to a pane id when that pane is clicked this frame, so the app can move
+    /// focus after the tree finishes laying out.
+    clicked: &'a mut Option<TileId>,
 }
 
 impl<'a> Behavior<Box<dyn Panel>> for Tactical<'a> {
@@ -137,6 +140,15 @@ impl<'a> Behavior<Box<dyn Panel>> for Tactical<'a> {
         // so the recessed screen has chassis breathing room around it (and the
         // grooves between panes read as metal).
         let block = ui.max_rect().shrink2(Vec2::new(8.0, 6.0));
+        // Focus-on-click: a press anywhere in the pane focuses it. We test the
+        // press position rather than adding a click-sensing widget, so panels'
+        // own interactions (waterslide tuning, send button) keep their clicks.
+        let press = ui.input(|i| i.pointer.any_pressed().then(|| i.pointer.interact_pos()).flatten());
+        if let Some(pos) = press {
+            if ui.max_rect().contains(pos) {
+                *self.clicked = Some(id);
+            }
+        }
         let painter = ui.painter().clone();
         let mut ctx = PanelCtx {
             ui,
@@ -146,7 +158,7 @@ impl<'a> Behavior<Box<dyn Panel>> for Tactical<'a> {
             dt: self.dt,
             bus: self.bus,
             unlocked: self.unlocked,
-            active: id == self.active_tile,
+            active: id == self.focused,
         };
         pane.ui(&mut ctx, block);
         UiResponse::None
@@ -190,8 +202,23 @@ pub struct TreeIds {
     pub root: TileId,
     pub right: TileId,
     pub band: TileId,
-    /// The FT8/Waterfall pane — the one panel that holds keyboard focus for now.
+    /// The four panes, in keyboard-shortcut order (Cmd/Ctrl-1..4).
     pub waterfall: TileId,
+    pub log: TileId,
+    pub contacts: TileId,
+}
+
+impl TreeIds {
+    /// The pane bound to Cmd/Ctrl-`n` (1-based): 1 FT8, 2 Log, 3 Band, 4 Map.
+    pub fn by_number(&self, n: usize) -> Option<TileId> {
+        match n {
+            1 => Some(self.waterfall),
+            2 => Some(self.log),
+            3 => Some(self.band),
+            4 => Some(self.contacts),
+            _ => None,
+        }
+    }
 }
 
 fn build_tree() -> (Tree<Box<dyn Panel>>, TreeIds) {
@@ -217,7 +244,7 @@ fn build_tree() -> (Tree<Box<dyn Panel>>, TreeIds) {
     }
     (
         Tree::new("martian_tree", root, tiles),
-        TreeIds { root, right, band, waterfall },
+        TreeIds { root, right, band, waterfall, log, contacts },
     )
 }
 
@@ -335,23 +362,44 @@ impl eframe::App for App {
                 );
             });
 
+        // Keyboard focus: Cmd/Ctrl-1..4 selects a panel (1 FT8, 2 Log, 3 Band,
+        // 4 Map). `modifiers.command` is Cmd on macOS, Ctrl elsewhere.
+        let focus_num = ctx.input(|i| {
+            if !i.modifiers.command {
+                return None;
+            }
+            [egui::Key::Num1, egui::Key::Num2, egui::Key::Num3, egui::Key::Num4]
+                .iter()
+                .position(|k| i.key_pressed(*k))
+                .map(|idx| idx + 1)
+        });
+        if let Some(id) = focus_num.and_then(|n| self.tree_ids.by_number(n)) {
+            self.focused = id;
+        }
+
         // -------- body: chassis + resizable tile tree --------
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(pal.face_bottom))
             .show_inside(root, |ui| {
                 let painter = ui.painter().clone();
                 paint_chassis(&painter, ui.max_rect(), &pal, &brushed);
+                let mut clicked: Option<TileId> = None;
                 let mut behavior = Tactical {
                     pal: &pal,
                     relief: &relief,
                     dt: dt as f64,
                     bus: &self.view,
                     unlocked: self.edit_mode,
-                    active_tile: self.tree_ids.waterfall,
+                    focused: self.focused,
+                    clicked: &mut clicked,
                 };
                 enforce_min_width(&mut self.tree, self.tree_ids.root, pd::MIN_PANEL_W, pd::VGROOVE_W);
                 pin_band_height(&mut self.tree, &self.tree_ids, pd::VGROOVE_W);
                 self.tree.ui(&mut behavior, ui);
+                // Apply a click-to-focus once the tree has been walked.
+                if let Some(id) = clicked {
+                    self.focused = id;
+                }
             });
 
         self.run_screenshot(&ctx);
@@ -366,11 +414,24 @@ impl App {
     fn top_bar(&mut self, ui: &mut egui::Ui, painter: &egui::Painter, bar: Rect, pal: &Palette) {
         let cy = bar.center().y;
 
-        // ---- identity (far left): spine 3×16 + N0JDC + DN70KA ----
-        let x0 = bar.left() + 14.0;
-        let spine = Rect::from_min_max(Pos2::new(x0, cy - 8.0), Pos2::new(x0 + 3.0, cy + 8.0));
-        painter.rect_filled(spine, CornerRadius::ZERO, pal.accent);
-        let call_x = spine.right() + 8.0;
+        // ---- identity (far left): a 9px accent marker that matches the FT8
+        // panel's focus box (same left edge + width), with the callsign indented
+        // to line up with the FT8 panel's label. ----
+        // The FT8 pane rect comes from the tile layout (previous frame's, which
+        // is fine for a stable layout); fall back to the design inset.
+        let panel_left = match self.tree.tiles.rect(self.tree_ids.waterfall) {
+            // Match the inset block's left edge (the Tactical shrink2(8, _) inset),
+            // where the FT8 header's focus box is drawn.
+            Some(r) => r.left() + 8.0,
+            None => bar.left() + 8.0,
+        };
+        let marker = Rect::from_min_max(
+            Pos2::new(panel_left, cy - 8.0),
+            Pos2::new(panel_left + FOCUS_BOX_SZ, cy + 8.0),
+        );
+        painter.rect_filled(marker, CornerRadius::ZERO, pal.accent);
+        // Callsign left edge == FT8 header label left: focus box (9) + 8px gap.
+        let call_x = panel_left + FOCUS_BOX_SZ + 8.0;
         let call = tracked("N0JDC");
         engraved_text(
             painter,
