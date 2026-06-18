@@ -4,6 +4,41 @@ Running notes, gotchas, and reminders. Newest at the top.
 
 ## 2026-06-18
 
+- **Idea: a "radio configuration check" easter egg.** The mic-vs-USB saga below would
+  have been a 5-second diagnosis if DM420 could *audit the rig's setup* and tell the
+  operator exactly what's wrong. Proposal: a hidden self-test (an easter egg — e.g. a
+  key combo or a `/checkrig` slash command) that reads the rig over CAT and prints a
+  pass/fail checklist with the precise fix for each miss, e.g. *"Menu 63 = ACC2 → set to
+  USB"*, *"not in DATA mode"*, *"USB input level (Menu 64) = 0"*.
+  - **What's already readable:** mode + TX state from `IF`, mode from `MD`, the data-mode
+    flag from `DA` (the driver issues these today). Menu items (63/64, and the SG's
+    69/70/71) would need the **`EX` menu-read** CAT command — exact byte format TBD from
+    the TS-590S PC Command Reference; it's a *read*, so the check stays non-destructive.
+  - **Why "easter egg":** keep it playful and out of the main flow — a self-test the
+    operator can invoke when TX looks wrong, not a nag. Model-specific menu numbers (S vs
+    SG) mean the check needs a small per-model table, or it can just report the raw
+    `EX` values and the expected one.
+
+- **Rig transmitted from the MIC, not the USB audio — root cause + fix (done; needs on-air test):**
+  the rig kept up but modulated the front mic even in USB-DATA mode, and DM420's own
+  diagnostic confirmed it *was* playing FT8 to the "USB Audio CODEC" output — so the
+  audio path was fine and the fault was the **keying command**. DM420's CAT driver keyed
+  with bare `TX` (= `TX0`), which is the **mic SEND** route. Per the TS-590S USB Audio
+  manual §4.2: *"the [SEND] keys... are the method for transmitting audio input to the
+  microphone, so even if these operations are implemented, audio entered as audio
+  signals from USB cannot be transmitted."* USB audio transmits only via **DATA SEND** —
+  whose CAT equivalent is **`TX1`**. Fix: `catrig::set_ptt` now keys with `TX1` (rear/data
+  route); key-down stays `RX`. The mock keys off the first two chars so it's unaffected.
+  - **Rig menus still required (one-time, TS-590S):** **Menu 63 = USB** ("audio input
+    line selection for data"; default is **ACC2**, so USB modulation is silent until you
+    change it) and **Menu 64** ("audio level of USB input for data", 0–9) non-zero. RX
+    decode over USB works regardless of Menu 63, so it can still be on ACC2 — set it.
+    (On the **TS-590SG** the same two are **Menu 69** and **Menu 71**; the SG also has a
+    Menu 70 FRONT/REAR, but `TX1`/DATA SEND bypasses it.)
+  - **Maybe next:** have DM420 set the rig to USB-DATA itself (it currently never sends
+    `MD`/`DA` and drops the data-mode flag in `rig_adapter::apply`), so you don't set the
+    mode by hand. Menu 63/64 are rig-config, not CAT-settable in the normal command set.
+
 - **Transmit Steps 1 + 2 — auto-sequenced TX behind an opt-in flag (done; needs on-air test):**
   the PTT interlock granter (single-holder token + TTL) and the full audio-TX path
   (synthesize FT8 → key → play → re-key inside the 10 s watchdog → key down →

@@ -68,6 +68,10 @@ pub fn list_devices() -> Result<Vec<DeviceInfo>, AudioError> {
                 looks_like_radio: is_radio_codec(&name),
             });
         }
+        // Output entry when cpal can enumerate an output config. cpal can't
+        // enumerate a USB codec's output even though it streams fine, so also list a
+        // radio codec as an output (deduped) — the player opens it with an assumed
+        // config.
         if let Some((rate, channels)) = probe_config(&device, DeviceKind::Output) {
             out.push(DeviceInfo {
                 name: name.clone(),
@@ -76,6 +80,19 @@ pub fn list_devices() -> Result<Vec<DeviceInfo>, AudioError> {
                 channels,
                 is_default: Some(&name) == default_out.as_ref(),
                 looks_like_radio: is_radio_codec(&name),
+            });
+        } else if is_radio_codec(&name)
+            && !out
+                .iter()
+                .any(|d| d.kind == DeviceKind::Output && d.name == name)
+        {
+            out.push(DeviceInfo {
+                name: name.clone(),
+                kind: DeviceKind::Output,
+                sample_rate: 48_000,
+                channels: 2,
+                is_default: false,
+                looks_like_radio: true,
             });
         }
     }
@@ -180,6 +197,10 @@ pub(crate) fn open_cpal_device(
             let needle = n.to_lowercase();
             let mut name_matched = 0u32;
             let mut substring: Option<cpal::Device> = None;
+            // cpal can't enumerate a USB codec's output even though it streams fine;
+            // keep the codec's output sibling (matching name, not input-capable) as a
+            // fallback when nothing reports the requested capability.
+            let mut codec_fallback: Option<cpal::Device> = None;
             for d in host
                 .devices()
                 .map_err(|e| AudioError::Device(e.to_string()))?
@@ -193,7 +214,15 @@ pub(crate) fn open_cpal_device(
                 }
                 name_matched += 1;
                 if !supports_kind(&d, kind) {
-                    debug!(name = %dn, ?kind, "skipping matched device without {kind:?} support");
+                    if kind == DeviceKind::Output
+                        && is_radio_codec(&dn)
+                        && !supports_kind(&d, DeviceKind::Input)
+                        && codec_fallback.is_none()
+                    {
+                        codec_fallback = Some(d);
+                    } else {
+                        debug!(name = %dn, ?kind, "skipping matched device without {kind:?} support");
+                    }
                     continue;
                 }
                 if exact {
@@ -205,7 +234,7 @@ pub(crate) fn open_cpal_device(
                     substring = Some(d);
                 }
             }
-            substring.ok_or_else(|| {
+            substring.or(codec_fallback).ok_or_else(|| {
                 AudioError::Device(if name_matched > 0 {
                     format!("audio device matching '{n}' exists but has no {kind:?} streams")
                 } else {

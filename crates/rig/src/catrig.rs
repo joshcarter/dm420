@@ -51,7 +51,12 @@ impl<C: CatChannel> Rig for CatRig<C> {
     }
 
     fn set_ptt(&mut self, tx: bool) -> Result<(), RigError> {
-        let cmd = if tx { "TX" } else { "RX" };
+        // `TX1` keys the **rear/data** audio route (USB/ACC2); bare `TX` (= `TX0`)
+        // keys the front **mic** route. DM420 is a digital-mode app, so the data
+        // route is always what we want — keying it is what makes the rig modulate
+        // the USB audio we play, independent of the rig's "source of SEND/PTT"
+        // (FRONT/REAR) menu. Key-down (`RX`) is route-independent.
+        let cmd = if tx { "TX1" } else { "RX" };
         self.ch.exchange(cmd, Expect::NoReply)?;
         Ok(())
     }
