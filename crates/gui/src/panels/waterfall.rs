@@ -17,7 +17,7 @@ use crate::panel_data as pd;
 use crate::send::{Activation, Command, SendState};
 use crate::settings::{DEFAULT_BAUD, HardwareConfig, KENWOOD_BAUDS};
 use crate::theme::*;
-use crate::waterslide_panel::{WaterslidePanel, WaterslideTheme};
+use crate::waterslide_panel::{Target, WaterslidePanel, WaterslideTheme, target_call};
 
 /// SNR like the rest of the console: Unicode minus, two digits.
 fn fmt_snr(snr: i8) -> String {
@@ -368,8 +368,24 @@ impl Panel for Waterfall {
                         &cmap,
                     );
                     // Left half: decodes sliding left from centre, drawn over the
-                    // spectrogram (graticule, NOW line, and Hz labels included).
-                    draw_waterslide(painter, body, pal, &ctx.bus.recent_decodes(64), now_ms);
+                    // spectrogram (graticule, NOW line, and Hz labels included). A
+                    // click selects a station/offset; feed it to the send row's target.
+                    let outgoing = self.slide.outgoing().clone();
+                    let armed = ctx
+                        .bus
+                        .qso_state()
+                        .map(|s| !matches!(s.phase, QsoPhase::Idle))
+                        .unwrap_or(false);
+                    let tx = TxLane {
+                        target: &outgoing,
+                        bandwidth_hz: signal_bandwidth_hz(ctx.bus.current_config().protocol),
+                        armed,
+                    };
+                    if let Some(t) =
+                        draw_waterslide(ctx.ui, body, pal, &ctx.bus.recent_decodes(64), now_ms, tx)
+                    {
+                        self.slide.set_outgoing(t);
+                    }
                     ctx.ui
                         .ctx()
                         .request_repaint_after(std::time::Duration::from_millis(33));
@@ -401,6 +417,16 @@ impl Panel for Waterfall {
 
 /// Audio-offset axis span (Hz): FT8/FT4 decodes land in roughly 0..3000 Hz.
 const WS_MAX_HZ: f32 = 3000.0;
+
+/// Occupied bandwidth (Hz) of one transmission in the given mode — `num_tones ×
+/// tone_spacing` (FT8: 8 × 6.25 ≈ 50 Hz; FT4: 4 × 20.83 ≈ 83 Hz). Used to size
+/// the outgoing-frequency lane so it matches a real signal's footprint.
+fn signal_bandwidth_hz(protocol: Protocol) -> f32 {
+    match protocol {
+        Protocol::Ft8 => 50.0,
+        Protocol::Ft4 => 83.0,
+    }
+}
 
 /// Internal spectrogram texture: width = history columns, height = frequency bins.
 const SPECTRO_COLS: usize = 512;
@@ -516,18 +542,63 @@ impl Spectrogram {
 /// (~15 s); a smaller value scrolls faster, a larger one shows more history.
 const WS_HISTORY_SECS: f32 = 45.0;
 
+/// Decode-text size on the waterslide scales with pane height, clamped to this
+/// band: `MIN_FONT_PT` (the app-wide floor) up to `WS_MSG_FONT_MAX`. The size is
+/// tuned against `WS_REF_H` — at that pane height the message renders at 12 pt.
+const WS_MSG_FONT_MAX: f32 = 12.0;
+const WS_REF_H: f32 = 460.0;
+
+/// A decode positioned on the waterslide. `true_y` is the audio-offset lane (the
+/// frequency the signal actually sits on); `final_y` is where the text is drawn
+/// after de-collision. Click-to-tune must read `true_y`/the offset, never `final_y`.
+struct Placed {
+    idx: usize, // index into the `decodes` slice
+    x: f32,
+    true_y: f32,
+    final_y: f32,
+    slot: i64, // decode timestamp (FT8 slot start) — decodes sharing one form a column
+}
+
+/// The next-TX lane overlaid on the waterslide: where it sits (`target`), how
+/// wide the on-air signal is (`bandwidth_hz`), and whether we're armed to
+/// transmit — which tints it cyan (armed) vs amber (idle), mirroring SEND/STOP.
+struct TxLane<'a> {
+    target: &'a Target,
+    bandwidth_hz: f32,
+    armed: bool,
+}
+
 /// The "waterslide" decode view: each decode placed by audio offset (vertical)
 /// and age (horizontal), newest at the centre NOW line and sliding left as it
 /// ages. The right (FFT) half is left blank until a spectrum producer is wired.
 /// Fed by `BusView::recent_decodes`, i.e. the real decoder's bus stream.
+///
+/// `tx` is the current next-TX target, drawn as a lane so the operator sees
+/// where/whom they're set to call. Returns `Some(target)` when the operator
+/// clicked: a decoded line snaps to that station (call + its true audio offset),
+/// priming a reply; bare spectrum snaps to a plain offset. The snap always reads
+/// the decode's *true* audio offset, never the de-collided text position.
 fn draw_waterslide(
-    painter: &egui::Painter,
+    ui: &egui::Ui,
     rect: Rect,
     pal: &Palette,
     decodes: &[Decode],
     now_ms: i64,
-) {
-    let painter = painter.with_clip_rect(rect);
+    tx: TxLane,
+) -> Option<Target> {
+    // A click anywhere in the body tunes the next TX; landing on a decoded line
+    // snaps to that station. The cursor hints the lane is interactive.
+    let resp = ui
+        .interact(rect, ui.id().with("ws_live_tune"), egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    let click_pos = resp.clicked().then(|| resp.interact_pointer_pos()).flatten();
+    // A click that hits a decoded line records (call, true-offset); resolved after
+    // the draw loop has the text rects to hit-test against.
+    let mut snap: Option<(Option<String>, i32)> = None;
+
+    // Same layer as `ctx.painter` (which is `ui.painter().clone()`) and the
+    // spectrogram drawn just before — clipped to the body rect.
+    let painter = ui.painter_at(rect);
     let now_x = rect.center().x; // the NOW line
     let left_w = (now_x - rect.left()).max(1.0);
     let pps = left_w / WS_HISTORY_SECS; // pixels per second of history
@@ -552,9 +623,25 @@ fn draw_waterslide(
         );
     }
 
-    // Decodes: newest at NOW, older to the left. Each message is left-aligned so
-    // it starts at its decode time and reads rightward; the SNR sits just to its left.
-    for d in decodes {
+    // Text size scales with pane height but is clamped to a readable band, so a
+    // tall pane doesn't bloat it and a short one doesn't shrink it past legibility
+    // (`MIN_FONT_PT` is the app-wide floor — see `theme.rs`). The de-collision
+    // gap below is keyed to the resulting line height.
+    let msg_pt = (12.0 * rect.height() / WS_REF_H).clamp(MIN_FONT_PT, WS_MSG_FONT_MAX);
+    let snr_pt = (msg_pt - 1.5).max(MIN_FONT_PT);
+    let line_h = msg_pt * 1.25; // minimum vertical spacing between two decode centres
+
+    // The decode/TX offset is the signal's *lowest* tone, so its energy sits
+    // `bandwidth/2` above the offset. Centre the text there to line it up with
+    // the spectrogram trace (and the TX lane). The click target stays the raw
+    // offset (the second pass snaps to `d.offset`), not this visual centre.
+    let half_bw = tx.bandwidth_hz * 0.5;
+
+    // First pass: gather every on-screen decode with its *true* y (the signal's
+    // vertical centre). `final_y` starts equal and is nudged below for legibility;
+    // the true y is kept so we can draw a leader back to it when the text bumps.
+    let mut placed: Vec<Placed> = Vec::new();
+    for (idx, d) in decodes.iter().enumerate() {
         let age = (now_ms - d.t.0) as f32 / 1000.0;
         if age < 0.0 {
             continue; // a clock skew put it in the (blank) future half
@@ -563,25 +650,90 @@ fn draw_waterslide(
         if x < rect.left() {
             continue; // scrolled off the left edge
         }
-        let y = y_of(d.offset.0);
+        let ty = y_of(d.offset.0 + half_bw);
+        placed.push(Placed {
+            idx,
+            x,
+            true_y: ty,
+            final_y: ty,
+            slot: d.t.0,
+        });
+    }
+
+    // De-collide one slot-column at a time: decodes sharing a slot land at the
+    // same x, so two close offsets overlap. We bump them apart *within* the
+    // column (sorted top-down, pushed down by `line_h`, then the whole column
+    // shifted up if it overflows the bottom) — never rearranging across columns,
+    // so the rest of the display stays put (cf. DM780's full-reflow superbrowser).
+    placed.sort_by(|a, b| a.slot.cmp(&b.slot).then(a.true_y.total_cmp(&b.true_y)));
+    let mut i = 0;
+    while i < placed.len() {
+        let slot = placed[i].slot;
+        let mut j = i + 1;
+        while j < placed.len() && placed[j].slot == slot {
+            j += 1;
+        }
+        for k in (i + 1)..j {
+            let floor = placed[k - 1].final_y + line_h;
+            if placed[k].final_y < floor {
+                placed[k].final_y = floor;
+            }
+        }
+        let overflow = placed[j - 1].final_y - (rect.bottom() - line_h * 0.5);
+        if overflow > 0.0 {
+            let top = rect.top() + line_h * 0.5;
+            for p in &mut placed[i..j] {
+                p.final_y = (p.final_y - overflow).max(top);
+            }
+        }
+        i = j;
+    }
+
+    // Second pass: draw. Each message is left-aligned so it starts at its decode
+    // time and reads rightward; the SNR sits just to its left. Both ride `final_y`.
+    let msg_font = mono(msg_pt);
+    let snr_font = mono(snr_pt);
+    for p in &placed {
+        let d = &decodes[p.idx];
         let strong = d.snr_db.map(|s| s > -12).unwrap_or(false);
         let msg_col = if strong { pal.body } else { pal.dim };
         let snr_col = if strong { pal.accent } else { pal.dim };
         let msg_rect = painter.text(
-            Pos2::new(x, y),
+            Pos2::new(p.x, p.final_y),
             Align2::LEFT_CENTER,
             decode_text(d),
-            mono(11.0),
+            msg_font.clone(),
             msg_col,
         );
         let snr = d.snr_db.map(fmt_snr).unwrap_or_else(|| "   ".into());
         painter.text(
-            Pos2::new(msg_rect.left() - 6.0, y),
+            Pos2::new(msg_rect.left() - 6.0, p.final_y),
             Align2::RIGHT_CENTER,
             snr,
-            mono(9.5),
+            snr_font.clone(),
             snr_col,
         );
+        // Clicking this line targets its station, snapping to the *true* audio
+        // offset (`d.offset`), never `final_y`. A free-text line with no callsign
+        // still tunes the offset.
+        if let Some(cp) = click_pos
+            && msg_rect.expand(4.0).contains(cp)
+        {
+            snap = Some((target_call(&decode_text(d)), d.offset.0 as i32));
+        }
+        // Bumped off its lane: draw a faint leader from the true audio centre to
+        // the shifted text so the eye still maps the row to its real frequency.
+        if (p.final_y - p.true_y).abs() > 1.0 {
+            let leader = snr_col.gamma_multiply(0.5);
+            painter.line_segment(
+                [Pos2::new(p.x - 4.0, p.true_y), Pos2::new(p.x - 4.0, p.final_y)],
+                egui::Stroke::new(1.0, leader),
+            );
+            painter.line_segment(
+                [Pos2::new(p.x - 6.0, p.true_y), Pos2::new(p.x - 2.0, p.true_y)],
+                egui::Stroke::new(1.0, leader),
+            );
+        }
     }
 
     // NOW line at the centre.
@@ -592,6 +744,51 @@ fn draw_waterslide(
         ],
         egui::Stroke::new(2.0, pal.accent),
     );
+
+    // Outgoing-frequency lane (matches the mock-mode indicator): a translucent
+    // full-width band with bright rules top and bottom. It spans
+    // [offset, offset + bandwidth] — the decode/TX offset is the signal's
+    // *lowest* tone, so the energy sits above it (FT8 ≈ 50 Hz, FT4 ≈ 83 Hz);
+    // basing the band there lines it up with the traffic on the spectrogram.
+    // Cyan while armed to transmit, amber otherwise — same convention as
+    // SEND/STOP. Labelled with the station being called (or a bare offset).
+    let lane = if tx.armed { pal.accent2 } else { pal.accent };
+    let off = tx.target.off() as f32;
+    let bottom = y_of(off);
+    let top = y_of(off + tx.bandwidth_hz).min(bottom - 3.0); // floor at 3px so it stays visible
+    let band = Rect::from_min_max(Pos2::new(rect.left(), top), Pos2::new(rect.right(), bottom));
+    painter.rect_filled(band, 0.0, lane.gamma_multiply(0.10));
+    painter.line_segment(
+        [band.left_top(), band.right_top()],
+        egui::Stroke::new(1.5, lane),
+    );
+    painter.line_segment(
+        [band.left_bottom(), band.right_bottom()],
+        egui::Stroke::new(1.5, lane),
+    );
+    let tx_label = match tx.target {
+        Target::Station { call, off } => format!("\u{25B6} {call}  {off} Hz"),
+        Target::Offset(off) => format!("\u{25B6} TX {off} Hz"),
+    };
+    painter.text(
+        Pos2::new(rect.left() + 4.0, band.top() - 1.0),
+        Align2::LEFT_BOTTOM,
+        tx_label,
+        snr_font,
+        lane,
+    );
+
+    // Resolve a click into the new outgoing target: a decoded line becomes a
+    // Station (prime a reply to that call); empty spectrum becomes a bare Offset
+    // read off the vertical position. Offsets are clamped to the visible axis.
+    click_pos.map(|cp| match snap {
+        Some((Some(call), off)) => Target::Station { call, off },
+        Some((None, off)) => Target::Offset(off),
+        None => {
+            let off = ((rect.bottom() - cp.y) / rect.height() * WS_MAX_HZ).round();
+            Target::Offset(off.clamp(0.0, WS_MAX_HZ) as i32)
+        }
+    })
 }
 
 // =====================================================================

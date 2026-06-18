@@ -177,7 +177,7 @@ impl Target {
 /// The station a decoded line refers to: the sender's callsign, which is the
 /// second whitespace token in every FT8 message form we generate — `CQ <call>
 /// <grid>` and `<to> <from> …` both put the station-of-interest at index 1.
-fn target_call(msg: &str) -> Option<String> {
+pub(crate) fn target_call(msg: &str) -> Option<String> {
     msg.split_whitespace().nth(1).map(str::to_owned)
 }
 
@@ -214,6 +214,13 @@ impl WaterslidePanel {
     /// send row to render and address.
     pub fn outgoing(&self) -> &Target {
         &self.outgoing
+    }
+
+    /// Set the outgoing target. Used by the live (real-mode) waterslide, whose
+    /// click handling lives in `panels::waterfall::draw_waterslide` rather than
+    /// this panel's own `ui`, to feed the clicked decode/offset back to the send row.
+    pub fn set_outgoing(&mut self, target: Target) {
+        self.outgoing = target;
     }
 
     /// Map an audio offset (Hz) to a vertical position in 0..H design space.
@@ -305,6 +312,11 @@ impl WaterslidePanel {
         // `sy` alone bloats them, keying to `sx`/min shrinks them too far. The
         // geometric mean is the area-preserving uniform scale — the middle ground.
         let fscale = (sx * sy).sqrt();
+        // Clamp the scaled sizes to a readable band: never below the app-wide
+        // floor, never large enough to swamp a small pane. `MIN_FONT_PT` is the
+        // shared floor (see `theme.rs`); the de-collision in `waterslide_sim`
+        // assumes a comparable line height.
+        let pt = |base: f32| (base * fscale).clamp(crate::theme::MIN_FONT_PT, base + 2.0);
 
         // Interaction: a click tunes the outgoing (next-TX) audio frequency.
         // A click landing on a decoded line snaps to that station's offset
@@ -350,7 +362,7 @@ impl WaterslidePanel {
                     p(X_FFT_R - 8.0, y - 3.0),
                     Align2::RIGHT_BOTTOM,
                     label,
-                    FontId::monospace(9.0 * fscale),
+                    FontId::monospace(pt(9.0)),
                     theme.legend,
                 );
             }
@@ -376,7 +388,7 @@ impl WaterslidePanel {
                 pos,
                 Align2::RIGHT_CENTER,
                 &rec.msg,
-                FontId::monospace(12.0 * fscale),
+                FontId::monospace(pt(12.0)),
                 theme.text,
             );
             let msg_w = msg_rect.width();
@@ -392,7 +404,7 @@ impl WaterslidePanel {
                 snr_pos,
                 Align2::RIGHT_CENTER,
                 sgn(rec.rsnr),
-                FontId::monospace(10.5 * fscale),
+                FontId::monospace(pt(10.5)),
                 snr_col,
             );
         }
@@ -442,7 +454,7 @@ impl WaterslidePanel {
             p(X_FFT_L + 4.0, oy),
             Align2::LEFT_CENTER,
             tx_label,
-            FontId::monospace(9.0 * fscale),
+            FontId::monospace(pt(9.0)),
             theme.accent,
         );
 

@@ -31,6 +31,13 @@ pub fn mono(size: f32) -> FontId {
     FontId::new(size, FontFamily::Monospace)
 }
 
+/// App-wide floor for any text whose size is *computed at runtime* (e.g. the
+/// waterslide decode lanes, or log-book rows scaled to a small pane). Below this
+/// our monospace data text stops being readable, so every size-scaling call
+/// clamps to this value. Fixed-size legends don't need it — they're authored
+/// above the floor already.
+pub const MIN_FONT_PT: f32 = 8.0;
+
 // ---------------------------------------------------------------------------
 // Geometry tokens (logical px). Ratios matter more than exact values.
 // ---------------------------------------------------------------------------

@@ -10,18 +10,6 @@ transmit--currently a hard window, something like 1000-2000Hz.
 
 FT4/FT8 mode switch. Also switch calling frequency for each band.
 
-Waterslide view: as signals get decoded, we may need to shift the
-vertical position of decodes when their text won't render cleanly
-because of adjacent signals. We may need to bump the position of a
-decode up/down so they are all readable--but without completely
-rearranging all the decodes as DM780's "superbrowser" would do.
-IMPORTANT: click to select signal must select the actual audio center,
-not including any text shift factor.
-
-Waterslide view: related to signal decode text not stepping on each
-other, we need to control the text size. Set a reasonable min/max font
-size. Min font size may need to be app-wide, e.g. for log book.
-
 Waterslide view: indicator for unworked station calling CQ. (Highlight
 using cyan secondary accent color?)
 
@@ -50,6 +38,8 @@ Unlocked view should show the keyboard shortcut for each panel.
 
 
 # Optional
+
+Shared multi-operator notebook panel. Freeform text box.
 
 Consider: as audio is being received, use the signal intenity to guess
 where a FT4/FT8 decode will occur, and do a Matrix-style "scrolling
