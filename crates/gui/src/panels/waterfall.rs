@@ -89,8 +89,10 @@ impl Waterfall {
     /// armed state). The box is not a free text field: only `/`/`:` (start a slash
     /// command) and Enter (activate the button) are accepted; see `send.rs`.
     fn draw_send_row(&mut self, ctx: &mut PanelCtx, row: Rect) {
-        // The operator's configured station identity (top-bar, env-seeded).
+        // The operator's configured station identity. There is no default, so gate
+        // operating until a callsign is set (top bar when unlocked, or dm420.toml).
         let (mycall, mygrid) = (ctx.call, ctx.grid);
+        let call_set = !mycall.trim().is_empty();
 
         // Keyboard: only the active panel acts on typed input / Enter. `/` or `:`
         // begins a slash command; Backspace/Escape edit/abort it; Enter activates
@@ -154,6 +156,8 @@ impl Waterfall {
         // message > the local preview.
         let display = if self.send.entering {
             self.send.buf.clone()
+        } else if !call_set {
+            "SET CALLSIGN — unlock (GUI ▸ EDIT) or set dm420.toml".to_string()
         } else if let Some(text) = qso
             .as_ref()
             .and_then(|s| s.next_tx.as_ref())
@@ -185,7 +189,13 @@ impl Waterfall {
         // Scan-style lit key (lcd track + key_cell), sized to its label. SEND when
         // idle; STOP once the engine is armed/calling/in an exchange (the single
         // Stop control).
-        let btn_label = if active_qso { "STOP" } else { "SEND" };
+        let btn_label = if !call_set {
+            "SET CALL"
+        } else if active_qso {
+            "STOP"
+        } else {
+            "SEND"
+        };
         let cell_w = measure(painter, &tracked(btn_label), heading_bold(9.0)) + 22.0;
         let track_w = cell_w + 4.0;
         let track = Rect::from_min_max(
@@ -244,7 +254,10 @@ impl Waterfall {
                     self.vfo_override_hz = Some((mhz * 1_000_000.0).round() as u64);
                 }
                 Activation::Toggle => {
-                    if active_qso {
+                    if !call_set {
+                        // No station callsign yet — operating is blocked until one
+                        // is set (top bar when unlocked, or dm420.toml).
+                    } else if active_qso {
                         ctx.bus.abort_qso();
                     } else if let Some(call) = &sel_call {
                         ctx.bus.answer_station(sel_off, call.clone(), sel_slot);

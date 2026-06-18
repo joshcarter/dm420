@@ -23,7 +23,7 @@
 //! - `DM420_CALLSIGN` — the operator's station call sign (default `N0JDC`).
 //! - `DM420_GRID` — the operator's Maidenhead grid locator (default `DN70KA`).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use app_core::{CoreConfig, DecodeSource, LineProfile, Protocol, SerialConfig};
 
@@ -57,16 +57,41 @@ pub struct Station {
 }
 
 impl Station {
-    /// Read `DM420_CALLSIGN` / `DM420_GRID`, falling back to the project's home
-    /// station. Both are upper-cased to FT8/Maidenhead convention.
-    pub fn from_env() -> Self {
+    /// Load the operator's station identity, in precedence order: the
+    /// `DM420_CALLSIGN` / `DM420_GRID` env vars → the `[station]` table in
+    /// `dm420.toml` (current dir) → unset. **There is no default** — a silent one
+    /// risks transmitting as the wrong station. Operating is blocked until a call
+    /// is set (typed into the unlocked top bar, or written to `dm420.toml`). The
+    /// config format/persistence is interim and TBD — see `joels-notes.md`.
+    pub fn load() -> Self {
+        let (toml_call, toml_grid) = read_station_config(Path::new("dm420.toml"));
         Station {
             call: env_nonempty("DM420_CALLSIGN")
-                .unwrap_or_else(|| "N0JDC".into())
+                .or(toml_call)
+                .unwrap_or_default()
                 .to_uppercase(),
             grid: env_nonempty("DM420_GRID")
-                .unwrap_or_else(|| "DN70KA".into())
+                .or(toml_grid)
+                .unwrap_or_default()
                 .to_uppercase(),
+        }
+    }
+
+    /// Whether a callsign has been set. Operating (CQ/answer/TX/log) is gated on
+    /// this, since without it we'd identify as a blank/incorrect station.
+    pub fn is_set(&self) -> bool {
+        !self.call.trim().is_empty()
+    }
+
+    /// Persist the current identity to `dm420.toml`, preserving comments and any
+    /// other content. Called on GUI re-lock so UI edits survive a restart; write
+    /// errors are logged, not fatal.
+    pub fn save(&self) {
+        let path = Path::new("dm420.toml");
+        let existing = std::fs::read_to_string(path).ok();
+        let text = update_station_config(existing.as_deref(), &self.call, &self.grid);
+        if let Err(e) = std::fs::write(path, &text) {
+            eprintln!("dm420: could not write {}: {e}", path.display());
         }
     }
 
@@ -162,6 +187,145 @@ fn env_nonempty(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.is_empty())
 }
 
+/// Read the interim station config file and return its `(callsign, grid)`.
+fn read_station_config(path: &Path) -> (Option<String>, Option<String>) {
+    match std::fs::read_to_string(path) {
+        Ok(text) => parse_station_config(&text),
+        Err(_) => (None, None),
+    }
+}
+
+/// Pull `callsign` / `grid` from a `[station]` table. **Not** a full TOML parser —
+/// it deliberately avoids adding a dependency for a format that is still TBD (see
+/// `joels-notes.md`); swap in the `toml` crate when the config grows.
+fn parse_station_config(text: &str) -> (Option<String>, Option<String>) {
+    let (mut call, mut grid) = (None, None);
+    let mut in_station = false;
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(table) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            in_station = table.trim() == "station";
+            continue;
+        }
+        if !in_station {
+            continue;
+        }
+        if let Some((key, val)) = line.split_once('=') {
+            let val = val.trim().trim_matches('"').trim();
+            if val.is_empty() {
+                continue;
+            }
+            match key.trim() {
+                "callsign" | "call" => call = Some(val.to_string()),
+                "grid" => grid = Some(val.to_string()),
+                _ => {}
+            }
+        }
+    }
+    (call, grid)
+}
+
+/// Rewrite `dm420.toml` content to carry `call`/`grid`, **preserving comments** and
+/// every other line: existing `callsign`/`grid` in `[station]` are updated in place
+/// (inline comments kept), any missing key is appended to the table, and a
+/// `[station]` table — or the whole file — is created if absent. Pairs with
+/// [`parse_station_config`]; a real `toml_edit` swap-in would subsume both.
+fn update_station_config(existing: Option<&str>, call: &str, grid: &str) -> String {
+    let Some(text) = existing else {
+        return default_station_toml(call, grid);
+    };
+    let mut out: Vec<String> = Vec::new();
+    let mut in_station = false;
+    let mut seen_station = false;
+    let mut wrote_call = false;
+    let mut wrote_grid = false;
+    let mut insert_at: Option<usize> = None; // after the last meaningful [station] line
+
+    for raw in text.lines() {
+        let code = raw.split('#').next().unwrap_or("").trim();
+        if let Some(table) = code.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            in_station = table.trim() == "station";
+            seen_station |= in_station;
+            out.push(raw.to_string());
+            if in_station {
+                insert_at = Some(out.len());
+            }
+            continue;
+        }
+        if in_station {
+            match code.split_once('=').map(|(k, _)| k.trim()) {
+                Some("callsign") | Some("call") => {
+                    out.push(rewrite_kv(raw, call));
+                    wrote_call = true;
+                }
+                Some("grid") => {
+                    out.push(rewrite_kv(raw, grid));
+                    wrote_grid = true;
+                }
+                _ => out.push(raw.to_string()),
+            }
+            if !raw.trim().is_empty() {
+                insert_at = Some(out.len());
+            }
+            continue;
+        }
+        out.push(raw.to_string());
+    }
+
+    let mut missing = Vec::new();
+    if !wrote_call {
+        missing.push(format!("callsign = \"{call}\""));
+    }
+    if !wrote_grid {
+        missing.push(format!("grid = \"{grid}\""));
+    }
+    if !missing.is_empty() {
+        if let (true, Some(at)) = (seen_station, insert_at) {
+            for (i, line) in missing.into_iter().enumerate() {
+                out.insert(at + i, line);
+            }
+        } else {
+            if out.last().is_some_and(|l| !l.trim().is_empty()) {
+                out.push(String::new());
+            }
+            out.push("[station]".to_string());
+            out.extend(missing);
+        }
+    }
+
+    let mut s = out.join("\n");
+    s.push('\n');
+    s
+}
+
+/// Rewrite a `key = value` line with a new quoted value, preserving the key, its
+/// spacing, and any trailing inline comment.
+fn rewrite_kv(raw: &str, new_val: &str) -> String {
+    let Some(eq) = raw.find('=') else {
+        return raw.to_string();
+    };
+    let prefix = &raw[..=eq];
+    let post = &raw[eq + 1..];
+    match post.find('#') {
+        Some(h) => format!("{prefix} \"{new_val}\"  {}", post[h..].trim_end()),
+        None => format!("{prefix} \"{new_val}\""),
+    }
+}
+
+/// A fresh `dm420.toml` with explanatory comments, when no file exists yet.
+fn default_station_toml(call: &str, grid: &str) -> String {
+    format!(
+        "# DM420 station identity — written from the UI; safe to hand-edit.\n\
+         # No built-in default: DM420 won't call CQ or answer until a callsign is set.\n\n\
+         [station]\n\
+         callsign = \"{call}\"\n\
+         grid = \"{grid}\"\n"
+    )
+}
+
 fn serial_from_env() -> SerialConfig {
     let port = env_nonempty("DM420_SERIAL_PORT");
 
@@ -217,5 +381,70 @@ fn wav_from_env() -> Option<PathBuf> {
             p.display()
         );
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_station_table_with_comments() {
+        let cfg = "# header\n[station]\ncallsign = \"w4ll\"  # my call\ngrid = \"EM73\"\n";
+        let (call, grid) = parse_station_config(cfg);
+        assert_eq!(call.as_deref(), Some("w4ll"));
+        assert_eq!(grid.as_deref(), Some("EM73"));
+    }
+
+    #[test]
+    fn ignores_other_tables_and_blank_values() {
+        let cfg = "[other]\ncallsign = \"X\"\n\n[station]\ngrid = \"\"\n";
+        let (call, grid) = parse_station_config(cfg);
+        assert_eq!(call, None, "a callsign under [other] must not leak in");
+        assert_eq!(grid, None, "an empty value is treated as unset");
+    }
+
+    #[test]
+    fn empty_config_is_unset() {
+        assert_eq!(parse_station_config(""), (None, None));
+    }
+
+    #[test]
+    fn update_preserves_comments_and_round_trips() {
+        let original = "# top\n[station]\ncallsign = \"OLD\"  # my call\ngrid = \"AA00\"\n";
+        let updated = update_station_config(Some(original), "W4LL", "EM73");
+        assert!(
+            updated.contains("callsign = \"W4LL\"  # my call"),
+            "inline comment kept: {updated}"
+        );
+        assert!(updated.contains("# top"), "header comment kept: {updated}");
+        assert_eq!(
+            parse_station_config(&updated),
+            (Some("W4LL".to_string()), Some("EM73".to_string()))
+        );
+    }
+
+    #[test]
+    fn update_appends_missing_keys_and_table() {
+        // Missing grid in an existing table → appended.
+        let a = update_station_config(Some("[station]\ncallsign = \"X\"\n"), "X", "EM73");
+        assert_eq!(
+            parse_station_config(&a),
+            (Some("X".to_string()), Some("EM73".to_string()))
+        );
+        // No file → fresh template.
+        let b = update_station_config(None, "W4LL", "EM73");
+        assert!(b.contains("[station]"));
+        assert_eq!(
+            parse_station_config(&b),
+            (Some("W4LL".to_string()), Some("EM73".to_string()))
+        );
+        // File without a [station] table → table appended, existing note kept.
+        let c = update_station_config(Some("# just a note\n"), "W4LL", "EM73");
+        assert!(c.contains("# just a note"));
+        assert_eq!(
+            parse_station_config(&c),
+            (Some("W4LL".to_string()), Some("EM73".to_string()))
+        );
     }
 }

@@ -41,11 +41,13 @@ impl App {
         let dark = std::env::var("MARTIAN_LIGHT").is_err();
         let (tree, tree_ids) = build_tree();
         let focused = tree_ids.waterfall; // FT8 panel holds focus at startup
-        let station = Station::from_env();
+        let station = Station::load();
         let view = BusView::start(egui_ctx.clone(), station.to_qso_config());
         Self {
             dark,
-            edit_mode: false,
+            // No default callsign: when the station identity isn't set yet, boot
+            // straight into config (unlocked) so the operator is prompted for it.
+            edit_mode: !station.is_set(),
             station,
             tree,
             tree_ids,
