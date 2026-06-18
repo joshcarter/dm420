@@ -4,8 +4,8 @@
 use eframe::egui;
 use egui::{Align2, Color32, ColorImage, Pos2, Rect, TextureHandle, TextureOptions};
 use types::{
-    Decode, DecodeContent, HealthState, ParsedMessage, QsoPhase, SpectrumRow, SubsystemHealth,
-    SubsystemId,
+    Decode, DecodeContent, HealthState, ParsedMessage, QsoPhase, SlotId, SpectrumRow,
+    SubsystemHealth, SubsystemId,
 };
 
 use app_core::{LineProfile, Protocol, SerialConfig};
@@ -17,7 +17,7 @@ use crate::panel_data as pd;
 use crate::send::{Activation, Command, SendState};
 use crate::settings::{DEFAULT_BAUD, HardwareConfig, KENWOOD_BAUDS};
 use crate::theme::*;
-use crate::waterslide_panel::{WaterslidePanel, WaterslideTheme};
+use crate::waterslide_panel::{Target, WaterslidePanel, WaterslideTheme};
 
 /// SNR like the rest of the console: Unicode minus, two digits.
 fn fmt_snr(snr: i8) -> String {
@@ -41,6 +41,19 @@ fn decode_text(d: &Decode) -> String {
     }
 }
 
+/// The real-mode click selection tracked by the panel. The live waterslide is
+/// draw-only (the mock sim's `ui()` owns selection in mock mode), so in real mode
+/// the panel records the clicked target itself.
+#[derive(Clone)]
+struct RealSel {
+    /// Outgoing TX audio offset (Hz, absolute 0..3000) — where the next CQ/answer
+    /// transmits. Kept distinct from the dial/centre frequency.
+    offset: f32,
+    /// The station to work (its base call + the slot its decode landed in, for the
+    /// real `DecodeRef`) when a decoded line was clicked rather than bare spectrum.
+    target: Option<(String, SlotId)>,
+}
+
 pub struct Waterfall {
     slide: WaterslidePanel,
     spectro: Spectrogram,
@@ -51,6 +64,8 @@ pub struct Waterfall {
     /// Dial frequency set via the `/f` command (MHz→Hz), shown in the header in
     /// place of the rig readout. Mock feedback until rig wiring lands.
     vfo_override_hz: Option<u64>,
+    /// Real-mode selection (offset + optional station). Mock mode reads `slide`.
+    real_sel: RealSel,
 }
 
 impl Waterfall {
@@ -61,6 +76,10 @@ impl Waterfall {
             form: ConfigForm::default(),
             send: SendState::default(),
             vfo_override_hz: None,
+            real_sel: RealSel {
+                offset: 1500.0,
+                target: None,
+            },
         }
     }
 
@@ -102,10 +121,30 @@ impl Waterfall {
             }
         }
 
+        // Where we're pointed. In real mode the panel owns the click selection (the
+        // live waterslide is draw-only); in mock mode the sim does. Resolve to a TX
+        // offset, the station to work (if a decoded line was clicked), and that
+        // decode's slot (threaded into the real `DecodeRef`).
+        let (sel_off, sel_call, sel_slot) = if ctx.bus.is_real() {
+            match &self.real_sel.target {
+                Some((call, slot)) => (self.real_sel.offset, Some(call.clone()), *slot),
+                None => (self.real_sel.offset, None, SlotId(0)),
+            }
+        } else {
+            let t = self.slide.outgoing();
+            (t.off() as f32, t.station().map(str::to_string), SlotId(0))
+        };
+
         // Keep the buffer mirroring the would-be next message as a preview (unless
         // mid-command); the engine's authored message takes over once it's running.
-        let target = self.slide.outgoing().clone();
-        self.send.refresh_auto(&target, mycall, mygrid);
+        let preview = match &sel_call {
+            Some(call) => Target::Station {
+                call: call.clone(),
+                off: sel_off as i32,
+            },
+            None => Target::Offset(sel_off as i32),
+        };
+        self.send.refresh_auto(&preview, mycall, mygrid);
 
         // Live QSO-engine state drives the display and the button.
         let qso = ctx.bus.qso_state();
@@ -196,8 +235,9 @@ impl Waterfall {
 
         // Enter or a button click activates: apply a slash command, else toggle
         // the engine. Toggle resolves against the live phase: abort if the engine
-        // is busy, otherwise arm — answer the selected station, or call CQ on bare
-        // spectrum. Offsets carry the sign the waterslide uses (audio offset Hz).
+        // is busy, otherwise arm — answer the selected station (threading its real
+        // slot), or call CQ on bare spectrum. The offset/target come from the
+        // resolved selection above (real-mode click state, or the mock sim).
         if activate || btn.clicked() {
             match self.send.activate() {
                 Activation::Command(Command::SetFrequency(mhz)) => {
@@ -206,11 +246,10 @@ impl Waterfall {
                 Activation::Toggle => {
                     if active_qso {
                         ctx.bus.abort_qso();
-                    } else if let Some(call) = target.station() {
-                        ctx.bus
-                            .answer_station(target.off() as f32, call.to_string());
+                    } else if let Some(call) = &sel_call {
+                        ctx.bus.answer_station(sel_off, call.clone(), sel_slot);
                     } else {
-                        ctx.bus.call_cq(target.off() as f32);
+                        ctx.bus.call_cq(sel_off);
                     }
                 }
                 Activation::None => {}
@@ -367,9 +406,47 @@ impl Panel for Waterfall {
                         ctx.bus.spectrum().as_ref(),
                         &cmap,
                     );
+                    // Click-to-select on the live waterslide (mock mode selects via
+                    // the sim's own `ui()`; the real waterslide is draw-only). We
+                    // hit-test here and let `draw_waterslide` resolve the click to a
+                    // station (decoded line) or a bare TX offset (empty spectrum).
+                    let resp = ctx
+                        .ui
+                        .interact(body, ctx.ui.id().with("ws_select"), egui::Sense::click())
+                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+                    let click = resp.clicked().then(|| resp.interact_pointer_pos()).flatten();
+
+                    // Selection feedback: highlight the selected station's lane and
+                    // tag it with the live QSO phase (ARMED while waiting for its CQ,
+                    // WORKING once the exchange is under way).
+                    let phase = ctx
+                        .bus
+                        .qso_state()
+                        .map(|s| s.phase)
+                        .unwrap_or(QsoPhase::Idle);
+                    let sel_call = self.real_sel.target.as_ref().map(|(c, _)| c.clone());
+                    let tag = sel_call.as_deref().map(|c| match phase {
+                        QsoPhase::Armed => format!("ARMED ▸ {c}"),
+                        QsoPhase::InExchange { .. } => format!("WORKING ▸ {c}"),
+                        _ => format!("▸ {c}"),
+                    });
+
                     // Left half: decodes sliding left from centre, drawn over the
-                    // spectrogram (graticule, NOW line, and Hz labels included).
-                    draw_waterslide(painter, body, pal, &ctx.bus.recent_decodes(64), now_ms);
+                    // spectrogram (graticule, NOW line, and Hz labels included). The
+                    // returned selection (if the click resolved to one) is stored.
+                    if let Some(sel) = draw_waterslide(
+                        painter,
+                        body,
+                        pal,
+                        &ctx.bus.recent_decodes(64),
+                        now_ms,
+                        click,
+                        self.real_sel.offset,
+                        sel_call.as_deref(),
+                        tag.as_deref(),
+                    ) {
+                        self.real_sel = sel;
+                    }
                     ctx.ui
                         .ctx()
                         .request_repaint_after(std::time::Duration::from_millis(33));
@@ -516,21 +593,50 @@ impl Spectrogram {
 /// (~15 s); a smaller value scrolls faster, a larger one shows more history.
 const WS_HISTORY_SECS: f32 = 45.0;
 
+/// The station that originated a decode (its base call) plus the slot it landed
+/// in, for building a real `DecodeRef`. `None` for free-text/streaming decodes,
+/// which can't be worked.
+fn decode_station(d: &Decode) -> Option<(String, SlotId)> {
+    match &d.content {
+        DecodeContent::Slotted { slot, message, .. } => {
+            let call = match message {
+                ParsedMessage::Cq { caller, .. } => Some(caller.0.clone()),
+                ParsedMessage::Exchange { from, .. } => Some(from.0.clone()),
+                ParsedMessage::Signoff { from, .. } => Some(from.0.clone()),
+                ParsedMessage::Free(_) | ParsedMessage::Raw(_) => None,
+            };
+            call.map(|c| (c, *slot))
+        }
+        DecodeContent::Streaming { .. } => None,
+    }
+}
+
 /// The "waterslide" decode view: each decode placed by audio offset (vertical)
 /// and age (horizontal), newest at the centre NOW line and sliding left as it
 /// ages. The right (FFT) half is left blank until a spectrum producer is wired.
 /// Fed by `BusView::recent_decodes`, i.e. the real decoder's bus stream.
+///
+/// `click` is the pointer position of a click this frame (if any); a click on a
+/// decoded line selects that station, anything else a bare TX offset — returned
+/// as the new [`RealSel`]. `tx_off` is the current outgoing offset (marked), and
+/// `sel_call`/`tag` highlight + label the selected station's lane.
+#[allow(clippy::too_many_arguments)]
 fn draw_waterslide(
     painter: &egui::Painter,
     rect: Rect,
     pal: &Palette,
     decodes: &[Decode],
     now_ms: i64,
-) {
+    click: Option<Pos2>,
+    tx_off: f32,
+    sel_call: Option<&str>,
+    tag: Option<&str>,
+) -> Option<RealSel> {
     let painter = painter.with_clip_rect(rect);
     let now_x = rect.center().x; // the NOW line
     let left_w = (now_x - rect.left()).max(1.0);
     let pps = left_w / WS_HISTORY_SECS; // pixels per second of history
+    let mut hit: Option<RealSel> = None;
 
     // Audio offset → vertical position (low Hz at bottom, high Hz at top).
     let y_of = |off: f32| rect.bottom() - (off / WS_MAX_HZ).clamp(0.0, 1.0) * rect.height();
@@ -552,6 +658,20 @@ fn draw_waterslide(
         );
     }
 
+    // Selected station's lane: a faint highlight band drawn behind the decodes so
+    // the text stays readable on top of it.
+    if tag.is_some() {
+        let sy = y_of(tx_off);
+        painter.rect_filled(
+            Rect::from_min_max(
+                Pos2::new(rect.left(), sy - 9.0),
+                Pos2::new(rect.right(), sy + 9.0),
+            ),
+            corner_radius(2),
+            pal.accent2.gamma_multiply(0.12),
+        );
+    }
+
     // Decodes: newest at NOW, older to the left. Each message is left-aligned so
     // it starts at its decode time and reads rightward; the SNR sits just to its left.
     for d in decodes {
@@ -564,9 +684,28 @@ fn draw_waterslide(
             continue; // scrolled off the left edge
         }
         let y = y_of(d.offset.0);
+        let station = decode_station(d);
+        // A decode from the selected station reads in the secondary accent so the
+        // whole lane is easy to follow.
+        let is_sel = match (&station, sel_call) {
+            (Some((c, _)), Some(s)) => c.as_str() == s,
+            _ => false,
+        };
         let strong = d.snr_db.map(|s| s > -12).unwrap_or(false);
-        let msg_col = if strong { pal.body } else { pal.dim };
-        let snr_col = if strong { pal.accent } else { pal.dim };
+        let msg_col = if is_sel {
+            pal.accent2
+        } else if strong {
+            pal.body
+        } else {
+            pal.dim
+        };
+        let snr_col = if is_sel {
+            pal.accent2
+        } else if strong {
+            pal.accent
+        } else {
+            pal.dim
+        };
         let msg_rect = painter.text(
             Pos2::new(x, y),
             Align2::LEFT_CENTER,
@@ -574,6 +713,17 @@ fn draw_waterslide(
             mono(11.0),
             msg_col,
         );
+        // A click on this line selects the station to work (and snaps the TX offset
+        // to it); resolved after the loop. Unparsed lines can't be worked.
+        if let Some(cp) = click
+            && msg_rect.expand(4.0).contains(cp)
+            && let Some((call, slot)) = &station
+        {
+            hit = Some(RealSel {
+                offset: d.offset.0,
+                target: Some((call.clone(), *slot)),
+            });
+        }
         let snr = d.snr_db.map(fmt_snr).unwrap_or_else(|| "   ".into());
         painter.text(
             Pos2::new(msg_rect.left() - 6.0, y),
@@ -584,6 +734,39 @@ fn draw_waterslide(
         );
     }
 
+    // Selected lane marker + tag (cyan), or the bare TX-offset marker (accent) when
+    // only an offset is picked — so the operator always sees where the next
+    // transmission goes and which station is armed.
+    let ty = y_of(tx_off);
+    match tag {
+        Some(tag) => {
+            painter.line_segment(
+                [Pos2::new(rect.left(), ty), Pos2::new(rect.right(), ty)],
+                egui::Stroke::new(1.0, pal.accent2.gamma_multiply(0.6)),
+            );
+            painter.text(
+                Pos2::new(rect.right() - 4.0, ty - 2.0),
+                Align2::RIGHT_BOTTOM,
+                tag,
+                mono(9.5),
+                pal.accent2,
+            );
+        }
+        None => {
+            painter.line_segment(
+                [Pos2::new(now_x, ty), Pos2::new(rect.right(), ty)],
+                egui::Stroke::new(1.0, pal.accent.gamma_multiply(0.5)),
+            );
+            painter.text(
+                Pos2::new(rect.right() - 4.0, ty + 2.0),
+                Align2::RIGHT_TOP,
+                "TX",
+                mono(8.5),
+                pal.accent,
+            );
+        }
+    }
+
     // NOW line at the centre.
     painter.line_segment(
         [
@@ -592,6 +775,19 @@ fn draw_waterslide(
         ],
         egui::Stroke::new(2.0, pal.accent),
     );
+
+    // Resolve a click into a new selection: a decoded station (captured in the
+    // loop) wins; otherwise it's a bare TX offset read off the vertical position.
+    if let Some(cp) = click {
+        return Some(hit.unwrap_or_else(|| {
+            let off = ((rect.bottom() - cp.y) / rect.height() * WS_MAX_HZ).clamp(0.0, WS_MAX_HZ);
+            RealSel {
+                offset: off,
+                target: None,
+            }
+        }));
+    }
+    None
 }
 
 // =====================================================================

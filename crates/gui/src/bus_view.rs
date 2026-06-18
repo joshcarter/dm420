@@ -344,14 +344,14 @@ impl BusView {
     }
 
     /// Arm to answer `call` at `offset_hz` (the DM420 wait-for-CQ model — the
-    /// engine replies when that station next calls CQ).
-    pub fn answer_station(&self, offset_hz: f32, call: String) {
+    /// engine replies when that station next calls CQ). `slot` is the slot the
+    /// target's decode landed in, threaded from the click so the `DecodeRef` is the
+    /// real one. (The engine still re-derives TX parity from the target's own CQ
+    /// when it commits, but the ref now carries the true slot for selection/gossip.)
+    pub fn answer_station(&self, offset_hz: f32, call: String, slot: SlotId) {
         let target = DecodeRef {
             radio: mocks::radio_id(),
-            // The engine commits on the target's CQ decode (matching `call`) and
-            // takes the TX-slot parity from that decode, so this placeholder slot
-            // is never read. TODO: thread the real `DecodeRef` from the click.
-            slot: SlotId(0),
+            slot,
             call: Some(Callsign(call)),
         };
         self.publish_selection(offset_hz, Some(target.clone()));
