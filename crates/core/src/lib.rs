@@ -32,12 +32,11 @@ mod parse;
 mod rig_adapter;
 mod tx;
 
-pub use control::{AudioControl, CoreControl, RigControl};
+pub use control::{AudioControl, CoreControl, RigControl, TxControl};
 pub use modes::Protocol;
 pub use parse::parse_message;
 pub use rig::LineProfile;
 pub use rig_adapter::CommandResult;
-pub use tx::TxConfig;
 
 /// Names of input-capable audio devices, for a UI device picker. Empty on error.
 pub fn list_audio_inputs() -> Vec<String> {
@@ -45,6 +44,18 @@ pub fn list_audio_inputs() -> Vec<String> {
         .map(|ds| {
             ds.into_iter()
                 .filter(|d| d.kind == audio::DeviceKind::Input)
+                .map(|d| d.name)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Names of output-capable audio devices, for a UI device picker. Empty on error.
+pub fn list_audio_outputs() -> Vec<String> {
+    audio::list_devices()
+        .map(|ds| {
+            ds.into_iter()
+                .filter(|d| d.kind == audio::DeviceKind::Output)
                 .map(|d| d.name)
                 .collect()
         })
@@ -115,9 +126,6 @@ pub struct CoreConfig {
     pub decode: DecodeSource,
     /// How to reach the rig. `None` ⇒ no rig producer (mock/headless).
     pub serial: Option<SerialConfig>,
-    /// Output device for TX audio (the rig's data-in); `None` = system default.
-    /// Only used when `allow_transmit` is set.
-    pub tx_output: Option<String>,
 }
 
 impl Default for CoreConfig {
@@ -127,7 +135,6 @@ impl Default for CoreConfig {
             allow_transmit: false,
             decode: DecodeSource::None,
             serial: None,
-            tx_output: None,
         }
     }
 }
@@ -146,7 +153,6 @@ pub fn spawn(bus: &BusHandle, cfg: CoreConfig) -> CoreControl {
         allow_transmit,
         decode,
         serial,
-        tx_output,
     } = cfg;
 
     let mut control = CoreControl::default();
@@ -157,11 +163,14 @@ pub fn spawn(bus: &BusHandle, cfg: CoreConfig) -> CoreControl {
     let granter = interlock::Granter::default();
     interlock::serve(bus, radio.clone(), granter.clone());
 
-    // Opt-in TX path: only when allow_transmit is set do we stand up the audio-TX
-    // service that synthesizes, keys, and plays. Off by default (RX-only).
+    // TX path: the audio-TX service that synthesizes, keys, and plays. Its output
+    // device is live-editable from the UI via `control.tx`. Spawned whenever
+    // transmit is permitted (the operator still keys it explicitly, per over).
+    let tx_control = Arc::new(control::TxControl::new(None));
     if allow_transmit {
-        tx::spawn(bus, radio.clone(), tx::TxConfig { output: tx_output });
+        tx::spawn(bus, radio.clone(), tx_control.clone());
     }
+    control.tx = Some(tx_control);
 
     // The rig producer is optional: with no serial config there's simply no rig
     // on the bus (the GUI shows it as down). A present config never panics —

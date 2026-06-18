@@ -27,17 +27,9 @@ const PTT_REFRESH: Duration = Duration::from_secs(5);
 /// even if playback never signals done. An FT8 over is ~12.6 s in a 15 s slot.
 const MAX_TX: Duration = Duration::from_secs(14);
 
-/// TX-side configuration. Carried by [`CoreConfig`](crate::CoreConfig) and used
-/// only when `allow_transmit` is set.
-#[derive(Clone, Default)]
-pub struct TxConfig {
-    /// Output device for TX audio (the rig's data-in). `None` = system default.
-    pub output: Option<String>,
-}
-
 /// Serve `radio/{id}/audio_tx`: run each requested transmission to completion (one
 /// at a time) and report its outcome on `radio/{id}/tx_report`.
-pub fn spawn(bus: &BusHandle, radio: t::RadioId, cfg: TxConfig) {
+pub fn spawn(bus: &BusHandle, radio: t::RadioId, tx: std::sync::Arc<crate::control::TxControl>) {
     let mut server = match bus.serve::<t::TxRequest, t::TxAck>(&Topic::AudioTx(radio.clone())) {
         Ok(s) => s,
         Err(e) => {
@@ -47,9 +39,11 @@ pub fn spawn(bus: &BusHandle, radio: t::RadioId, cfg: TxConfig) {
     };
     let bus = bus.clone();
     tokio::spawn(async move {
-        tracing::info!("audio-tx: TX path armed (allow_transmit set)");
+        tracing::info!("audio-tx: TX path armed");
         while let Some((req, responder)) = server.next().await {
-            let (slot, outcome) = transmit(&bus, &radio, &cfg, req).await;
+            // Read the (live-editable) output device fresh for each over.
+            let output = tx.snapshot();
+            let (slot, outcome) = transmit(&bus, &radio, output, req).await;
             let _ = bus.publish(
                 &Topic::TxReport(radio.clone()),
                 t::TxReport {
@@ -69,7 +63,7 @@ pub fn spawn(bus: &BusHandle, radio: t::RadioId, cfg: TxConfig) {
 async fn transmit(
     bus: &BusHandle,
     radio: &t::RadioId,
-    cfg: &TxConfig,
+    output: Option<String>,
     req: t::TxRequest,
 ) -> (Option<t::SlotId>, t::TxOutcome) {
     let t::TxRequest::SlottedMessage {
@@ -115,7 +109,7 @@ async fn transmit(
     }
 
     // Play to the rig's data-in, refreshing PTT inside the watchdog until done.
-    let outcome = match audio::play(cfg.output.clone(), samples, TX_SAMPLE_RATE) {
+    let outcome = match audio::play(output, samples, TX_SAMPLE_RATE) {
         Ok(playback) => {
             wait_keyed(bus, radio, token, &playback).await;
             playback.stop();

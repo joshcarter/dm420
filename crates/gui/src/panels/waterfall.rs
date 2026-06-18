@@ -802,6 +802,8 @@ struct ConfigForm {
     /// Whether the fields have been seeded from the applied config yet.
     loaded: bool,
     audio_input: Option<String>,
+    /// TX audio output device (the rig's data-in); `None` = system default.
+    audio_output: Option<String>,
     port: Option<String>,
     baud: u32,
     profile: LineProfile,
@@ -809,6 +811,7 @@ struct ConfigForm {
     protocol: Protocol,
     /// Cached device/port lists for the pickers (refreshed on load / Refresh).
     audio_devices: Vec<String>,
+    audio_output_devices: Vec<String>,
     serial_ports: Vec<String>,
 }
 
@@ -817,12 +820,14 @@ impl Default for ConfigForm {
         Self {
             loaded: false,
             audio_input: None,
+            audio_output: None,
             port: None,
             baud: DEFAULT_BAUD,
             profile: LineProfile::Default,
             autodetect: true,
             protocol: Protocol::Ft8,
             audio_devices: Vec::new(),
+            audio_output_devices: Vec::new(),
             serial_ports: Vec::new(),
         }
     }
@@ -834,12 +839,14 @@ impl ConfigForm {
     fn load(&mut self, bus: &BusView) {
         let cfg = bus.current_config();
         self.audio_input = cfg.audio_input;
+        self.audio_output = cfg.audio_output;
         self.port = cfg.serial.port;
         self.baud = cfg.serial.baud;
         self.profile = cfg.serial.profile;
         self.autodetect = cfg.serial.autodetect;
         self.protocol = cfg.protocol;
         self.audio_devices = bus.audio_inputs();
+        self.audio_output_devices = bus.audio_outputs();
         self.serial_ports = bus.serial_ports();
         self.loaded = true;
     }
@@ -848,6 +855,7 @@ impl ConfigForm {
     fn to_config(&self) -> HardwareConfig {
         HardwareConfig {
             audio_input: self.audio_input.clone(),
+            audio_output: self.audio_output.clone(),
             serial: SerialConfig {
                 port: self.port.clone(),
                 baud: self.baud,
@@ -905,6 +913,32 @@ impl ConfigForm {
                                     }
                                 });
                         });
+                        ui.end_row();
+
+                        // TX audio output (the rig's data-in). Independent of
+                        // capture, so it's always selectable in real mode.
+                        ui.label("Audio output");
+                        let out_sel = self
+                            .audio_output
+                            .clone()
+                            .unwrap_or_else(|| "(system default)".into());
+                        egui::ComboBox::from_id_salt("audio_output")
+                            .selected_text(out_sel)
+                            .width(240.0)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.audio_output,
+                                    None,
+                                    "(system default)",
+                                );
+                                for d in &self.audio_output_devices {
+                                    ui.selectable_value(
+                                        &mut self.audio_output,
+                                        Some(d.clone()),
+                                        d,
+                                    );
+                                }
+                            });
                         ui.end_row();
 
                         ui.label("Mode");
@@ -986,6 +1020,7 @@ impl ConfigForm {
                 ui.add_space(6.0);
                 if ui.button("Refresh devices").clicked() {
                     self.audio_devices = bus.audio_inputs();
+                    self.audio_output_devices = bus.audio_outputs();
                     self.serial_ports = bus.serial_ports();
                 }
                 ui.add_space(2.0);

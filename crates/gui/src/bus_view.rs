@@ -148,11 +148,9 @@ impl BusView {
 
         // The QSO engine is logic, not hardware — it runs in both modes, driven
         // by whichever decode/clock producers are live, serving `qso/{id}/command`
-        // and publishing `QsoState`. TX is opt-in: the engine auto-sends only in
-        // real mode with `DM420_ALLOW_TX` set (and a rig + the PTT interlock
-        // present); otherwise it sequences but never keys.
-        let allow_tx = real && settings.allow_tx;
-        let qso_control = qso::spawn(&bus, mocks::radio_id(), station, allow_tx);
+        // and publishing `QsoState`. It auto-sends in real mode (a rig + the PTT
+        // interlock are present); in mock mode it sequences but never keys.
+        let qso_control = qso::spawn(&bus, mocks::radio_id(), station, real);
 
         pump_state(
             &bus,
@@ -292,6 +290,9 @@ impl BusView {
         if let Some(audio) = &self.control.audio {
             audio.set(cfg.audio_input.clone(), cfg.protocol);
         }
+        if let Some(tx) = &self.control.tx {
+            tx.set(cfg.audio_output.clone());
+        }
         *self.applied.lock().unwrap() = cfg;
     }
 
@@ -306,6 +307,11 @@ impl BusView {
     /// Input-capable audio device names, for the settings picker.
     pub fn audio_inputs(&self) -> Vec<String> {
         app_core::list_audio_inputs()
+    }
+
+    /// Output-capable audio device names, for the TX-output settings picker.
+    pub fn audio_outputs(&self) -> Vec<String> {
+        app_core::list_audio_outputs()
     }
 
     /// Available serial port names (likely-radio first), for the settings picker.

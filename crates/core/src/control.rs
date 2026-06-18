@@ -83,6 +83,31 @@ impl AudioControl {
     }
 }
 
+/// Shared, live-editable TX audio output device. The audio-TX service reads it
+/// before each over, so a device change made in the UI applies on re-lock without
+/// a restart (mirrors [`AudioControl`], but TX output is independent of capture so
+/// it gets its own control).
+pub struct TxControl {
+    output: Mutex<Option<String>>,
+}
+
+impl TxControl {
+    pub(crate) fn new(output: Option<String>) -> Self {
+        Self {
+            output: Mutex::new(output),
+        }
+    }
+
+    /// Replace the TX output device; picked up on the next over.
+    pub fn set(&self, output: Option<String>) {
+        *self.output.lock().unwrap() = output;
+    }
+
+    pub(crate) fn snapshot(&self) -> Option<String> {
+        self.output.lock().unwrap().clone()
+    }
+}
+
 /// Handle for live reconfiguration of the running producers from the UI. Each
 /// field is present only when that producer is running (e.g. `audio` is `None`
 /// for WAV replay or rig-only setups). Cheap to clone (the controls live behind
@@ -91,6 +116,7 @@ impl AudioControl {
 pub struct CoreControl {
     pub rig: Option<std::sync::Arc<RigControl>>,
     pub audio: Option<std::sync::Arc<AudioControl>>,
+    pub tx: Option<std::sync::Arc<TxControl>>,
 }
 
 /// Why a supervisor's connected session ended — distinguishes a real fault from
