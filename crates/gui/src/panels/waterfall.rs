@@ -4,7 +4,8 @@
 use eframe::egui;
 use egui::{Align2, Color32, ColorImage, Pos2, Rect, TextureHandle, TextureOptions};
 use types::{
-    Decode, DecodeContent, HealthState, ParsedMessage, SpectrumRow, SubsystemHealth, SubsystemId,
+    Decode, DecodeContent, HealthState, ParsedMessage, QsoPhase, SpectrumRow, SubsystemHealth,
+    SubsystemId,
 };
 
 use app_core::{LineProfile, Protocol, SerialConfig};
@@ -13,7 +14,7 @@ use super::{Panel, PanelCtx};
 use crate::bus_view::BusView;
 use crate::chrome::{key_cell_accent, lcd_panel, measure, panel_header, shadow};
 use crate::panel_data as pd;
-use crate::send::{ArmState, Command, SendState};
+use crate::send::{Activation, Command, SendState};
 use crate::settings::{DEFAULT_BAUD, HardwareConfig, KENWOOD_BAUDS};
 use crate::theme::*;
 use crate::waterslide_panel::{WaterslidePanel, WaterslideTheme};
@@ -44,10 +45,9 @@ pub struct Waterfall {
     slide: WaterslidePanel,
     spectro: Spectrogram,
     form: ConfigForm,
-    /// Send-row state (outgoing message + arm/transmit lifecycle). Mock-only.
+    /// Send-row text-box / slash-command state. The transmit lifecycle itself
+    /// lives in the QSO engine (`QsoState`), which this row renders and commands.
     send: SendState,
-    /// Last FT8 slot index seen, to fire the mock arm→transmit tick on a change.
-    last_slot: i64,
     /// Dial frequency set via the `/f` command (MHz→Hz), shown in the header in
     /// place of the rig readout. Mock feedback until rig wiring lands.
     vfo_override_hz: Option<u64>,
@@ -60,7 +60,6 @@ impl Waterfall {
             spectro: Spectrogram::new(),
             form: ConfigForm::default(),
             send: SendState::default(),
-            last_slot: i64::MIN,
             vfo_override_hz: None,
         }
     }
@@ -95,9 +94,24 @@ impl Waterfall {
             }
         }
 
-        // Keep the box mirroring the engine's next message (unless mid-command).
+        // Keep the buffer mirroring the would-be next message as a preview (unless
+        // mid-command); the engine's authored message takes over once it's running.
         let target = self.slide.outgoing().clone();
         self.send.refresh_auto(&target, mycall, mygrid);
+
+        // Live QSO-engine state drives the display and the button.
+        let qso = ctx.bus.qso_state();
+        let phase = qso.as_ref().map(|s| s.phase).unwrap_or(QsoPhase::Idle);
+        let active_qso = !matches!(phase, QsoPhase::Idle);
+        // What to show in the box: a command being typed > the engine's queued
+        // message > the local preview.
+        let display = if self.send.entering {
+            self.send.buf.clone()
+        } else if let Some(text) = qso.as_ref().and_then(|s| s.next_tx.as_ref()).map(|m| &m.text) {
+            text.clone()
+        } else {
+            self.send.buf.clone()
+        };
 
         let pal = ctx.pal;
         let painter = ctx.painter;
@@ -117,8 +131,10 @@ impl Waterfall {
             pal.sub,
         );
 
-        // Scan-style lit key (lcd track + key_cell), sized to its label.
-        let btn_label = self.send.button_label();
+        // Scan-style lit key (lcd track + key_cell), sized to its label. SEND when
+        // idle; STOP once the engine is armed/calling/in an exchange (the single
+        // Stop control).
+        let btn_label = if active_qso { "STOP" } else { "SEND" };
         let cell_w = measure(painter, &tracked(btn_label), heading_bold(9.0)) + 22.0;
         let track_w = cell_w + 4.0;
         let track = Rect::from_min_max(
@@ -139,11 +155,11 @@ impl Waterfall {
             egui::Stroke::new(1.0, pal.edge),
             egui::StrokeKind::Inside,
         );
-        let text_color = if self.send.armed == ArmState::Idle { pal.body } else { pal.accent2 };
+        let text_color = if active_qso { pal.accent2 } else { pal.body };
         painter.with_clip_rect(box_rect).text(
             Pos2::new(box_rect.left() + 6.0, cy),
             Align2::LEFT_CENTER,
-            &self.send.buf,
+            &display,
             egui::FontId::monospace(12.0),
             text_color,
         );
@@ -154,7 +170,7 @@ impl Waterfall {
             Pos2::new(track.left() + 2.0, track.top() + 2.0),
             Pos2::new(track.right() - 2.0, track.bottom() - 2.0),
         );
-        let accent = if self.send.armed == ArmState::Idle { pal.accent } else { pal.accent2 };
+        let accent = if active_qso { pal.accent2 } else { pal.accent };
         let btn = key_cell_accent(
             ctx.ui,
             painter,
@@ -166,10 +182,25 @@ impl Waterfall {
             ctx.ui.id().with("ft8_send_btn"),
         );
 
-        // Enter or a button click activates: apply a command, else toggle arm.
+        // Enter or a button click activates: apply a slash command, else toggle
+        // the engine. Toggle resolves against the live phase: abort if the engine
+        // is busy, otherwise arm — answer the selected station, or call CQ on bare
+        // spectrum. Offsets carry the sign the waterslide uses (audio offset Hz).
         if activate || btn.clicked() {
-            if let Some(Command::SetFrequency(mhz)) = self.send.activate() {
-                self.vfo_override_hz = Some((mhz * 1_000_000.0).round() as u64);
+            match self.send.activate() {
+                Activation::Command(Command::SetFrequency(mhz)) => {
+                    self.vfo_override_hz = Some((mhz * 1_000_000.0).round() as u64);
+                }
+                Activation::Toggle => {
+                    if active_qso {
+                        ctx.bus.abort_qso();
+                    } else if let Some(call) = target.station() {
+                        ctx.bus.answer_station(target.off() as f32, call.to_string());
+                    } else {
+                        ctx.bus.call_cq(target.off() as f32);
+                    }
+                }
+                Activation::None => {}
             }
         }
     }
@@ -327,15 +358,9 @@ impl Panel for Waterfall {
 
         // The send row is the operating control, shown only when locked. When
         // unlocked the bottom strip is the settings/edit surface, not the radio.
+        // The transmit lifecycle now lives in the QSO engine, which the row reads
+        // and commands (no local arm cadence to step).
         if !ctx.unlocked {
-            // Mock arm→transmit cadence: step the lifecycle each slot boundary.
-            // `now_slot` only advances under the mock sim, the only place the
-            // send row is functional for now.
-            let slot = self.slide.now_slot();
-            if slot != self.last_slot {
-                self.last_slot = slot;
-                self.send.slot_tick();
-            }
             self.draw_send_row(ctx, send_row);
         }
     }

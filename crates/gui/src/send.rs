@@ -11,17 +11,18 @@
 
 use crate::waterslide_panel::Target;
 
-/// Where the send row is in its transmit lifecycle.
-///
-/// `Idle` → the auto-filled message is shown, nothing queued. `Armed` → queued,
-/// will transmit on the next slot. `Transmitting` → on the air this slot. The
-/// button reads Send/Send/Cancel across these (color shifts idle→accent2).
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum ArmState {
-    #[default]
-    Idle,
-    Armed,
-    Transmitting,
+/// What pressing Enter / the Send button means right now. The transmit lifecycle
+/// itself lives in the QSO engine (`QsoState.phase`); the send row only renders
+/// that and issues commands.
+#[derive(Clone, PartialEq, Debug)]
+pub enum Activation {
+    /// A completed slash command to apply (e.g. set frequency).
+    Command(Command),
+    /// Not composing a command — toggle the QSO engine. The panel decides
+    /// arm-vs-abort from the live `QsoState` phase.
+    Toggle,
+    /// Nothing actionable (an empty or unrecognized command was abandoned).
+    None,
 }
 
 /// A parsed slash/colon command. Only frequency-set exists for now.
@@ -67,7 +68,6 @@ pub fn next_message(target: &Target, mycall: &str, grid: &str) -> String {
 /// "showing the auto message" from "the operator is composing a command".
 #[derive(Default)]
 pub struct SendState {
-    pub armed: ArmState,
     pub buf: String,
     /// True while composing a slash command (`buf` is the operator's input, not
     /// the auto message). Set by `/`/`:`, cleared on Enter/Escape/empty backspace.
@@ -118,40 +118,17 @@ impl SendState {
         }
     }
 
-    /// Handle Enter or a button press. While composing a command, parse and
-    /// return it (then leave command entry). Otherwise toggle arm/disarm.
-    pub fn activate(&mut self) -> Option<Command> {
+    /// Handle Enter or a button press. While composing a command, parse and return
+    /// it (then leave command entry). Otherwise it's a [`Activation::Toggle`] —
+    /// the panel arms or aborts the engine depending on the live `QsoState`.
+    pub fn activate(&mut self) -> Activation {
         if self.entering {
             let cmd = parse_command(&self.buf);
             self.entering = false;
             self.buf.clear();
-            return cmd;
+            return cmd.map_or(Activation::None, Activation::Command);
         }
-        self.armed = match self.armed {
-            ArmState::Idle => ArmState::Armed,
-            // Both Armed and Transmitting disarm (the single Stop control).
-            _ => ArmState::Idle,
-        };
-        None
-    }
-
-    /// Advance the mock lifecycle on a slot boundary. FT8 transmits in alternate
-    /// slots, so once armed we ping-pong Armed↔Transmitting: queue, transmit,
-    /// listen, transmit again — matching the real even/odd-slot cadence.
-    pub fn slot_tick(&mut self) {
-        self.armed = match self.armed {
-            ArmState::Armed => ArmState::Transmitting,
-            ArmState::Transmitting => ArmState::Armed,
-            ArmState::Idle => ArmState::Idle,
-        };
-    }
-
-    /// Button label for the current state (all caps to match the Scan key).
-    pub fn button_label(&self) -> &'static str {
-        match self.armed {
-            ArmState::Transmitting => "CANCEL",
-            _ => "SEND",
-        }
+        Activation::Toggle
     }
 }
 
@@ -195,8 +172,8 @@ mod tests {
 
     #[test]
     fn typing_only_accepts_slash_commands() {
-        let mut s = SendState::default();
-        s.buf = "CQ N0JDC DN70".into(); // standing auto message
+        // standing auto message in the box
+        let mut s = SendState { buf: "CQ N0JDC DN70".into(), ..Default::default() };
         // Arbitrary text is ignored — the box can't hold free text.
         s.type_text("hello");
         assert!(!s.entering);
@@ -208,23 +185,29 @@ mod tests {
         s.type_text("f 14.074");
         assert_eq!(s.buf, "/f 14.074");
         // Enter parses, applies, and leaves command entry.
-        assert_eq!(s.activate(), Some(Command::SetFrequency(14.074)));
+        assert_eq!(s.activate(), Activation::Command(Command::SetFrequency(14.074)));
         assert!(!s.entering);
         assert!(s.buf.is_empty());
         // `:` is an equivalent command prefix.
         s.type_text(":freq 7.074");
-        assert_eq!(s.activate(), Some(Command::SetFrequency(7.074)));
+        assert_eq!(s.activate(), Activation::Command(Command::SetFrequency(7.074)));
     }
 
     #[test]
-    fn enter_toggles_arm_when_not_composing() {
+    fn enter_is_a_toggle_when_not_composing() {
+        let mut s = SendState { buf: "CQ N0JDC DN70".into(), ..Default::default() };
+        // Outside command entry, Enter toggles the engine — the panel resolves
+        // arm-vs-abort from the live QsoState phase.
+        assert_eq!(s.activate(), Activation::Toggle);
+        assert_eq!(s.activate(), Activation::Toggle);
+    }
+
+    #[test]
+    fn empty_command_is_a_noop_not_a_toggle() {
         let mut s = SendState::default();
-        s.buf = "CQ N0JDC DN70".into();
-        assert_eq!(s.activate(), None);
-        assert_eq!(s.armed, ArmState::Armed);
-        // Enter again disarms (the single Stop control).
-        assert_eq!(s.activate(), None);
-        assert_eq!(s.armed, ArmState::Idle);
+        s.type_text("/"); // started a command, then…
+        assert_eq!(s.activate(), Activation::None); // …submitted nothing parseable
+        assert!(!s.entering);
     }
 
     #[test]
@@ -237,17 +220,5 @@ mod tests {
         s.escape();
         assert!(!s.entering);
         assert!(s.buf.is_empty());
-    }
-
-    #[test]
-    fn slot_tick_pingpongs_only_when_armed() {
-        let mut s = SendState::default();
-        s.slot_tick();
-        assert_eq!(s.armed, ArmState::Idle); // idle stays idle
-        s.armed = ArmState::Armed;
-        s.slot_tick();
-        assert_eq!(s.armed, ArmState::Transmitting);
-        s.slot_tick();
-        assert_eq!(s.armed, ArmState::Armed);
     }
 }

@@ -15,6 +15,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use bus::types::*;
 use bus::{BusError, BusHandle, BusMessage, Topic, TopicSelector};
@@ -73,6 +74,9 @@ pub struct BusView {
     bands: Arc<Mutex<HashMap<Band, BandActivity>>>,
     logs: Ring<LogEntry>,
     decodes: Ring<Decode>,
+    /// Latest QSO-engine state (phase, partner, queued next message). Drives the
+    /// FT8 send row.
+    qso: Cell<QsoState>,
     /// Latest health per hardware subsystem (real mode only). Drives the panels'
     /// fault display when a device is missing or disconnected.
     health: Arc<Mutex<HashMap<SubsystemId, SubsystemHealth>>>,
@@ -116,6 +120,7 @@ impl BusView {
         let spectrum = cell();
         let scanner = cell();
         let clock = cell();
+        let qso = cell();
         let bands: Arc<Mutex<HashMap<Band, BandActivity>>> = Arc::new(Mutex::new(HashMap::new()));
         let logs = Ring::new(512);
         let decodes = Ring::new(64);
@@ -148,6 +153,12 @@ impl BusView {
         // `QsoState` (the send row) lands in the next wiring pass.
         let qso_control = qso::spawn(&bus, mocks::radio_id(), station, false);
 
+        pump_state(
+            &bus,
+            Topic::QsoState(mocks::radio_id()),
+            qso.clone(),
+            egui_ctx.clone(),
+        );
         pump_state(
             &bus,
             Topic::RigState(mocks::radio_id()),
@@ -192,6 +203,7 @@ impl BusView {
             bands,
             logs,
             decodes,
+            qso,
             health,
             real,
             control,
@@ -316,6 +328,68 @@ impl BusView {
     /// re-lock after the operator edits the call/grid).
     pub fn set_qso_station(&self, station: qso::StationConfig) {
         self.qso_control.set_station(station);
+    }
+
+    /// The current QSO-engine state (phase, partner, queued next message), if it
+    /// has published yet.
+    pub fn qso_state(&self) -> Option<QsoState> {
+        self.qso.lock().unwrap().clone()
+    }
+
+    /// Call CQ at `offset_hz`: set the outgoing offset (no retune) and start the
+    /// engine calling.
+    pub fn call_cq(&self, offset_hz: f32) {
+        self.publish_selection(offset_hz, None);
+        self.send_qso_command(QsoCommand::CallCq);
+    }
+
+    /// Arm to answer `call` at `offset_hz` (the DM420 wait-for-CQ model — the
+    /// engine replies when that station next calls CQ).
+    pub fn answer_station(&self, offset_hz: f32, call: String) {
+        let target = DecodeRef {
+            radio: mocks::radio_id(),
+            // The engine commits on the target's CQ decode (matching `call`) and
+            // takes the TX-slot parity from that decode, so this placeholder slot
+            // is never read. TODO: thread the real `DecodeRef` from the click.
+            slot: SlotId(0),
+            call: Some(Callsign(call)),
+        };
+        self.publish_selection(offset_hz, Some(target.clone()));
+        self.send_qso_command(QsoCommand::Start { target });
+    }
+
+    /// Disarm / stop the engine (the single Stop control).
+    pub fn abort_qso(&self) {
+        self.send_qso_command(QsoCommand::Abort);
+    }
+
+    /// Publish the current selection (outgoing offset + optional target) onto the
+    /// `selection/{id}/active` State topic.
+    fn publish_selection(&self, offset_hz: f32, target: Option<DecodeRef>) {
+        let _ = self.bus.publish(
+            &Topic::Selection(mocks::radio_id()),
+            Selection {
+                radio: mocks::radio_id(),
+                outgoing: OffsetHz(offset_hz),
+                target,
+            },
+        );
+    }
+
+    /// Fire a QSO command at the engine's command server. The engine reflects the
+    /// result on `qso/{id}/state`, so the ack is ignored (fire-and-forget); the
+    /// request runs on the bus runtime since it `await`s.
+    fn send_qso_command(&self, cmd: QsoCommand) {
+        let bus = self.bus.clone();
+        self._rt.spawn(async move {
+            let _ = bus
+                .request::<QsoCommand, qso::QsoAck>(
+                    &Topic::QsoCommand(mocks::radio_id()),
+                    cmd,
+                    Duration::from_secs(1),
+                )
+                .await;
+        });
     }
 
     /// The underlying bus, for issuing commands (TX, tuning) from the UI later.

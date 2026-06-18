@@ -25,4 +25,4 @@ mod shell;
 
 pub use engine::{CompletedQso, Engine, Event, Step, TxIntent};
 pub use message::StationConfig;
-pub use shell::{QsoControl, spawn};
+pub use shell::{QsoAck, QsoControl, spawn};

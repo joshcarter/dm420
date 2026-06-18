@@ -209,12 +209,6 @@ impl WaterslidePanel {
         &self.outgoing
     }
 
-    /// The current FT8 slot index from the sim clock. The host uses changes in
-    /// this to drive the mock arm→transmit cadence (one TX per slot boundary).
-    pub fn now_slot(&self) -> i64 {
-        (self.sim.t() / crate::waterslide_sim::SLOT).floor() as i64
-    }
-
     /// Map an audio offset (Hz) to a vertical position in 0..H design space.
     /// Mirrors `waterslide_sim::y_of` against this panel's reference height.
     fn y_of(off: i32) -> f32 {
