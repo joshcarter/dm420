@@ -4,12 +4,13 @@ Running notes, gotchas, and reminders. Newest at the top.
 
 ## 2026-06-18
 
-- **Signal strength must be calibrated to the noise floor (near-term commit):**
-  the SNR shown on the waterslide is a placeholder — a POC estimate (`score / 2`
-  from the decoder, `crates/modes/src/decode.rs:357`, surfaced via
-  `crates/core/src/decode.rs:146`), *relative, not calibrated to noise*. A
-  near-term commit should report plausible signal strength measured against the
-  noise level. Target scale (standard FT8 reports):
+- **Signal strength calibrated to the noise floor — done (522fa46):** replaced the
+  `score / 2` POC placeholder with a real noise-relative SNR — per-slot noise floor
+  (median of the waterfall magnitudes, since signals are sparse) vs. signal power at
+  the Costas sync tones, corrected from the per-bin bandwidth to a 2500 Hz reference.
+  It is gain-independent (a power ratio), so a signal at the decode limit reads near
+  −21 dB regardless of input level. The waterslide also stopped dimming weak decodes
+  (2d31eb0). Target scale (standard FT8 reports), kept for reference:
 
   | Report | What it means |
   |---|---|
