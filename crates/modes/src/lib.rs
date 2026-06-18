@@ -23,7 +23,7 @@ mod slot;
 mod text;
 mod waterfall;
 
-pub use decode::{Decode, decode};
+pub use decode::{Decode, decode, decode_streaming};
 pub use encode::synth_ft8;
 pub use message::MessageType;
 

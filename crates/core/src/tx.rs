@@ -138,9 +138,11 @@ async fn transmit(
         );
     }
 
-    // Synthesize the slot waveform, then trim the trailing silence so key-down
-    // lands shortly after the signal, not at the slot edge (the leading silence is
-    // kept so the rig has time to switch to TX before the signal).
+    // Synthesize the slot waveform, then trim the silence off both ends: trailing
+    // entirely (so key-down lands right after the signal), and leading down to a
+    // short T/R-settle lead (so the tones start near the top of the slot, not the
+    // synth's centered ~1.18 s in — a late start otherwise pushes our DT out of the
+    // far station's decode window).
     let Some(mut samples) = modes::synth_message(&message.text, offset.0, TX_SAMPLE_RATE) else {
         return (
             Some(slot),
@@ -149,6 +151,12 @@ async fn transmit(
     };
     while samples.last().is_some_and(|&s| s.abs() < 1e-4) {
         samples.pop();
+    }
+    // ~0.5 s of lead is ample for the rig's (millisecond) T/R switch; drop the rest.
+    const TX_LEAD_SAMPLES: usize = TX_SAMPLE_RATE as usize / 2;
+    let lead = samples.iter().take_while(|&&s| s.abs() < 1e-4).count();
+    if lead > TX_LEAD_SAMPLES {
+        samples.drain(..lead - TX_LEAD_SAMPLES);
     }
     tracing::debug!(
         samples = samples.len(),

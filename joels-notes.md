@@ -4,6 +4,84 @@ Running notes, gotchas, and reminders. Newest at the top.
 
 ## 2026-06-18
 
+- **Decode/TX timing — optimizations done + planned (the "answered a repeated CQ but
+  didn't" thread).** Root cause: decodes land ~0.7 s *after* the slot boundary (the
+  decoder waits for the full slot, then ~0.7 s of compute), so the engine learns of a CQ
+  too late to answer in the next slot.
+  - **DONE — stream decodes as found.** `modes::decode_streaming` (callback per decode,
+    strongest-first) + `core::decode` now publishes each onto the bus the instant it's
+    found instead of batching the whole slot. The UI ring and QSO engine already consume
+    a stream, so messages appear incrementally and the engine sees the strongest signal
+    (a CQ being worked) first. No downstream changes.
+  - **DONE — trim TX leading silence.** `core::tx` trims the synth's centered ~1.18 s
+    lead down to ~0.5 s so our tones start near the top of the slot. We were effectively
+    transmitting at DT ≈ +1.4 s (synth centering + ~0.76 s playback-open latency) — near
+    the edge of decodability; this pulls it back to a safe ~+0.7 s.
+  - **DONE — two-pass decode (early at signal-end + full at boundary).** Confirmed on-air
+    that it helps. `core::decode` runs a speculative **early** pass when the signal is done
+    (~13.5 s into an FT8 slot, `DECODE_TAIL` knob) so on-time stations — incl. a CQ being
+    worked — reach the UI + engine *before* the boundary, plus the existing **full** pass at
+    the boundary that catches late-DT / weak signals (deduped by message text per slot).
+    Degrades to today's behavior if the early pass finds nothing; the dedup + trigger
+    generalize to N passes for free (just add trigger points).
+  - **IDEA (validated, not built) — "continuous" decoding.** Drop slot alignment for RX:
+    a thread re-decodes the rolling last ~15 s every N ms (TOML knob, `decode_interval_ms`),
+    sleeps, repeats — each station pops up ~one cycle (~0.8 s) after *it* finishes, uniform
+    for early and late starters. **Feasible:** `find_candidates` already searches the whole
+    slot (`time_offset −10..~+25` blocks ≈ −1.6..+4 s; comment: "spans the whole slot"), so
+    a signal anywhere in the buffer is found. Cost ≈ one core (a single decode ~0.7–1.2 s
+    keeps up with a ~100 ms-sleep loop) — acceptable. **The real work isn't CPU, it's two
+    bits of bookkeeping:** (1) **time-bounded dedup** — each signal is caught ~3× as the
+    window slides, so dedup by message text but *windowed* (~1 slot), else a station's
+    repeat CQ next cycle is wrongly suppressed; (2) **slot recovery** — the decoder returns
+    DT relative to the rolling buffer, but the engine still needs the real slot+parity to
+    time TX, so recompute `slot = floor((buf_start + dt)/period)`. Buffer stays ~one slot
+    (the waterfall is sized for one). Build behind the TOML flag to A/B vs two-pass.
+  - **NOT WORTH IT — N full decodes every 200 ms (~16/slot).** ~16× redundant (each pass
+    rebuilds the whole FFT waterfall + re-decodes already-found signals, ~90 % thrown away
+    by dedup) for ~10–15 s of CPU/slot, just to show *already-late* stations a fraction
+    sooner. A *few* passes (3–4) is the cheap middle ground; the efficient version is an
+    **incremental decoder** (reuse the waterfall, decode only newly-completed candidates) —
+    the real "every 200 ms" without the waste, and it pairs with multi-pass subtraction.
+  - **HELD — forgiving late start (fire the answer mid-slot on commit).** The direct fix
+    for a CQ whose decode lands just after the boundary, but it means emitting TX off a
+    `Decode` event, not just the slot tick — intricate surgery on the 12-test QSO state
+    machine (`next`/`tx_parity`/`step`/`finish`), and it overlaps the **wait-for-CQ-vs-
+    immediate answer-model decision flagged for Josh**. Do it *with* that decision.
+  - **HELD — pre-open the TX output stream.** The log shows ~0.5 s from key-up to
+    `playback started` — cpal reopens the output device every over. Keeping it open across
+    overs cuts that ~0.5 s (and loosens the lead-trim budget). Separate audio-lifecycle
+    change.
+  - **FUTURE — multi-pass subtraction decode.** Ours is single-pass; WSJT-X decodes
+    strong → subtracts → re-decodes to dig out weak/colliding signals (and that, not
+    "signals finishing sooner," is why its messages appear spread over ~1 s). Bigger
+    feature; finds *more* signals, not just sooner — worth it for weak-signal/crowded
+    bands.
+
+- **🟠 OPEN DESIGN DECISION (Josh N0JDC + Joel W4LL need to talk) — the answering model:
+  "wait-for-CQ" vs answer-immediately.** Diagnosed from `dm420.log`: arming to answer a
+  clicked CQ **never fires** if that station doesn't call CQ *again*. DM420's engine
+  (`qso::engine` `commit_from_armed`) only replies on the target's **next** CQ — so when
+  you click a CQ and that station then gets worked by someone else, the engine sits
+  `Armed` and never transmits ("armed but nothing fired"). WSJT-X instead **answers the
+  CQ you clicked immediately** (next slot). The keying/TX path itself is fine — this is
+  purely the sequencing model.
+  - **Decide together:** this is a `docs/qso_flow.md` design call (Josh co-owns it).
+    **Maybe make it a toggle** — "answer immediately" (reply to the selected CQ next slot,
+    using its slot for TX parity) vs the current "wait-for-CQ" (wait for them to call
+    again). Likely default = answer-immediately, since that's what "answer this CQ" means
+    to most operators; keep wait-for-CQ as the option for arming a not-currently-calling
+    station.
+  - **Also wanted: user feedback about what the engine is *thinking*.** An armed-but-
+    waiting engine is silent on screen, so it just looks broken. Surface the engine's
+    state/intent in the UI — e.g. extend the waterslide's `ARMED ▸ {call}` tag to say
+    *what it's waiting on* ("waiting for W1ABC's CQ"), and cover idle / calling /
+    answering / nothing-heard. The engine now **logs** these transitions (`qso engine:
+    armed — will answer when the target next calls CQ`, `… target called CQ → answering`,
+    `calling CQ`, `abort → idle`) — the UI should mirror that thinking.
+  - **Status:** no behavior change yet (per Joel) — talk to Josh first. The diagnosis and
+    the engine-state logging (`qso/src/engine.rs`) are in place to inform the conversation.
+
 - **🔴 IMPORTANT — EMI/RFI crashed the rig's USB on transmit (FIXED, station-side):**
   this was the real TX blocker. With keying + data-route audio all correct, the **entire
   TS-590 USB connection dropped out the instant RF actually flowed** — the audio codec

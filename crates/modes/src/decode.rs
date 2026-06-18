@@ -420,6 +420,24 @@ fn decode_candidate(wf: &Waterfall, c: &Candidate) -> Option<[u8; 10]> {
 /// Decode a slot of mono audio at `sample_rate` (12 kHz expected) and return the
 /// transmissions found, strongest first.
 pub fn decode(samples: &[f32], sample_rate: u32, protocol: Protocol) -> Vec<Decode> {
+    // Collect the streamed decodes; order is strongest-first (candidate score).
+    // The call site re-sorts low-to-high in frequency if it wants that.
+    let mut out = Vec::new();
+    decode_streaming(samples, sample_rate, protocol, |d| out.push(d));
+    out
+}
+
+/// Like [`decode`], but hand each transmission to `on_decode` the instant it is
+/// found (strongest first) rather than collecting them into a `Vec`. This lets the
+/// live pipeline publish each decode onto the bus as it lands, so the UI and the
+/// QSO engine see the strongest signals (e.g. a CQ being answered) first — a beat
+/// before the whole slot's batch would have finished — instead of all at once.
+pub fn decode_streaming(
+    samples: &[f32],
+    sample_rate: u32,
+    protocol: Protocol,
+    mut on_decode: impl FnMut(Decode),
+) {
     let mut mon = Monitor::new(sample_rate, protocol, TIME_OSR, FREQ_OSR, 200.0, 3000.0);
     let bs = mon.block_size;
     let mut pos = 0;
@@ -430,10 +448,9 @@ pub fn decode(samples: &[f32], sample_rate: u32, protocol: Protocol) -> Vec<Deco
 
     let wf = &mon.wf;
     let noise = noise_floor(wf);
-    let cands = find_candidates(wf);
+    let cands = find_candidates(wf); // already sorted strongest-first by score
     let mut hash = CallHash::new();
     let mut seen: HashSet<[u8; 10]> = HashSet::new();
-    let mut out = Vec::new();
     let sp = wf.symbol_period;
     for c in &cands {
         let Some(payload) = decode_candidate(wf, c) else {
@@ -449,7 +466,7 @@ pub fn decode(samples: &[f32], sample_rate: u32, protocol: Protocol) -> Vec<Deco
             (wf.min_bin as f32 + c.freq_offset as f32 + c.freq_sub as f32 / wf.freq_osr as f32)
                 / sp;
         let dt = (c.time_offset as f32 + c.time_sub as f32 / wf.time_osr as f32) * sp;
-        out.push(Decode {
+        on_decode(Decode {
             score: c.score,
             snr_db: estimate_snr(wf, c, noise),
             dt,
@@ -458,9 +475,6 @@ pub fn decode(samples: &[f32], sample_rate: u32, protocol: Protocol) -> Vec<Deco
             msg_type,
         });
     }
-    // Present low-to-high in frequency by default at the call site; here keep
-    // strongest-first (candidates are already sorted by score).
-    out
 }
 
 #[cfg(test)]

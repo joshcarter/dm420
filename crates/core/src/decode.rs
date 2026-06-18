@@ -12,9 +12,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bus::types as t;
 use bus::{BusHandle, Topic};
-use modes::{Decode as ModeDecode, Protocol, decode};
+use modes::{Decode as ModeDecode, Protocol, decode, decode_streaming};
 
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 use crate::control::{AudioControl, StopReason, sleep_or_changed};
 use crate::health;
@@ -22,6 +23,13 @@ use crate::parse::parse_message;
 
 /// Decoder input rate (Joel's decoder is fixed at 12 kHz).
 const DECODE_RATE: u32 = 12_000;
+
+/// Seconds of post-signal silence at the end of a slot. The FT8/FT4 transmission
+/// finishes this far before the boundary, so the early (signal-end) decode pass
+/// fires `slot − this` into the slot — soon enough to answer in the next slot,
+/// while the boundary pass still catches anything with a late DT. Tunable: smaller
+/// = decodes appear later but the early pass catches more stations.
+const DECODE_TAIL: f64 = 1.5;
 
 /// Replay pacing for WAV playback. Not real slot timing — a recording's slots are
 /// emitted on this cadence so the GUI's decode rail populates promptly.
@@ -132,27 +140,77 @@ fn publish_slot(
     slot_start_ms: i64,
     decs: Vec<ModeDecode>,
 ) {
+    for d in decs {
+        publish_one(bus, radio, proto, slot_start_ms, d);
+    }
+}
+
+/// Publish a single decode onto the lossless decodes stream. The live path calls
+/// this per-decode as the decoder streams them, so each lands on the bus the
+/// instant it's found (rather than waiting for the whole slot's batch).
+fn publish_one(
+    bus: &BusHandle,
+    radio: &t::RadioId,
+    proto: Protocol,
+    slot_start_ms: i64,
+    d: ModeDecode,
+) {
     let ms = slot_start_ms;
     let slot_ms = (modes::slot_period(proto) * 1000.0) as i64;
     let slot = t::SlotId(ms.div_euclid(slot_ms.max(1)) as u64);
-    let mode = over_air(proto);
+    let msg = t::Decode {
+        radio: radio.clone(),
+        mode: over_air(proto),
+        t: t::Timestamp(ms),
+        offset: t::OffsetHz(d.freq_hz),
+        snr_db: Some(d.snr_db.round() as i8),
+        source: t::SignalSource::Received,
+        content: t::DecodeContent::Slotted {
+            slot,
+            dt: d.dt,
+            message: parse_message(&d.message),
+        },
+    };
+    let _ = bus.publish(&Topic::Decodes(radio.clone()), msg);
+}
 
-    for d in decs {
-        let msg = t::Decode {
-            radio: radio.clone(),
-            mode,
-            t: t::Timestamp(ms),
-            offset: t::OffsetHz(d.freq_hz),
-            snr_db: Some(d.snr_db.round() as i8),
-            source: t::SignalSource::Received,
-            content: t::DecodeContent::Slotted {
-                slot,
-                dt: d.dt,
-                message: parse_message(&d.message),
-            },
-        };
-        let _ = bus.publish(&Topic::Decodes(radio.clone()), msg);
-    }
+/// Decode `audio` for the slot starting at `slot_start_ms` on its own thread,
+/// streaming each *new* decode onto the bus. `published` dedups by message text
+/// within a slot, so the boundary (full) pass never re-publishes what the
+/// signal-end (early) pass already sent. `cleanup` drops the slot's dedup set when
+/// the pass finishes (set on the final boundary pass).
+#[allow(clippy::too_many_arguments)]
+fn spawn_decode_pass(
+    bus: BusHandle,
+    radio: t::RadioId,
+    proto: Protocol,
+    audio: Vec<f32>,
+    slot_start_ms: i64,
+    published: Arc<Mutex<HashMap<i64, HashSet<String>>>>,
+    pass: &'static str,
+    cleanup: bool,
+) {
+    std::thread::spawn(move || {
+        let secs = audio.len() / DECODE_RATE as usize;
+        let mut n = 0usize;
+        decode_streaming(&audio, DECODE_RATE, proto, |d| {
+            // Insert under the lock, publish outside it (the guard drops at the `;`).
+            let fresh = published
+                .lock()
+                .unwrap()
+                .entry(slot_start_ms)
+                .or_default()
+                .insert(d.message.clone());
+            if fresh {
+                publish_one(&bus, &radio, proto, slot_start_ms, d);
+                n += 1;
+            }
+        });
+        if cleanup {
+            published.lock().unwrap().remove(&slot_start_ms);
+        }
+        tracing::debug!("live decode [{pass}]: {secs} s of audio -> {n} new decode(s)");
+    });
 }
 
 /// Replay a WAV recording onto the decodes topic.
@@ -301,6 +359,14 @@ fn run_stream(
     // Audio for the slot currently in progress, plus the slot we're inside.
     let mut slot_buf: Vec<f32> = Vec::new();
     let mut slot_start = modes::current_slot_start(now_unix(), proto);
+    // Two-pass decode: a speculative early pass at signal-end + the full pass at the
+    // boundary. `early_trigger` is seconds-into-slot when the transmission is done
+    // (slot minus the trailing silence); `published` dedups the two passes by message
+    // text, per slot. (Adding more trigger points here scales to N passes for free —
+    // the dedup makes extra passes only publish what's newly decodable.)
+    let early_trigger = modes::slot_period(proto) - DECODE_TAIL;
+    let mut early_decoded = false;
+    let published: Arc<Mutex<HashMap<i64, HashSet<String>>>> = Arc::new(Mutex::new(HashMap::new()));
 
     let mut ever_healthy = false;
     let mut silent_for = Duration::ZERO;
@@ -359,28 +425,45 @@ fn run_stream(
             publish_column(bus, radio, proto, &win, bin_hz, max_bins);
         }
 
-        // --- slot-aligned decode: when wall-clock crosses a boundary, decode
-        // the slot that just ended (off-thread so it never stalls capture) ---
+        // --- slot-aligned decode (two-pass, off-thread so it never stalls capture).
+        // EARLY pass at signal-end (~13.5 s into an FT8 slot) gets on-time stations —
+        // incl. a CQ being worked — to the UI + engine *before* the boundary; the FULL
+        // pass at the boundary re-decodes the whole slot and adds any late-DT / weak
+        // signals the early pass missed (deduped against it). Degrades to today's
+        // behavior if the early pass finds nothing. Decodes are stamped with the slot's
+        // *start* time so text lands where its audio sits on the scrolling spectrogram.
         slot_buf.extend_from_slice(&s12);
-        let cur_slot = modes::current_slot_start(now_unix(), proto);
+        let now = now_unix();
+        let cur_slot = modes::current_slot_start(now, proto);
         if cur_slot != slot_start {
-            // `slot_buf` holds the slot that just ended; stamp its decodes with
-            // that slot's *start* time (when its audio began arriving), so the
-            // text lands where its audio now sits on the scrolling spectrogram.
             let slot_start_ms = (slot_start * 1000.0) as i64;
             slot_start = cur_slot;
+            early_decoded = false;
             let audio = std::mem::take(&mut slot_buf);
-            let bus = bus.clone();
-            let radio = radio.clone();
-            std::thread::spawn(move || {
-                let decs = decode(&audio, DECODE_RATE, proto);
-                tracing::debug!(
-                    "live decode: {} s of audio -> {} decode(s)",
-                    audio.len() / DECODE_RATE as usize,
-                    decs.len()
-                );
-                publish_slot(&bus, &radio, proto, slot_start_ms, decs);
-            });
+            spawn_decode_pass(
+                bus.clone(),
+                radio.clone(),
+                proto,
+                audio,
+                slot_start_ms,
+                published.clone(),
+                "full",
+                true,
+            );
+        } else if !early_decoded && modes::time_into_slot(now, proto) >= early_trigger {
+            early_decoded = true;
+            let slot_start_ms = (slot_start * 1000.0) as i64;
+            let audio = slot_buf.clone();
+            spawn_decode_pass(
+                bus.clone(),
+                radio.clone(),
+                proto,
+                audio,
+                slot_start_ms,
+                published.clone(),
+                "early",
+                false,
+            );
         }
     }
 }
