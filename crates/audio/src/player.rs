@@ -1,17 +1,19 @@
-//! Uncompressed WAV playback. Loading/decoding is pure and tested; only the
-//! actual output stream needs hardware. The player thread owns the cpal output
-//! stream (cpal streams are `!Send`); the caller gets a handle with progress
-//! counters and a stop channel.
+//! Audio output. `load_wav_mono` (loading/decoding) is pure and tested. The live
+//! output is a **persistent** stream: [`OutputStream`] opens the device once and
+//! keeps a cpal stream running (playing silence when idle), so starting a
+//! transmission is immediate — no per-over device open. The output thread owns the
+//! cpal stream (cpal streams are `!Send`); the handle drives it via a command
+//! channel plus progress/done atomics.
 
 use crate::AudioError;
 use crate::device::{DeviceKind, open_cpal_device};
 use crate::dsp::{Resampler, downmix_to_mono};
 use cpal::traits::{DeviceTrait, StreamTrait};
-use crossbeam_channel::{Receiver, Sender, bounded};
+use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use tracing::{debug, info, warn};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use tracing::{info, warn};
 
 /// Load a WAV file as mono f32 samples plus its sample rate. Handles 16/24/32-bit
 /// integer and 32-bit float, any channel count (downmixed by averaging).
@@ -37,105 +39,151 @@ pub fn load_wav_mono(path: &Path) -> Result<(Vec<f32>, u32), AudioError> {
     Ok((mono, spec.sample_rate))
 }
 
-/// Handle to an in-progress playback.
-pub struct Playback {
-    /// Frames (at the *file* rate) played so far.
-    pub progress: Arc<AtomicU64>,
-    /// Total frames at the file rate.
-    pub total_frames: u64,
-    pub file_rate: u32,
-    pub device_name: String,
-    stop_tx: Sender<()>,
-    done_rx: Receiver<()>,
-    join: std::thread::JoinHandle<()>,
+/// A command to the output stream's audio callback.
+enum OutCmd {
+    /// Play these device-rate samples from the start; `ratio` (file_rate/device_rate)
+    /// maps playback position back to file frames for `progress`.
+    Play { samples: Vec<f32>, ratio: f64 },
+    /// Drop to silence immediately (operator Stop).
+    Silence,
 }
 
-impl Playback {
-    /// True once the file has finished playing (does not block).
-    pub fn is_done(&self) -> bool {
-        self.done_rx.try_recv().is_ok()
-    }
-
-    /// Block until playback completes or `stop()` is called elsewhere.
-    pub fn wait(self) {
-        let _ = self.done_rx.recv();
-        let _ = self.stop_tx.send(());
-        let _ = self.join.join();
-    }
-
-    /// A clone of the done-channel for select loops.
-    pub fn done_receiver(&self) -> Receiver<()> {
-        self.done_rx.clone()
-    }
-
-    /// Stop playback now.
-    pub fn stop(self) {
-        let _ = self.stop_tx.send(());
-        let _ = self.join.join();
-    }
-}
-
-/// Start playing mono samples (at `file_rate`) on the output device
-/// (`None` = system default). Resamples to the device rate as needed and fans
-/// the mono signal out to all device channels.
-pub fn play(
-    output_name: Option<String>,
-    mono: Vec<f32>,
-    file_rate: u32,
-) -> Result<Playback, AudioError> {
-    let total_frames = mono.len() as u64;
-    let progress = Arc::new(AtomicU64::new(0));
-    let progress2 = Arc::clone(&progress);
-    let (stop_tx, stop_rx) = bounded::<()>(1);
-    let (done_tx, done_rx) = bounded::<()>(1);
-    let (ready_tx, ready_rx) = bounded::<Result<String, AudioError>>(1);
-
-    let join = std::thread::Builder::new()
-        .name("audio-play".into())
-        .spawn(move || {
-            playback_thread(
-                output_name,
-                mono,
-                file_rate,
-                progress2,
-                stop_rx,
-                done_tx,
-                ready_tx,
-            )
-        })
-        .expect("spawn audio-play");
-
-    let device_name = match ready_rx.recv() {
-        Ok(Ok(name)) => name,
-        Ok(Err(e)) => {
-            let _ = join.join();
-            return Err(e);
-        }
-        Err(_) => return Err(AudioError::Stream("playback thread died on startup".into())),
-    };
-
-    Ok(Playback {
-        progress,
-        total_frames,
-        file_rate,
-        device_name,
-        stop_tx,
-        done_rx,
-        join,
-    })
-}
-
-fn playback_thread(
-    output_name: Option<String>,
-    mono: Vec<f32>,
-    file_rate: u32,
+/// A persistently-open output stream. The device is opened once (here) and the
+/// cpal stream runs continuously, emitting silence until [`load`](Self::load)ed
+/// with a waveform — so a transmission starts on the next audio callback rather
+/// than after a cold device open. Re-open (a fresh `OutputStream`) only when the
+/// selected output device changes or the stream dies.
+pub struct OutputStream {
+    /// The device name as requested by the caller (`None` = system default), kept
+    /// so the owner can tell whether a settings change needs a re-open.
+    requested: Option<String>,
+    device_name: String,
+    device_rate: u32,
+    cmd_tx: Sender<OutCmd>,
+    /// Playback position of the current waveform, in *file* frames.
     progress: Arc<AtomicU64>,
-    stop_rx: Receiver<()>,
-    done_tx: Sender<()>,
-    ready_tx: Sender<Result<String, AudioError>>,
+    /// True when the current waveform has finished (or none is loaded) — i.e. the
+    /// stream is emitting silence.
+    done: Arc<AtomicBool>,
+    /// Set by cpal's error callback if the device drops out; the owner re-opens.
+    dead: Arc<AtomicBool>,
+    shutdown_tx: Sender<()>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl OutputStream {
+    /// Open `name` (`None` = system default) and start a silent stream. Blocks only
+    /// until the stream is running (the one cold open), then stays warm.
+    pub fn open(requested: Option<String>) -> Result<OutputStream, AudioError> {
+        let (cmd_tx, cmd_rx) = unbounded::<OutCmd>();
+        let (ready_tx, ready_rx) = bounded::<Result<(String, u32), AudioError>>(1);
+        let (shutdown_tx, shutdown_rx) = bounded::<()>(1);
+        let progress = Arc::new(AtomicU64::new(0));
+        let done = Arc::new(AtomicBool::new(true)); // idle == "done" (emitting silence)
+        let dead = Arc::new(AtomicBool::new(false));
+
+        let (progress_t, done_t, dead_t, req_t) =
+            (progress.clone(), done.clone(), dead.clone(), requested.clone());
+        let join = std::thread::Builder::new()
+            .name("audio-out".into())
+            .spawn(move || {
+                output_thread(req_t, cmd_rx, progress_t, done_t, dead_t, ready_tx, shutdown_rx)
+            })
+            .expect("spawn audio-out");
+
+        match ready_rx.recv() {
+            Ok(Ok((device_name, device_rate))) => Ok(OutputStream {
+                requested,
+                device_name,
+                device_rate,
+                cmd_tx,
+                progress,
+                done,
+                dead,
+                shutdown_tx,
+                join: Some(join),
+            }),
+            Ok(Err(e)) => {
+                let _ = join.join();
+                Err(e)
+            }
+            Err(_) => Err(AudioError::Stream("output thread died on startup".into())),
+        }
+    }
+
+    /// The device name as requested at open (`None` = system default).
+    pub fn requested(&self) -> Option<&str> {
+        self.requested.as_deref()
+    }
+
+    /// The resolved output device name.
+    pub fn device_name(&self) -> &str {
+        &self.device_name
+    }
+
+    /// The current playback position counter (file frames), shared with the audio
+    /// callback — used to pace anything synced to playback (e.g. the TX waterfall).
+    pub fn progress(&self) -> Arc<AtomicU64> {
+        self.progress.clone()
+    }
+
+    /// True once the loaded waveform has finished (or none is loaded).
+    pub fn is_done(&self) -> bool {
+        self.done.load(Ordering::Acquire)
+    }
+
+    /// True if the device dropped out and the stream needs re-opening.
+    pub fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::Acquire)
+    }
+
+    /// Load a mono waveform (at `file_rate`) and start playing it immediately,
+    /// resampling to the device rate as needed.
+    pub fn load(&self, mono: Vec<f32>, file_rate: u32) {
+        let ratio = file_rate as f64 / self.device_rate as f64;
+        let samples = if file_rate == self.device_rate {
+            mono
+        } else {
+            let mut r = Resampler::new(file_rate, self.device_rate);
+            let mut out = r.push(&mono);
+            out.extend(r.flush());
+            out
+        };
+        // Reset synchronously so a waiter polling `is_done`/`progress` right after
+        // this never sees the previous over's finished state.
+        self.progress.store(0, Ordering::Release);
+        self.done.store(false, Ordering::Release);
+        let _ = self.cmd_tx.send(OutCmd::Play { samples, ratio });
+    }
+
+    /// Cut any in-progress playback to silence now (operator Stop / abort).
+    pub fn silence(&self) {
+        let _ = self.cmd_tx.send(OutCmd::Silence);
+        self.done.store(true, Ordering::Release);
+    }
+}
+
+impl Drop for OutputStream {
+    fn drop(&mut self) {
+        let _ = self.shutdown_tx.send(());
+        if let Some(j) = self.join.take() {
+            let _ = j.join();
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn output_thread(
+    requested: Option<String>,
+    cmd_rx: Receiver<OutCmd>,
+    progress: Arc<AtomicU64>,
+    done: Arc<AtomicBool>,
+    dead: Arc<AtomicBool>,
+    ready_tx: Sender<Result<(String, u32), AudioError>>,
+    shutdown_rx: Receiver<()>,
 ) {
     let setup = (|| {
-        let device = open_cpal_device(DeviceKind::Output, output_name.as_deref())?;
+        let device = open_cpal_device(DeviceKind::Output, requested.as_deref())?;
         let name = device.name().unwrap_or_else(|_| "<unknown>".into());
         // Prefer the device's reported config; fall back to a common f32 layout for a
         // USB codec whose output configs cpal can't enumerate (it still streams fine).
@@ -168,77 +216,89 @@ fn playback_thread(
         buffer_size: cpal::BufferSize::Default,
     };
     let channels = channels as usize;
-    debug!(device = %name, rate = device_rate, channels, "audio-tx: opening output stream");
 
-    // Resample the whole file up front (memory is cheap at these sizes, and it
-    // keeps the audio callback trivial). Track progress in *file* frames so the
-    // UI can show position against the file duration.
-    let ratio = file_rate as f64 / device_rate as f64;
-    let samples: Vec<f32> = if file_rate == device_rate {
-        mono
-    } else {
-        let mut r = Resampler::new(file_rate, device_rate);
-        let mut out = r.push(&mono);
-        out.extend(r.flush());
-        out
-    };
-
-    let pos = Arc::new(AtomicU64::new(0));
-    let pos_cb = Arc::clone(&pos);
-    let samples = Arc::new(samples);
-    let samples_cb = Arc::clone(&samples);
-    let done_cb = done_tx.clone();
-    let progress_cb = Arc::clone(&progress);
-    let err_name = name.clone(); // for the stream-error callback (catches device dropouts)
+    // Callback-owned playback state (cpal data callbacks are `FnMut`, so the closure
+    // carries it across invocations). Starts empty == silence. New waveforms / Stop
+    // arrive over `cmd_rx`, drained at the top of each callback. `playing` gates the
+    // done/progress updates to a single play→finished transition, so a callback that
+    // runs on an already-finished buffer can't re-assert `done` after the handle has
+    // cleared it for the next over.
+    let mut current: Vec<f32> = Vec::new();
+    let mut pos: usize = 0;
+    let mut ratio: f64 = 1.0;
+    let mut playing = false;
+    let progress_cb = progress.clone();
+    let done_cb = done.clone();
+    let err_dead = dead.clone();
+    let err_name = name.clone();
 
     let stream = device.build_output_stream(
         &stream_config,
         move |out: &mut [f32], _| {
-            let mut p = pos_cb.load(Ordering::Relaxed) as usize;
+            while let Ok(cmd) = cmd_rx.try_recv() {
+                match cmd {
+                    OutCmd::Play { samples, ratio: r } => {
+                        current = samples;
+                        pos = 0;
+                        ratio = r;
+                        playing = true;
+                        done_cb.store(false, Ordering::Relaxed);
+                    }
+                    OutCmd::Silence => {
+                        current.clear();
+                        pos = 0;
+                        playing = false;
+                    }
+                }
+            }
             for frame in out.chunks_mut(channels) {
-                let v = samples_cb.get(p).copied().unwrap_or(0.0);
+                let v = current.get(pos).copied().unwrap_or(0.0);
                 for slot in frame.iter_mut() {
                     *slot = v;
                 }
-                if p < samples_cb.len() {
-                    p += 1;
+                if pos < current.len() {
+                    pos += 1;
                 }
             }
-            pos_cb.store(p as u64, Ordering::Relaxed);
-            progress_cb.store((p as f64 * ratio) as u64, Ordering::Relaxed);
-            if p >= samples_cb.len() {
-                let _ = done_cb.try_send(());
+            if playing {
+                progress_cb.store((pos as f64 * ratio) as u64, Ordering::Relaxed);
+                if pos >= current.len() {
+                    done_cb.store(true, Ordering::Relaxed);
+                    playing = false; // emit silence until the next Play
+                }
             }
         },
-        move |e| warn!(device = %err_name, error = %e, "audio-tx: output stream error (device dropout?)"),
+        move |e| {
+            warn!(device = %err_name, error = %e, "audio-out: output stream error (device dropout?)");
+            err_dead.store(true, Ordering::Release);
+        },
         None,
     );
 
     let stream = match stream {
         Ok(s) => s,
         Err(e) => {
-            warn!(device = %name, error = %e, "audio-tx: failed to build output stream");
+            warn!(device = %name, error = %e, "audio-out: failed to build output stream");
             let _ = ready_tx.send(Err(AudioError::Stream(e.to_string())));
             return;
         }
     };
     if let Err(e) = stream.play() {
-        warn!(device = %name, error = %e, "audio-tx: failed to start output stream");
+        warn!(device = %name, error = %e, "audio-out: failed to start output stream");
         let _ = ready_tx.send(Err(AudioError::Stream(e.to_string())));
         return;
     }
-    info!(device = %name, device_rate, channels, frames = samples.len(), "audio-tx: playback started");
-    let _ = ready_tx.send(Ok(name));
+    info!(device = %name, device_rate, channels, "audio-out: output stream open (warm)");
+    let _ = ready_tx.send(Ok((name, device_rate)));
 
-    // Hold the stream until stopped (wait() sends stop after done arrives).
-    let _ = stop_rx.recv();
-    // Pause explicitly before dropping — macOS coreaudio has been observed to
-    // keep callbacks running after a bare drop (see recorder.rs).
+    // Hold the stream alive until the handle is dropped. Pause before drop —
+    // macOS coreaudio has been observed to keep callbacks running after a bare
+    // drop (see recorder.rs).
+    let _ = shutdown_rx.recv();
     if let Err(e) = stream.pause() {
         warn!(error = %e, "failed to pause output stream");
     }
     drop(stream);
-    let _ = done_tx.try_send(());
 }
 
 #[cfg(test)]

@@ -22,7 +22,7 @@ pub mod recorder;
 pub use device::{DeviceInfo, DeviceKind, list_devices, preferred_input, select};
 pub use dsp::{Resampler, dbfs, level_bar};
 pub use meta::{RadioSnapshot, RecordingMeta, default_recording_path};
-pub use player::{Playback, load_wav_mono, play};
+pub use player::{OutputStream, load_wav_mono};
 pub use recorder::{
     CaptureStream, LevelMeasurement, Recorder, RecordingSummary, capture_stream, capture_window,
     measure_level,

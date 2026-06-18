@@ -57,10 +57,35 @@ pub fn spawn(bus: &BusHandle, radio: t::RadioId, tx: Arc<crate::control::TxContr
     let bus = bus.clone();
     tokio::spawn(async move {
         tracing::info!("audio-tx: TX path armed");
+        // The warm output stream: opened once and kept alive across overs so a
+        // transmission starts on the next audio callback, not after a cold device
+        // open. Re-opened only when the selected device changes or it drops out.
+        // Open it up front so even the first over is immediate; if the device isn't
+        // ready yet the loop opens it on the first transmit instead.
+        let mut out: Option<audio::OutputStream> = match audio::OutputStream::open(tx.snapshot()) {
+            Ok(o) => Some(o),
+            Err(e) => {
+                tracing::warn!(error = %e, "audio-tx: output not ready at startup; opening on first over");
+                None
+            }
+        };
         while let Some((req, responder)) = server.next().await {
-            // Read the (live-editable) output device fresh for each over.
-            let output = tx.snapshot();
-            let (slot, outcome) = transmit(&bus, &radio, output, req, &abort_gen).await;
+            let want = tx.snapshot(); // live-editable output device (None = default)
+            let reopen = match &out {
+                Some(o) => o.requested() != want.as_deref() || o.is_dead(),
+                None => true,
+            };
+            if reopen {
+                drop(out.take()); // drop any existing stream first to free the device
+                out = match audio::OutputStream::open(want.clone()) {
+                    Ok(o) => Some(o),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "audio-tx: cannot open output device");
+                        None
+                    }
+                };
+            }
+            let (slot, outcome) = transmit(&bus, &radio, out.as_ref(), req, &abort_gen).await;
             match &outcome {
                 t::TxOutcome::Sent => tracing::info!(?slot, "audio-tx: over sent"),
                 t::TxOutcome::Failed(e) => tracing::warn!(?slot, error = %e, "audio-tx: over failed"),
@@ -113,12 +138,13 @@ fn spawn_abort_watcher(bus: &BusHandle, radio: t::RadioId, abort_gen: Arc<Atomic
     });
 }
 
-/// Run one transmission end to end. Returns the slot it was for (for the report)
-/// and the outcome.
+/// Run one transmission end to end on the warm `out` stream. Returns the slot it
+/// was for (for the report) and the outcome. `out` is `None` only when the output
+/// device couldn't be opened — the over then fails cleanly.
 async fn transmit(
     bus: &BusHandle,
     radio: &t::RadioId,
-    output: Option<String>,
+    out: Option<&audio::OutputStream>,
     req: t::TxRequest,
     abort_gen: &AtomicU64,
 ) -> (Option<t::SlotId>, t::TxOutcome) {
@@ -134,6 +160,13 @@ async fn transmit(
         return (
             None,
             t::TxOutcome::Failed("unsupported TxRequest variant".into()),
+        );
+    };
+
+    let Some(out) = out else {
+        return (
+            Some(slot),
+            t::TxOutcome::Failed("audio output: device unavailable".into()),
         );
     };
 
@@ -200,40 +233,39 @@ async fn transmit(
     let max_bins = (SPECTRUM_MAX_HZ / bin_hz).ceil() as usize;
     let tx_cols = tx_spectrum_columns(&samples, max_bins);
 
-    // Play to the rig's data-in, staying keyed until playback finishes (or the
+    // Play to the rig's data-in on the warm stream — starts on the next audio
+    // callback (no device open here), staying keyed until playback finishes (or the
     // operator hits Stop, which cuts the over short). No mid-over re-keying: the
     // watchdog covers a full over, and a Kenwood rejects `TX` while transmitting.
-    let outcome = match audio::play(output, samples, TX_SAMPLE_RATE) {
-        Ok(playback) => {
-            // How late the very first audio sample reaches the air, relative to the
-            // slot edge — synth + key-up + device-open all land in here. Plus the
-            // ~0.2 s lead trimmed above, this is our effective DT.
-            tracing::info!(
-                into_slot_ms = now_ms().rem_euclid(15_000),
-                "audio-tx: playback started (tones reach air ~0.2 s later)",
-            );
-            // Stream the own-TX columns while it plays; `stop` ends the streamer the
-            // instant the over does (normal finish or operator Stop).
-            let stop = Arc::new(AtomicBool::new(false));
-            spawn_tx_spectrum(
-                bus.clone(),
-                radio.clone(),
-                mode,
-                playback.progress.clone(),
-                tx_cols,
-                bin_hz,
-                stop.clone(),
-            );
-            let aborted = wait_done(&playback, abort_gen, base).await;
-            stop.store(true, Ordering::Release);
-            playback.stop();
-            if aborted {
-                t::TxOutcome::Failed("aborted by operator".into())
-            } else {
-                t::TxOutcome::Sent
-            }
-        }
-        Err(e) => t::TxOutcome::Failed(format!("audio output: {e}")),
+    out.load(samples, TX_SAMPLE_RATE);
+    // How late the first audio sample reaches the air, relative to the slot edge —
+    // synth + key-up land in here (no longer a device open). Plus the ~0.2 s lead
+    // trimmed above, this is our effective DT.
+    tracing::info!(
+        into_slot_ms = now_ms().rem_euclid(15_000),
+        "audio-tx: playback started (tones reach air ~0.2 s later)",
+    );
+    // Stream the own-TX columns while it plays; `stop` ends the streamer the instant
+    // the over does (normal finish or operator Stop).
+    let stop = Arc::new(AtomicBool::new(false));
+    spawn_tx_spectrum(
+        bus.clone(),
+        radio.clone(),
+        mode,
+        out.progress(),
+        tx_cols,
+        bin_hz,
+        stop.clone(),
+    );
+    let aborted = wait_done(out, abort_gen, base).await;
+    stop.store(true, Ordering::Release);
+    if aborted {
+        out.silence(); // cut the carrier audio now
+    }
+    let outcome = if aborted {
+        t::TxOutcome::Failed("aborted by operator".into())
+    } else {
+        t::TxOutcome::Sent
     };
 
     // Always key down (key-down is never gated).
@@ -246,10 +278,10 @@ async fn transmit(
 /// stays keyed from the single key-up in [`transmit`] — a full over fits inside the
 /// rig's PTT watchdog, so there is no mid-over re-keying. Returns `true` if the
 /// operator aborted (Stop) before playback finished.
-async fn wait_done(playback: &audio::Playback, abort_gen: &AtomicU64, base: u64) -> bool {
+async fn wait_done(out: &audio::OutputStream, abort_gen: &AtomicU64, base: u64) -> bool {
     let tick = Duration::from_millis(200);
     let mut elapsed = Duration::ZERO;
-    while !playback.is_done() && elapsed < MAX_TX {
+    while !out.is_done() && elapsed < MAX_TX {
         if abort_gen.load(Ordering::Acquire) != base {
             tracing::debug!("audio-tx: Stop detected mid-over; aborting carrier");
             return true; // operator hit Stop — abort the over now
