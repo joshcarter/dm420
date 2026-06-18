@@ -414,13 +414,15 @@ impl Panel for Waterfall {
                     } else {
                         crate::waterslide_panel::martian_cmap_light()
                     };
-                    self.spectro.update_and_paint(
-                        ctx.ui,
-                        right,
-                        ctx.dt,
-                        ctx.bus.spectrum().as_ref(),
-                        &cmap,
-                    );
+                    // While keyed, show our own-TX waterfall (the outgoing signal at
+                    // its true offset) in place of the RX one, which is meaningless
+                    // during an over. A fresh own-TX column means we're transmitting;
+                    // otherwise fall back to the RX waterfall. Both share the buffer,
+                    // so the timeline reads RX … my over … RX as it scrolls.
+                    let tx_col = ctx.bus.tx_spectrum().filter(|r| now_ms - r.t.0 < 500);
+                    let column = tx_col.or_else(|| ctx.bus.spectrum());
+                    self.spectro
+                        .update_and_paint(ctx.ui, right, ctx.dt, column.as_ref(), &cmap);
                     // Click-to-select on the live waterslide (mock mode selects via
                     // the sim's own `ui()`; the real waterslide is draw-only). We
                     // hit-test here and let `draw_waterslide` resolve the click to a

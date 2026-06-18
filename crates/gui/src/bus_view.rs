@@ -76,8 +76,12 @@ pub struct MapSpot {
 /// and pumps.
 pub struct BusView {
     rig: Cell<RigState>,
-    /// Latest waterfall column (real decoder only; published once per slot).
+    /// Latest RX waterfall column (real decoder only; published ~20×/s).
     spectrum: Cell<SpectrumRow>,
+    /// Latest own-TX waterfall column, streamed by `core::tx` while keyed. Kept
+    /// separate from `spectrum` so RX columns don't race it onto one cell; the
+    /// panel shows it in place of the RX waterfall during an over.
+    spectrum_tx: Cell<SpectrumRow>,
     // `scanner`/`clock` are pumped and exposed now; their panel consumers (idle
     // scan status, slot clock in the top bar) land in the next wiring pass.
     #[allow(dead_code)]
@@ -136,6 +140,7 @@ impl BusView {
 
         let rig = cell();
         let spectrum = cell();
+        let spectrum_tx = cell();
         let scanner = cell();
         let clock = cell();
         let qso = cell();
@@ -191,10 +196,11 @@ impl BusView {
             rig.clone(),
             egui_ctx.clone(),
         );
-        pump_state(
+        pump_spectrum(
             &bus,
             Topic::Spectrum(mocks::radio_id()),
             spectrum.clone(),
+            spectrum_tx.clone(),
             egui_ctx.clone(),
         );
         pump_state(&bus, Topic::ScannerState, scanner.clone(), egui_ctx.clone());
@@ -228,6 +234,7 @@ impl BusView {
         Self {
             rig,
             spectrum,
+            spectrum_tx,
             scanner,
             clock,
             bands,
@@ -257,9 +264,16 @@ impl BusView {
         self.rig.lock().unwrap().clone()
     }
 
-    /// The latest waterfall spectrum column, if one has arrived (real mode only).
+    /// The latest RX waterfall spectrum column, if one has arrived (real mode only).
     pub fn spectrum(&self) -> Option<SpectrumRow> {
         self.spectrum.lock().unwrap().clone()
+    }
+
+    /// The latest own-TX waterfall column, if one has arrived. Streamed by
+    /// `core::tx` while keyed; the panel shows it in place of the RX waterfall
+    /// during an over (the RX capture is meaningless while transmitting).
+    pub fn tx_spectrum(&self) -> Option<SpectrumRow> {
+        self.spectrum_tx.lock().unwrap().clone()
     }
 
     /// The current scanner status, if seen yet. (Consumer lands next pass.)
@@ -537,6 +551,43 @@ fn pump_state<T: BusMessage>(bus: &BusHandle, topic: Topic, cell: Cell<T>, ctx: 
                     ctx.request_repaint();
                 }
                 // State never lags, but be exhaustive: a closed channel ends the pump.
+                Err(BusError::Lagged { .. }) => continue,
+                Err(_) => break,
+            }
+        }
+    });
+}
+
+/// Spawn a pump for the spectrum topic, routing each column to the RX or own-TX
+/// cell by its `source`. Splitting them keeps RX columns (still produced by the
+/// decoder while we transmit) from racing the own-TX columns onto one cell, so the
+/// panel can cleanly swap to the outgoing-signal waterfall while keyed.
+fn pump_spectrum(
+    bus: &BusHandle,
+    topic: Topic,
+    rx: Cell<SpectrumRow>,
+    tx: Cell<SpectrumRow>,
+    ctx: egui::Context,
+) {
+    let mut sub = match bus.subscribe::<SpectrumRow>(TopicSelector::Exact(topic)) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(error = ?e, "bus_view: spectrum subscribe failed");
+            return;
+        }
+    };
+    tokio::spawn(async move {
+        loop {
+            match sub.recv().await {
+                Ok(v) => {
+                    let cell = match v.source {
+                        SignalSource::OwnTx => &tx,
+                        SignalSource::Received => &rx,
+                    };
+                    *cell.lock().unwrap() = Some(v);
+                    ctx.request_repaint();
+                }
+                // Lossy lag: keep reading. Closed/dropped: end the pump.
                 Err(BusError::Lagged { .. }) => continue,
                 Err(_) => break,
             }

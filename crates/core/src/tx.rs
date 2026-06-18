@@ -15,8 +15,8 @@
 //! path; nothing here runs in the default (RX-only) build.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bus::types as t;
 use bus::{BusError, BusHandle, Topic, TopicSelector};
@@ -29,6 +29,14 @@ const TX_SAMPLE_RATE: u32 = 12_000;
 /// even if playback never signals done. An FT8 over is ~12.6 s in a 15 s slot, and
 /// this stays under the rig's PTT watchdog so key-down beats it.
 const MAX_TX: Duration = Duration::from_secs(14);
+
+/// Own-TX waterfall parameters — must mirror `core::decode` so our own-TX columns
+/// share the RX axis: a 1024-pt FFT at 12 kHz (~11.7 Hz bins) kept to ~0..3000 Hz,
+/// one column every 50 ms. The TX synth already runs at 12 kHz (`TX_SAMPLE_RATE`),
+/// so a column FFT'd here drops straight onto the same offset axis the decoder uses.
+const FFT_SIZE: usize = 1024;
+const SPECTRUM_MAX_HZ: f32 = 3000.0;
+const SPECTRUM_HOP_S: f64 = 0.05;
 
 /// Serve `radio/{id}/audio_tx`: run each requested transmission to completion (one
 /// at a time) and report its outcome on `radio/{id}/tx_report`.
@@ -176,12 +184,33 @@ async fn transmit(
         return (Some(slot), classify_key_error(e));
     }
 
+    // Pre-FFT the synthesized waveform into own-TX waterfall columns so we can
+    // stream them, paced to playback, onto the spectrum topic — the operator sees
+    // their outgoing signal scroll by at its true offset (the RX capture is
+    // meaningless while keyed). Columns share the RX axis (same FFT size + rate).
+    let bin_hz = TX_SAMPLE_RATE as f32 / FFT_SIZE as f32;
+    let max_bins = (SPECTRUM_MAX_HZ / bin_hz).ceil() as usize;
+    let tx_cols = tx_spectrum_columns(&samples, max_bins);
+
     // Play to the rig's data-in, staying keyed until playback finishes (or the
     // operator hits Stop, which cuts the over short). No mid-over re-keying: the
     // watchdog covers a full over, and a Kenwood rejects `TX` while transmitting.
     let outcome = match audio::play(output, samples, TX_SAMPLE_RATE) {
         Ok(playback) => {
+            // Stream the own-TX columns while it plays; `stop` ends the streamer the
+            // instant the over does (normal finish or operator Stop).
+            let stop = Arc::new(AtomicBool::new(false));
+            spawn_tx_spectrum(
+                bus.clone(),
+                radio.clone(),
+                mode,
+                playback.progress.clone(),
+                tx_cols,
+                bin_hz,
+                stop.clone(),
+            );
             let aborted = wait_done(&playback, abort_gen, base).await;
+            stop.store(true, Ordering::Release);
             playback.stop();
             if aborted {
                 t::TxOutcome::Failed("aborted by operator".into())
@@ -245,4 +274,70 @@ fn classify_key_error(e: String) -> t::TxOutcome {
     } else {
         t::TxOutcome::Failed(e)
     }
+}
+
+/// FFT the synthesized waveform into scrolling-waterfall columns, one every
+/// [`SPECTRUM_HOP_S`]. Each entry is `(sample index at the window's right edge,
+/// magnitudes)` so the streamer can release a column once playback has reached it.
+fn tx_spectrum_columns(samples: &[f32], max_bins: usize) -> Vec<(usize, Vec<u8>)> {
+    let hop = (TX_SAMPLE_RATE as f64 * SPECTRUM_HOP_S).max(1.0) as usize;
+    let mut cols = Vec::new();
+    let mut end = FFT_SIZE;
+    while end <= samples.len() {
+        cols.push((
+            end,
+            dsp::spectrum_column(&samples[end - FFT_SIZE..end], FFT_SIZE, max_bins),
+        ));
+        end += hop;
+    }
+    cols
+}
+
+/// Stream the pre-computed own-TX waterfall columns onto the spectrum topic, paced
+/// to playback `progress` (file frames at 12 kHz, so it indexes `samples` directly)
+/// and tagged [`SignalSource::OwnTx`](t::SignalSource::OwnTx) so the GUI shows them
+/// in place of the RX waterfall while keyed. Ends when every column is out or
+/// `stop` is set (the over finished or the operator aborted).
+fn spawn_tx_spectrum(
+    bus: BusHandle,
+    radio: t::RadioId,
+    mode: t::OverAirMode,
+    progress: Arc<AtomicU64>,
+    cols: Vec<(usize, Vec<u8>)>,
+    bin_hz: f32,
+    stop: Arc<AtomicBool>,
+) {
+    tokio::spawn(async move {
+        let mut i = 0;
+        while i < cols.len() {
+            if stop.load(Ordering::Acquire) {
+                break;
+            }
+            let played = progress.load(Ordering::Relaxed) as usize;
+            while i < cols.len() && cols[i].0 <= played {
+                let _ = bus.publish(
+                    &Topic::Spectrum(radio.clone()),
+                    t::SpectrumRow {
+                        radio: radio.clone(),
+                        mode,
+                        t: t::Timestamp(now_ms()),
+                        bin0_offset: t::OffsetHz(0.0),
+                        bin_hz,
+                        mags: cols[i].1.clone(),
+                        source: t::SignalSource::OwnTx,
+                    },
+                );
+                i += 1;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    });
+}
+
+/// Milliseconds since the Unix epoch (wall clock), for stamping spectrum columns.
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
