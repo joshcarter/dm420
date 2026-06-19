@@ -1,7 +1,3 @@
-# Next
-
-'/f' command not working in real mode.
-
 # Soon
 
 Review if hashed callsigns are properly implemented.
@@ -11,7 +7,9 @@ Map screen: highlight with crosshairs the station you're armed to work.
 Need to determine actual limits of audio offset for
 transmit--currently a hard window, something like 1000-2000Hz.
 
-FT4/FT8 mode switch. Also switch calling frequency for each band.
+FT4/FT8 mode switch in the UI. (Per-band calling frequencies already switch
+by mode for `/b` — see `send::calling_freq_hz`; the mode itself is still
+config-only, read from the live spectrum.)
 
 Waterslide view: indicator for unworked station calling CQ. (Highlight
 using cyan secondary accent color?)

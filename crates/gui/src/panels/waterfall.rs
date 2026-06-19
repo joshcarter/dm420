@@ -4,8 +4,8 @@
 use eframe::egui;
 use egui::{Align2, Color32, ColorImage, Pos2, Rect, TextureHandle, TextureOptions};
 use types::{
-    Decode, DecodeContent, ExchangePayload, HealthState, ParsedMessage, QsoPhase, Signoff, SlotId,
-    SpectrumRow, SubsystemHealth, SubsystemId,
+    Decode, DecodeContent, ExchangePayload, HealthState, OverAirMode, ParsedMessage, QsoPhase,
+    Signoff, SlotId, SpectrumRow, SubsystemHealth, SubsystemId,
 };
 
 use app_core::{LineProfile, Protocol, SerialConfig};
@@ -89,8 +89,9 @@ pub struct Waterfall {
     /// Send-row text-box / slash-command state. The transmit lifecycle itself
     /// lives in the QSO engine (`QsoState`), which this row renders and commands.
     send: SendState,
-    /// Dial frequency set via the `/f` command (MHz→Hz), shown in the header in
-    /// place of the rig readout. Mock feedback until rig wiring lands.
+    /// Dial frequency set via the `/f` / `/b` commands (Hz), shown in the header
+    /// in place of the rig readout. Mock-mode feedback only — in real mode those
+    /// commands retune the rig and the header tracks the resulting `RigState`.
     vfo_override_hz: Option<u64>,
     /// Real-mode selection (offset + optional station). Mock mode reads `slide`.
     real_sel: RealSel,
@@ -313,9 +314,7 @@ impl Waterfall {
         // resolved selection above (real-mode click state, or the mock sim).
         if activate || btn.clicked() {
             match self.send.activate() {
-                Activation::Command(Command::SetFrequency(mhz)) => {
-                    self.vfo_override_hz = Some((mhz * 1_000_000.0).round() as u64);
-                }
+                Activation::Command(cmd) => self.apply_command(ctx, cmd),
                 Activation::Toggle => {
                     if !call_set {
                         // No station callsign yet — operating is blocked until one
@@ -329,6 +328,32 @@ impl Waterfall {
                     }
                 }
                 Activation::None => {}
+            }
+        }
+    }
+
+    /// Apply a parsed slash command. `/f` takes an explicit dial frequency; `/b`
+    /// resolves a band to its calling frequency for the *current* over-air mode
+    /// (FT8 and FT4 differ — e.g. 20 m is 14.074 vs 14.080). In real mode the rig
+    /// is retuned and the header tracks the resulting `RigState`; in mock mode
+    /// there's no rig, so we set the local display override for feedback.
+    fn apply_command(&mut self, ctx: &PanelCtx, cmd: Command) {
+        let hz = match cmd {
+            Command::SetFrequency(mhz) => Some((mhz * 1_000_000.0).round() as u64),
+            Command::SetBand(band) => {
+                let mode = ctx
+                    .bus
+                    .spectrum()
+                    .map(|s| s.mode)
+                    .unwrap_or(OverAirMode::Ft8);
+                crate::send::calling_freq_hz(band, mode)
+            }
+        };
+        if let Some(hz) = hz {
+            if ctx.bus.is_real() {
+                ctx.bus.set_freq(hz);
+            } else {
+                self.vfo_override_hz = Some(hz);
             }
         }
     }

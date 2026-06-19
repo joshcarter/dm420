@@ -9,6 +9,8 @@
 //!
 //! See `docs/qso_flow.md` for the operator model this implements.
 
+use bus::types::{Band, OverAirMode};
+
 use crate::waterslide_panel::Target;
 
 /// What pressing Enter / the Send button means right now. The transmit lifecycle
@@ -25,16 +27,21 @@ pub enum Activation {
     None,
 }
 
-/// A parsed slash/colon command. Only frequency-set exists for now.
+/// A parsed slash/colon command.
 #[derive(Clone, PartialEq, Debug)]
 pub enum Command {
     /// Set the dial frequency, in MHz (e.g. `/f 14.074`).
     SetFrequency(f64),
+    /// Switch to a band (e.g. `/b 20m`). The dial moves to the calling frequency
+    /// for that band in the *current* mode — resolved at apply time via
+    /// [`calling_freq_hz`], since the parser doesn't know the mode.
+    SetBand(Band),
 }
 
 /// Parse a slash/colon command. Returns `None` if it isn't a command or the
 /// verb/argument isn't recognized. Verb matching is case-insensitive; the
-/// frequency verb accepts `f`, `freq`, or `frequency`.
+/// frequency verb accepts `f`, `freq`, or `frequency`; the band verb accepts
+/// `b` or `band`.
 pub fn parse_command(input: &str) -> Option<Command> {
     let s = input.trim();
     let rest = s.strip_prefix('/').or_else(|| s.strip_prefix(':'))?;
@@ -45,8 +52,64 @@ pub fn parse_command(input: &str) -> Option<Command> {
             let mhz: f64 = tokens.next()?.parse().ok()?;
             (mhz.is_finite() && mhz > 0.0).then_some(Command::SetFrequency(mhz))
         }
+        "b" | "band" => parse_band(tokens.next()?).map(Command::SetBand),
         _ => None,
     }
+}
+
+/// Parse a band argument — `20`, `20m`, or `20M` — into a [`Band`]. The meter
+/// count must name a real amateur HF/6 m band.
+fn parse_band(arg: &str) -> Option<Band> {
+    let meters: u16 = arg.trim_end_matches(['m', 'M']).parse().ok()?;
+    Some(match meters {
+        160 => Band::B160m,
+        80 => Band::B80m,
+        40 => Band::B40m,
+        30 => Band::B30m,
+        20 => Band::B20m,
+        17 => Band::B17m,
+        15 => Band::B15m,
+        12 => Band::B12m,
+        10 => Band::B10m,
+        6 => Band::B6m,
+        _ => return None,
+    })
+}
+
+/// The dial (calling) frequency in Hz for a band in a given mode. FT8 and FT4
+/// have distinct calling frequencies per band (e.g. 20 m is 14.074 for FT8,
+/// 14.080 for FT4); the architecture-only modes fall back to the FT8 table.
+/// Returns `None` for a (band, mode) pair with no established calling frequency
+/// (FT4 has none on 160 m).
+pub fn calling_freq_hz(band: Band, mode: OverAirMode) -> Option<u64> {
+    let hz = match mode {
+        OverAirMode::Ft4 => match band {
+            Band::B160m => return None, // FT4 has no established 160 m calling freq
+            Band::B80m => 3_575_000,
+            Band::B40m => 7_047_500,
+            Band::B30m => 10_140_000,
+            Band::B20m => 14_080_000,
+            Band::B17m => 18_104_000,
+            Band::B15m => 21_140_000,
+            Band::B12m => 24_919_000,
+            Band::B10m => 28_180_000,
+            Band::B6m => 50_318_000,
+        },
+        // FT8, and a sensible default for the architecture-only modes.
+        OverAirMode::Ft8 | OverAirMode::Psk31 | OverAirMode::Rtty => match band {
+            Band::B160m => 1_840_000,
+            Band::B80m => 3_573_000,
+            Band::B40m => 7_074_000,
+            Band::B30m => 10_136_000,
+            Band::B20m => 14_074_000,
+            Band::B17m => 18_100_000,
+            Band::B15m => 21_074_000,
+            Band::B12m => 24_915_000,
+            Band::B10m => 28_074_000,
+            Band::B6m => 50_313_000,
+        },
+    };
+    Some(hz)
 }
 
 /// The next auto-generated message for the current selection: a CQ call when the
@@ -159,13 +222,51 @@ mod tests {
         assert_eq!(parse_command("f 14.074"), None);
         assert_eq!(parse_command("CQ N0JDC DN70"), None);
         // Unknown verb.
-        assert_eq!(parse_command("/b 20"), None);
+        assert_eq!(parse_command("/x 20"), None);
         // Missing or non-numeric argument.
         assert_eq!(parse_command("/f"), None);
         assert_eq!(parse_command("/f abc"), None);
         // Nonsensical frequency.
         assert_eq!(parse_command("/f 0"), None);
         assert_eq!(parse_command("/f -1"), None);
+    }
+
+    #[test]
+    fn parses_band_verbs_and_flexible_args() {
+        // `/b` and `/band`, with or without a trailing `m`/`M`, all name 20 m.
+        for s in ["/b 20", "/b 20m", "/band 20M", ":band 20m", "  /B  20m "] {
+            assert_eq!(
+                parse_command(s),
+                Some(Command::SetBand(Band::B20m)),
+                "input {s:?}"
+            );
+        }
+        // Other bands resolve too.
+        assert_eq!(parse_command("/b 40"), Some(Command::SetBand(Band::B40m)));
+        assert_eq!(parse_command("/b 6"), Some(Command::SetBand(Band::B6m)));
+        // A meter count that isn't a real band, and a missing argument, are rejected.
+        assert_eq!(parse_command("/b 21"), None);
+        assert_eq!(parse_command("/b"), None);
+        assert_eq!(parse_command("/b xyz"), None);
+    }
+
+    #[test]
+    fn calling_freq_is_mode_dependent() {
+        // The canonical 20 m split: FT8 at 14.074, FT4 at 14.080.
+        assert_eq!(
+            calling_freq_hz(Band::B20m, OverAirMode::Ft8),
+            Some(14_074_000)
+        );
+        assert_eq!(
+            calling_freq_hz(Band::B20m, OverAirMode::Ft4),
+            Some(14_080_000)
+        );
+        // FT4 has no established 160 m calling frequency.
+        assert_eq!(calling_freq_hz(Band::B160m, OverAirMode::Ft4), None);
+        assert_eq!(
+            calling_freq_hz(Band::B160m, OverAirMode::Ft8),
+            Some(1_840_000)
+        );
     }
 
     #[test]

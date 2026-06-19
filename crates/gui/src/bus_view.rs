@@ -448,6 +448,24 @@ impl BusView {
         self.send_qso_command(QsoCommand::Abort);
     }
 
+    /// Retune the rig's dial to `hz` (the `/f` and `/b` slash commands). Issues a
+    /// `RigCommand::SetFreq` to the rig-command server; fire-and-forget, since the
+    /// new frequency comes back on `RigState` and drives the header readout. The
+    /// request `await`s, so it runs on the bus runtime; in mock mode (no rig
+    /// server) it simply times out harmlessly.
+    pub fn set_freq(&self, hz: u64) {
+        let bus = self.bus.clone();
+        self._rt.spawn(async move {
+            let _ = bus
+                .request::<RigCommand, app_core::CommandResult>(
+                    &Topic::RigCommand(mocks::radio_id()),
+                    RigCommand::SetFreq(AbsHz(hz)),
+                    Duration::from_secs(1),
+                )
+                .await;
+        });
+    }
+
     /// Publish the current selection (outgoing offset + optional target) onto the
     /// `selection/{id}/active` State topic.
     fn publish_selection(&self, offset_hz: f32, target: Option<DecodeRef>) {
