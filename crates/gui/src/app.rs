@@ -15,6 +15,15 @@ use crate::{TreeIds, build_tree};
 
 pub struct App {
     pub dark: bool,
+    /// Seed `dark` from the OS appearance on the first frame. False when
+    /// `MARTIAN_LIGHT` pins light (screenshots), so the env wins. The OS theme is
+    /// only readable once a pass has begun, so the seed happens in `ui`, not
+    /// `new`; see [`App::seed_theme_from_system`].
+    pub follow_system_at_startup: bool,
+    /// One-shot guard for the startup OS-theme seed. Set once the seed is applied
+    /// or the operator touches the DARK/LIGHT toggle — after that the manual
+    /// toggle owns the theme and live OS changes are ignored.
+    pub system_seeded: bool,
     pub edit_mode: bool, // GUI LOCK/EDIT
     /// The operator's station identity (call sign + grid). Shown in the top bar
     /// and editable there when unlocked; read by the panels via `PanelCtx`.
@@ -38,13 +47,19 @@ impl App {
     /// Build the app. `egui_ctx` is handed to the bus bridge so background data
     /// arriving off-frame can wake the UI.
     pub fn new(egui_ctx: &egui::Context) -> Self {
-        let dark = std::env::var("MARTIAN_LIGHT").is_err();
+        // `MARTIAN_LIGHT` pins light (used by the headless screenshot path); when
+        // it isn't set we boot dark, then seed from the OS appearance on the first
+        // frame (`seed_theme_from_system`). The env always wins over the OS seed.
+        let forced_light = std::env::var("MARTIAN_LIGHT").is_ok();
+        let dark = !forced_light;
         let (tree, tree_ids) = build_tree();
         let focused = tree_ids.waterfall; // FT8 panel holds focus at startup
         let station = Station::load();
         let view = BusView::start(egui_ctx.clone(), station.to_qso_config());
         Self {
             dark,
+            follow_system_at_startup: !forced_light,
+            system_seeded: false,
             // No default callsign: when the station identity isn't set yet, boot
             // straight into config (unlocked) so the operator is prompted for it.
             edit_mode: !station.is_set(),
@@ -64,6 +79,22 @@ impl App {
 
     pub fn palette(&self) -> Palette {
         if self.dark { GRAPHITE } else { SILVER }
+    }
+
+    /// One-shot: on the first frame the OS appearance is known, seed `dark` from
+    /// it so the app boots matching the host's light/dark setting. `MARTIAN_LIGHT`
+    /// opts out (the env pins light). After seeding, the manual DARK/LIGHT toggle
+    /// owns the theme — we don't keep following live OS changes (the chosen
+    /// "startup default only" behavior). Cheap to call every frame; it no-ops once
+    /// seeded or while the OS theme is still unknown.
+    pub fn seed_theme_from_system(&mut self, ctx: &egui::Context) {
+        if self.system_seeded || !self.follow_system_at_startup {
+            return;
+        }
+        if let Some(theme) = ctx.system_theme() {
+            self.dark = theme == egui::Theme::Dark;
+            self.system_seeded = true;
+        }
     }
 
     // -----------------------------------------------------------------

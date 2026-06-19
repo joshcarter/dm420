@@ -342,6 +342,11 @@ impl eframe::App for App {
             std::process::exit(0);
         }
 
+        // Seed the theme from the OS appearance on the first frame it's known
+        // (can't be done in `App::new` — the system theme isn't populated until a
+        // pass has begun). One-shot; the manual toggle owns the theme afterward.
+        self.seed_theme_from_system(&ctx);
+
         let pal = self.palette();
         if self.visuals_set_for != Some(self.dark) {
             apply_visuals(&ctx, &pal);
@@ -557,11 +562,11 @@ impl App {
             &[("DARK", self.dark), ("LIGHT", !self.dark)],
             "sw_disp",
         );
-        if disp_clicks[0] {
-            self.dark = true;
-        }
-        if disp_clicks[1] {
-            self.dark = false;
+        if disp_clicks[0] || disp_clicks[1] {
+            self.dark = disp_clicks[0];
+            // A manual choice wins from here on — stop the startup OS seed in case
+            // the OS theme hadn't been reported yet on this first frame.
+            self.system_seeded = true;
         }
 
         // ---- clocks (two LCD chips), to the left of the switches ----

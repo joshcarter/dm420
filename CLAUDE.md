@@ -123,7 +123,11 @@ on-screen fault and reconnects on its own**:
 | `DM420_MODE` | on-air mode: `ft8` \| `ft4` | `ft8` |
 | `DM420_WAV` | replay a WAV instead of live capture (bring-up) | live capture |
 
-`MARTIAN_LIGHT` forces the light palette; `MARTIAN_SHOT=<path>` saves a screenshot.
+At startup the dark/light palette is **seeded from the host OS appearance** (egui
+`system_theme()`, read on the first frame since it isn't populated in `App::new`);
+the top-bar DARK/LIGHT toggle then owns it for the session (no live OS following).
+`MARTIAN_LIGHT` pins the light palette and opts out of the OS seed (used by the
+screenshot path); `MARTIAN_SHOT=<path>` saves a screenshot.
 
 ```sh
 cargo run -p gui                                               # real, autodetect rig
