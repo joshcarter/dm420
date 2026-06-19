@@ -103,9 +103,9 @@ pub struct BusView {
     /// fault display when a device is missing or disconnected.
     health: Arc<Mutex<HashMap<SubsystemId, SubsystemHealth>>>,
 
-    /// Whether real producers (`DM420_REAL=1`) are driving the bus. Panels use
-    /// this to avoid presenting mock-only visuals (e.g. the simulated FFT) as if
-    /// they were live radio data.
+    /// Whether real producers are driving the bus (the default; `DM420_MOCK=1`
+    /// opts into mocks). Panels use this to avoid presenting mock-only visuals
+    /// (e.g. the simulated FFT) as if they were live radio data.
     real: bool,
 
     /// Handle for live reconfiguration of the running producers (real mode only;
@@ -252,7 +252,8 @@ impl BusView {
         }
     }
 
-    /// True when real producers (`DM420_REAL=1`) are driving the bus.
+    /// True when real producers are driving the bus (the default; `DM420_MOCK=1`
+    /// opts into mocks).
     pub fn is_real(&self) -> bool {
         self.real
     }

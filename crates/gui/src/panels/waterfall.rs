@@ -94,6 +94,15 @@ pub struct Waterfall {
     vfo_override_hz: Option<u64>,
     /// Real-mode selection (offset + optional station). Mock mode reads `slide`.
     real_sel: RealSel,
+    /// The message latched on the air for the current over, held in the Send box
+    /// until the transmission finishes — even after the engine has advanced its
+    /// `next_tx` or gone idle (the final 73/RR73 keeps showing while it plays out).
+    /// `None` when we're not transmitting. See `draw_send_row`.
+    tx_hold: Option<String>,
+    /// The engine's `next_tx` text observed on the previous frame, so when an over
+    /// starts we can latch the message being sent even though the engine may have
+    /// already stepped to idle by the time the own-TX waterfall reaches the GUI.
+    last_next_tx: Option<String>,
 }
 
 impl Waterfall {
@@ -108,17 +117,20 @@ impl Waterfall {
                 offset: 1500.0,
                 target: None,
             },
+            tx_hold: None,
+            last_next_tx: None,
         }
     }
 
-    /// The bottom "Send" row: `Send:` label, black message box (mirrors the next
-    /// outgoing message), and a right-aligned Scan-style lit key — orange `SEND`
-    /// when idle/armed, cyan `CANCEL` while transmitting (cyan also signals the
-    /// armed state). The box is not a free text field: only `/`/`:` (start a slash
-    /// command) and Enter (activate the button) are accepted; see `send.rs`.
+    /// The bottom "Send" row: `Send:` label, recessed message box (mirrors the
+    /// next outgoing message, themed to the screen background), and a right-aligned
+    /// Scan-style lit key — orange `SEND` when idle/armed, cyan `CANCEL` while
+    /// transmitting (cyan also signals the armed state). The box is not a free text
+    /// field: only `/`/`:` (start a slash command) and Enter (activate the button)
+    /// are accepted; see `send.rs`.
     fn draw_send_row(&mut self, ctx: &mut PanelCtx, row: Rect) {
         // The operator's configured station identity. There is no default, so gate
-        // operating until a callsign is set (top bar when unlocked, or dm420.toml).
+        // operating until a callsign is set (top bar when unlocked, or the config file).
         let (mycall, mygrid) = (ctx.call, ctx.grid);
         let call_set = !mycall.trim().is_empty();
 
@@ -179,19 +191,41 @@ impl Waterfall {
         // Live QSO-engine state drives the display and the button.
         let qso = ctx.bus.qso_state();
         let phase = qso.as_ref().map(|s| s.phase).unwrap_or(QsoPhase::Idle);
-        let active_qso = !matches!(phase, QsoPhase::Idle);
-        // What to show in the box: a command being typed > the engine's queued
-        // message > the local preview.
+        // The engine's queued message for the next over, if any.
+        let next_tx = qso
+            .as_ref()
+            .and_then(|s| s.next_tx.as_ref())
+            .map(|m| m.text.clone());
+
+        // Hold the on-air message in the box for the whole over. We're transmitting
+        // while a fresh own-TX waterfall column is arriving (the same signal the
+        // screen uses to swap to the own-TX waterfall). On the first frame of an
+        // over we latch the message being sent — preferring the live `next_tx`,
+        // else the one shown last frame, since by the time the own-TX column reaches
+        // the GUI the engine may already have stepped to idle (the final 73/RR73).
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let transmitting = ctx.bus.tx_spectrum().is_some_and(|r| now_ms - r.t.0 < 500);
+        if transmitting {
+            if self.tx_hold.is_none() {
+                self.tx_hold = next_tx.clone().or_else(|| self.last_next_tx.clone());
+            }
+        } else {
+            self.tx_hold = None;
+        }
+        self.last_next_tx = next_tx.clone();
+
+        // Treat an in-flight over as active even if the engine has already gone
+        // idle, so the box stays highlighted and the button reads STOP until the
+        // over finishes playing out.
+        let active_qso = !matches!(phase, QsoPhase::Idle) || self.tx_hold.is_some();
+        // What to show in the box: a command being typed > the message on the air >
+        // the engine's queued message > the local preview.
         let display = if self.send.entering {
             self.send.buf.clone()
         } else if !call_set {
-            "SET CALLSIGN — unlock (GUI ▸ EDIT) or set dm420.toml".to_string()
-        } else if let Some(text) = qso
-            .as_ref()
-            .and_then(|s| s.next_tx.as_ref())
-            .map(|m| &m.text)
-        {
-            text.clone()
+            "SET CALLSIGN — unlock (GUI ▸ EDIT) or set the config file".to_string()
+        } else if let Some(text) = self.tx_hold.clone().or(next_tx) {
+            text
         } else {
             self.send.buf.clone()
         };
@@ -236,8 +270,9 @@ impl Waterfall {
             Pos2::new(track.left() - pad, cy + 11.0),
         );
 
-        // Black message box with a 1px edge; text vertically centered.
-        painter.rect_filled(box_rect, corner_radius(2), Color32::BLACK);
+        // Recessed message box (themed to the screen background) with a 1px edge;
+        // text vertically centered.
+        painter.rect_filled(box_rect, corner_radius(2), pal.screen_bg);
         painter.rect_stroke(
             box_rect,
             corner_radius(2),
@@ -284,7 +319,7 @@ impl Waterfall {
                 Activation::Toggle => {
                     if !call_set {
                         // No station callsign yet — operating is blocked until one
-                        // is set (top bar when unlocked, or dm420.toml).
+                        // is set (top bar when unlocked, or the config file).
                     } else if active_qso {
                         ctx.bus.abort_qso();
                     } else if let Some(call) = &sel_call {
@@ -391,7 +426,7 @@ impl Panel for Waterfall {
                         screen,
                         pal,
                         "RADIO SETUP",
-                        "available in real mode — launch with DM420_REAL=1",
+                        "available in real mode — relaunch without DM420_MOCK=1",
                     );
                 }
             }
@@ -403,8 +438,8 @@ impl Panel for Waterfall {
             if self.form.loaded {
                 let edited = self.form.to_config();
                 if edited != ctx.bus.current_config() {
-                    // Persist the audio device choices to dm420.toml, then apply.
-                    crate::settings::save_audio_config(&edited);
+                    // Persist the audio + serial settings to the config file, then apply.
+                    crate::settings::save_hardware_config(&edited);
                     ctx.bus.apply_config(edited);
                 }
                 self.form.loaded = false; // re-sync to applied config on next unlock

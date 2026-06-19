@@ -100,20 +100,22 @@ uses `mocks::spawn` for everything.
 
 ```sh
 cargo build --workspace          # build everything
-cargo run -p gui                 # run the app (binary: dm420), mocks by default
+cargo run -p gui                 # run the app (binary: dm420), real producers by default
 cargo test --workspace
 cargo clippy --all-targets -- -D warnings
 ```
 
-By default the GUI runs on **mock** producers — no radio/audio hardware needed. It needs
-the **system clock within ~1 s of UTC (NTP)** for FT8/FT4 slot timing.
+By default the GUI runs the **real** rig/decode producers; pass `DM420_MOCK=1` to run
+on mocks with no radio/audio hardware needed. It needs the **system clock within ~1 s
+of UTC (NTP)** for FT8/FT4 slot timing.
 
-Real hardware is opt-in via env vars (interim; a settings UI will replace them). A
-missing/disconnected device **degrades to an on-screen fault and reconnects on its own**:
+Hardware bindings are set via env vars (interim; a settings UI will replace them) and
+persisted to `$HOME/.dm420/config.toml`. A missing/disconnected device **degrades to an
+on-screen fault and reconnects on its own**:
 
 | Variable | Purpose | Default |
 |---|---|---|
-| `DM420_REAL` | real rig/decode producers instead of mocks | mocks |
+| `DM420_MOCK` | mock producers instead of the real rig/decode path | real |
 | `DM420_AUDIO_INPUT` | capture device (case-insensitive substring, e.g. `USB PnP`) | system default |
 | `DM420_SERIAL_PORT` | rig CAT device, e.g. `/dev/cu.usbserial-120` | autodetect |
 | `DM420_SERIAL_BAUD` | rig baud | `19200` |
@@ -124,9 +126,10 @@ missing/disconnected device **degrades to an on-screen fault and reconnects on i
 `MARTIAN_LIGHT` forces the light palette; `MARTIAN_SHOT=<path>` saves a screenshot.
 
 ```sh
-DM420_REAL=1 cargo run -p gui                                   # real, autodetect rig
-DM420_REAL=1 DM420_AUDIO_INPUT="USB PnP" DM420_SERIAL_PORT=/dev/cu.usbserial-120 \
+cargo run -p gui                                               # real, autodetect rig
+DM420_AUDIO_INPUT="USB PnP" DM420_SERIAL_PORT=/dev/cu.usbserial-120 \
   DM420_MODE=ft4 cargo run -p gui                               # explicit
+DM420_MOCK=1 cargo run -p gui                                   # no hardware (mocks)
 ```
 
 ## Conventions, guardrails & gotchas

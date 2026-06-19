@@ -10,7 +10,7 @@
 //!
 //! - `RUST_LOG`, if set, wins outright (standard [`EnvFilter`] syntax, e.g.
 //!   `RUST_LOG=core::tx=debug,info`).
-//! - otherwise the `[logging] level` from `dm420.toml` (default `info`) sets the
+//! - otherwise the `[logging] level` from the config file (default `info`) sets the
 //!   level for **DM420's own crates**, while third-party crates (egui, winit,
 //!   wgpu, tokio, cpal…) are pinned at `warn` so the log stays readable.
 //!
@@ -22,7 +22,7 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::time::FormatTime;
 
-/// Log file, relative to the launch directory (alongside `dm420.toml`).
+/// Log file, relative to the launch directory.
 const LOG_FILE: &str = "dm420.log";
 
 /// DM420's own crates — the ones the `[logging] level` applies to. Everything

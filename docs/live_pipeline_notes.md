@@ -18,9 +18,10 @@ Severity: 🔴 correctness/blocker · 🟡 should-fix · 🟢 polish.
   is still the eventual UI.
 - ✅ **Mode is configurable.** `DM420_MODE=ft8|ft4`. (A band/mode selector in the
   UI is still future work.)
-- 🟡 **Real path gated by `DM420_REAL` / `DM420_WAV` env vars.** Fine for bring-up;
-  the env layer (`settings.rs`) is structured so a future per-panel settings UI
-  edits the same `Settings`/`CoreConfig` instead of the environment.
+- 🟡 **Real path is the default; `DM420_MOCK` / `DM420_WAV` env vars switch it.**
+  Fine for bring-up; the env layer (`settings.rs`) is structured so a future
+  per-panel settings UI edits the same `Settings`/`CoreConfig` instead of the
+  environment.
 - 🟢 **Radio id hardcoded** to `mocks::radio_id()` ("rig0") throughout; single-radio
   assumption baked in.
 
@@ -44,7 +45,7 @@ Severity: 🔴 correctness/blocker · 🟡 should-fix · 🟢 polish.
   `mocks::spawn_support` no longer publishes fake QSOs. Still pending: **ADIF**
   import/export and the **peer-merge** G-set; and `build_log` (in `qso/shell.rs`)
   still stamps placeholder **band/freq/mode** until `OperatingState` is published.
-- 🟡 **Scanner is still mock** even with `DM420_REAL=1` (`mocks::spawn_support`);
+- 🟡 **Scanner is still mock** even in real mode (`mocks::spawn_support`);
   the clock is real wall-clock. Real scanner strategy still needed.
 
 ## Audio capture

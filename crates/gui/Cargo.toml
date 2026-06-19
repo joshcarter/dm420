@@ -34,7 +34,8 @@ mocks.workspace = true
 qso.workspace = true
 
 # The real rig/decode producers (vendored Joel + bus adapters). Renamed to avoid
-# shadowing the std `core` crate. Enabled at runtime via `DM420_REAL=1`.
+# shadowing the std `core` crate. Used at runtime by default (`DM420_MOCK=1` opts
+# into mocks instead).
 app_core = { package = "core", path = "../core" }
 
 # Structured logging. Every crate emits through the `tracing` facade; the binary

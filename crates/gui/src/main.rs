@@ -535,7 +535,7 @@ impl App {
         );
         if gui_clicks[0] {
             // Re-lock commits configuration: push any edited call/grid to the QSO
-            // engine, and persist the identity to dm420.toml so it survives a restart
+            // engine, and persist the identity to the config file so it survives a restart
             // (comment-preserving; only once a callsign is actually set).
             self.edit_mode = false;
             self.view.set_qso_station(self.station.to_qso_config());

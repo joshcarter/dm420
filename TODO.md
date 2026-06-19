@@ -1,9 +1,12 @@
 # Next
 
-'/f' command not working in real mode
-
+'/f' command not working in real mode.
 
 # Soon
+
+Review if hashed callsigns are properly implemented.
+
+Map screen: highlight with crosshairs the station you're armed to work.
 
 Need to determine actual limits of audio offset for
 transmit--currently a hard window, something like 1000-2000Hz.

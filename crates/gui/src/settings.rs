@@ -9,8 +9,9 @@
 //!
 //! ## Variables
 //!
-//! - `DM420_REAL` — run the real rig/decode producers (`1`/non-empty) instead of
-//!   the mocks. Defaults to mocks so the GUI always runs with no hardware.
+//! - `DM420_MOCK` — run the mock producers instead of the real rig/decode path.
+//!   Real producers are the **default**; set this (`1`/non-empty) when you want
+//!   the GUI to run with no hardware.
 //! - `DM420_AUDIO_INPUT` — capture device name (case-insensitive substring match,
 //!   e.g. `USB PnP`). Unset ⇒ the system default input.
 //! - `DM420_SERIAL_PORT` — rig CAT device, e.g. `/dev/cu.usbserial-120`. Unset ⇒
@@ -18,6 +19,9 @@
 //! - `DM420_SERIAL_BAUD` — rig baud (one of the standard Kenwood rates). Invalid
 //!   ⇒ warn and keep the default.
 //! - `DM420_SERIAL_PROFILE` — serial line profile: `none` | `dtr-rts` | `rtscts`.
+//!   The serial port/baud/profile (plus the `autodetect` flag, which has no env
+//!   var) are persisted to the config file's `[serial]` table when edited in the
+//!   unlocked UI; the env vars override the saved values for a single launch.
 //! - `DM420_MODE` — `ft8` | `ft4` (default `ft8`).
 //! - `DM420_WAV` — replay this WAV instead of live capture (bring-up/testing).
 //! - `DM420_LOGBOOK` — path to the persisted logbook JSON (default
@@ -41,12 +45,36 @@ pub(crate) const KENWOOD_BAUDS: &[u32] = &[115_200, 57_600, 38_400, 19_200, 9_60
 /// Default log level when neither `RUST_LOG` nor `[logging] level` is set.
 pub(crate) const DEFAULT_LOG_LEVEL: &str = "info";
 
-/// The configured log level for DM420's crates: the `[logging] level` key in
-/// `dm420.toml`, or [`DEFAULT_LOG_LEVEL`] if unset. Read once at startup by
+/// Where DM420's TOML config lives: `$HOME/.dm420/config.toml`, falling back to
+/// `config.toml` in the current directory when there's no home. Holds the
+/// `[station]` and `[audio]` tables and the `[logging] level`. The writers
+/// (`Station::save`, [`save_audio_config`]) create the parent directory on first
+/// save. The format/persistence is interim and TBD — see `joels-notes.md`.
+pub(crate) fn config_path() -> PathBuf {
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home).join(".dm420").join("config.toml");
+    }
+    PathBuf::from("config.toml")
+}
+
+/// Create the config directory (`$HOME/.dm420`) if it doesn't exist yet, then
+/// write `text` to `path`. Logs on error rather than failing — a config write is
+/// best-effort.
+fn write_config(path: &Path, text: &str) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(e) = std::fs::write(path, text) {
+        tracing::warn!(path = %path.display(), error = %e, "could not write config");
+    }
+}
+
+/// The configured log level for DM420's crates: the `[logging] level` key in the
+/// config file, or [`DEFAULT_LOG_LEVEL`] if unset. Read once at startup by
 /// [`crate::logging::init`] — before the subscriber exists, so it logs nothing
 /// itself. `RUST_LOG` (handled in `logging`) overrides this when present.
 pub fn log_level() -> String {
-    let text = std::fs::read_to_string("dm420.toml").unwrap_or_default();
+    let text = std::fs::read_to_string(config_path()).unwrap_or_default();
     parse_table_value(&text, "logging", "level").unwrap_or_else(|| DEFAULT_LOG_LEVEL.to_string())
 }
 
@@ -74,13 +102,14 @@ pub struct Station {
 
 impl Station {
     /// Load the operator's station identity, in precedence order: the
-    /// `DM420_CALLSIGN` / `DM420_GRID` env vars → the `[station]` table in
-    /// `dm420.toml` (current dir) → unset. **There is no default** — a silent one
-    /// risks transmitting as the wrong station. Operating is blocked until a call
-    /// is set (typed into the unlocked top bar, or written to `dm420.toml`). The
-    /// config format/persistence is interim and TBD — see `joels-notes.md`.
+    /// `DM420_CALLSIGN` / `DM420_GRID` env vars → the `[station]` table in the
+    /// config file ([`config_path`]) → unset. **There is no default** — a silent
+    /// one risks transmitting as the wrong station. Operating is blocked until a
+    /// call is set (typed into the unlocked top bar, or written to the config
+    /// file). The config format/persistence is interim and TBD — see
+    /// `joels-notes.md`.
     pub fn load() -> Self {
-        let (toml_call, toml_grid) = read_station_config(Path::new("dm420.toml"));
+        let (toml_call, toml_grid) = read_station_config(&config_path());
         Station {
             call: env_nonempty("DM420_CALLSIGN")
                 .or(toml_call)
@@ -99,16 +128,14 @@ impl Station {
         !self.call.trim().is_empty()
     }
 
-    /// Persist the current identity to `dm420.toml`, preserving comments and any
-    /// other content. Called on GUI re-lock so UI edits survive a restart; write
-    /// errors are logged, not fatal.
+    /// Persist the current identity to the config file, preserving comments and
+    /// any other content. Called on GUI re-lock so UI edits survive a restart;
+    /// write errors are logged, not fatal.
     pub fn save(&self) {
-        let path = Path::new("dm420.toml");
-        let existing = std::fs::read_to_string(path).ok();
+        let path = config_path();
+        let existing = std::fs::read_to_string(&path).ok();
         let text = update_station_config(existing.as_deref(), &self.call, &self.grid);
-        if let Err(e) = std::fs::write(path, &text) {
-            tracing::warn!(path = %path.display(), error = %e, "could not write station config");
-        }
+        write_config(&path, &text);
     }
 
     /// The identity the QSO engine builds outgoing messages from. The contest
@@ -128,7 +155,8 @@ impl Station {
 
 /// Parsed startup configuration. Built once at launch by [`Settings::from_env`].
 pub struct Settings {
-    /// Run the real producers (`DM420_REAL`) rather than the mocks.
+    /// Run the real producers rather than the mocks. Real is the default; set
+    /// `DM420_MOCK` to run the mocks instead.
     pub real: bool,
     /// Capture device name; `None` ⇒ system default input.
     pub audio_input: Option<String>,
@@ -139,7 +167,7 @@ pub struct Settings {
     /// If set, replay this WAV instead of opening the live capture device.
     pub wav: Option<PathBuf>,
     /// TX audio output device (the rig's data-in); `None` = system default.
-    /// Persisted in dm420.toml `[audio]` (no env var).
+    /// Persisted in the config file's `[audio]` table (no env var).
     pub audio_output: Option<String>,
 }
 
@@ -147,11 +175,12 @@ impl Settings {
     /// Read the `DM420_*` environment into a `Settings`. Never fails: bad values
     /// log a warning and fall back to a sensible default.
     pub fn from_env() -> Self {
-        // Persisted audio device selections (dm420.toml [audio]); the env var still
-        // wins for the input, for quick overrides.
-        let (toml_in, toml_out) = read_audio_config(Path::new("dm420.toml"));
+        // Persisted audio device selections (config file [audio]); the env var
+        // still wins for the input, for quick overrides.
+        let (toml_in, toml_out) = read_audio_config(&config_path());
         Settings {
-            real: env_flag("DM420_REAL"),
+            // Real producers are the default now; `DM420_MOCK` opts back into mocks.
+            real: !env_flag("DM420_MOCK"),
             audio_input: env_nonempty("DM420_AUDIO_INPUT").or(toml_in),
             serial: serial_from_env(),
             protocol: protocol_from_env(),
@@ -235,7 +264,7 @@ fn read_station_config(path: &Path) -> (Option<String>, Option<String>) {
     }
 }
 
-/// Read the persisted `(input, output)` audio device names from `dm420.toml`.
+/// Read the persisted `(input, output)` audio device names from the config file.
 fn read_audio_config(path: &Path) -> (Option<String>, Option<String>) {
     match std::fs::read_to_string(path) {
         Ok(text) => parse_audio_config(&text),
@@ -283,6 +312,37 @@ fn parse_audio_config(text: &str) -> (Option<String>, Option<String>) {
         parse_table_value(text, "audio", "input"),
         parse_table_value(text, "audio", "output"),
     )
+}
+
+/// The persisted `[serial]` rig-control settings. Any subset may be present; the
+/// env vars and built-in defaults fill the gaps in [`serial_from_env`]. An empty
+/// value (e.g. `port = ""`) counts as unset — same convention as `[audio]`.
+#[derive(Default)]
+struct SerialFile {
+    port: Option<String>,
+    baud: Option<u32>,
+    profile: Option<LineProfile>,
+    autodetect: Option<bool>,
+}
+
+/// Pull the rig serial settings from the `[serial]` table. Unparseable
+/// baud/profile/autodetect values are treated as unset (the caller's default
+/// applies) rather than failing the whole read.
+fn parse_serial_config(text: &str) -> SerialFile {
+    SerialFile {
+        port: parse_table_value(text, "serial", "port"),
+        baud: parse_table_value(text, "serial", "baud").and_then(|s| s.parse().ok()),
+        profile: parse_table_value(text, "serial", "profile").and_then(|s| LineProfile::parse(&s)),
+        autodetect: parse_table_value(text, "serial", "autodetect").and_then(|s| s.parse().ok()),
+    }
+}
+
+/// Read the persisted `[serial]` rig settings from the config file.
+fn read_serial_config(path: &Path) -> SerialFile {
+    match std::fs::read_to_string(path) {
+        Ok(text) => parse_serial_config(&text),
+        Err(_) => SerialFile::default(),
+    }
 }
 
 /// Rewrite TOML `text` so `table` carries `kvs` (`key`, `value` pairs),
@@ -359,26 +419,38 @@ fn update_station_config(existing: Option<&str>, call: &str, grid: &str) -> Stri
     }
 }
 
-/// Persist the audio device selections to `dm420.toml`'s `[audio]` table,
-/// preserving comments and the rest of the file (e.g. `[station]`). Errors are
-/// logged, not fatal. Empty selections are written as `""` (system default).
-pub fn save_audio_config(cfg: &HardwareConfig) {
-    let path = Path::new("dm420.toml");
-    let kvs = [
-        ("input", cfg.audio_input.as_deref().unwrap_or("")),
-        ("output", cfg.audio_output.as_deref().unwrap_or("")),
-    ];
-    let text = match std::fs::read_to_string(path) {
-        Ok(existing) => update_toml_table(&existing, "audio", &kvs),
-        Err(_) => format!(
-            "# DM420 config — written from the UI; safe to hand-edit.\n\n[audio]\n\
-             input = \"{}\"\noutput = \"{}\"\n",
-            kvs[0].1, kvs[1].1
-        ),
-    };
-    if let Err(e) = std::fs::write(path, &text) {
-        tracing::warn!(path = %path.display(), error = %e, "could not write audio config");
-    }
+/// Persist the editable hardware bindings to the config file: the audio device
+/// selections (`[audio]`) and the rig serial settings (`[serial]` — port, baud,
+/// line profile, autodetect). Preserves comments and the rest of the file (e.g.
+/// `[station]`). Errors are logged, not fatal. Empty selections are written as
+/// `""` (system default / autodetect).
+pub fn save_hardware_config(cfg: &HardwareConfig) {
+    let path = config_path();
+    let existing = std::fs::read_to_string(&path).unwrap_or_else(|_| {
+        "# DM420 config — written from the UI; safe to hand-edit.\n".to_string()
+    });
+    let baud = cfg.serial.baud.to_string();
+    // Two passes over the same text, so both tables land in one file while every
+    // other table and all comments are preserved.
+    let text = update_toml_table(
+        &existing,
+        "audio",
+        &[
+            ("input", cfg.audio_input.as_deref().unwrap_or("")),
+            ("output", cfg.audio_output.as_deref().unwrap_or("")),
+        ],
+    );
+    let text = update_toml_table(
+        &text,
+        "serial",
+        &[
+            ("port", cfg.serial.port.as_deref().unwrap_or("")),
+            ("baud", &baud),
+            ("profile", cfg.serial.profile.label()),
+            ("autodetect", if cfg.serial.autodetect { "true" } else { "false" }),
+        ],
+    );
+    write_config(&path, &text);
 }
 
 /// Rewrite a `key = value` line with a new quoted value, preserving the key, its
@@ -395,7 +467,7 @@ fn rewrite_kv(raw: &str, new_val: &str) -> String {
     }
 }
 
-/// A fresh `dm420.toml` with explanatory comments, when no file exists yet.
+/// A fresh config file with explanatory comments, when none exists yet.
 fn default_station_toml(call: &str, grid: &str) -> String {
     format!(
         "# DM420 station identity — written from the UI; safe to hand-edit.\n\
@@ -407,14 +479,19 @@ fn default_station_toml(call: &str, grid: &str) -> String {
 }
 
 fn serial_from_env() -> SerialConfig {
-    let port = env_nonempty("DM420_SERIAL_PORT");
+    // Precedence per field: `DM420_SERIAL_*` env var (quick per-launch override) →
+    // the persisted `[serial]` table (written from the unlocked UI) → built-in
+    // default. `autodetect` has no env var; it comes from config, defaulting on.
+    let file = read_serial_config(&config_path());
+
+    let port = env_nonempty("DM420_SERIAL_PORT").or(file.port);
 
     let baud = match env_nonempty("DM420_SERIAL_BAUD") {
         Some(s) => s.parse::<u32>().unwrap_or_else(|_| {
             tracing::warn!(value = %s, "DM420_SERIAL_BAUD is not a number; using {DEFAULT_BAUD}");
             DEFAULT_BAUD
         }),
-        None => DEFAULT_BAUD,
+        None => file.baud.unwrap_or(DEFAULT_BAUD),
     };
 
     let profile = match env_nonempty("DM420_SERIAL_PROFILE") {
@@ -425,16 +502,16 @@ fn serial_from_env() -> SerialConfig {
             );
             LineProfile::Default
         }),
-        None => LineProfile::Default,
+        None => file.profile.unwrap_or(LineProfile::Default),
     };
 
     SerialConfig {
         port,
         baud,
         profile,
-        // Always allow the autodetect sweep as a fallback so the operator isn't
-        // stuck guessing a port/baud; an explicit port is still tried first.
-        autodetect: true,
+        // Default on so the operator isn't stuck guessing a port/baud; an explicit
+        // port is still tried first when the autodetect sweep runs.
+        autodetect: file.autodetect.unwrap_or(true),
     }
 }
 
@@ -524,5 +601,47 @@ mod tests {
             parse_station_config(&c),
             (Some("W4LL".to_string()), Some("EM73".to_string()))
         );
+    }
+
+    #[test]
+    fn parses_serial_table_with_all_fields() {
+        let cfg = "[serial]\nport = \"/dev/cu.usbserial-120\"\nbaud = \"9600\"\n\
+                   profile = \"dtr-rts\"\nautodetect = \"false\"\n";
+        let s = parse_serial_config(cfg);
+        assert_eq!(s.port.as_deref(), Some("/dev/cu.usbserial-120"));
+        assert_eq!(s.baud, Some(9600));
+        assert_eq!(s.profile, Some(LineProfile::AssertDtrRts));
+        assert_eq!(s.autodetect, Some(false));
+    }
+
+    #[test]
+    fn serial_partial_and_garbage_values_are_unset() {
+        // Missing keys → None; an empty port → None; a non-numeric baud → None.
+        let cfg = "[serial]\nport = \"\"\nbaud = \"fast\"\n";
+        let s = parse_serial_config(cfg);
+        assert_eq!(s.port, None, "empty port is treated as unset (autodetect)");
+        assert_eq!(s.baud, None, "unparseable baud falls back to the default");
+        assert_eq!(s.profile, None);
+        assert_eq!(s.autodetect, None);
+    }
+
+    #[test]
+    fn serial_round_trips_through_the_toml_writer() {
+        // Mirror what `save_hardware_config` writes, then read it back.
+        let text = update_toml_table(
+            "",
+            "serial",
+            &[
+                ("port", "/dev/ttyUSB0"),
+                ("baud", "19200"),
+                ("profile", LineProfile::Default.label()),
+                ("autodetect", "true"),
+            ],
+        );
+        let s = parse_serial_config(&text);
+        assert_eq!(s.port.as_deref(), Some("/dev/ttyUSB0"));
+        assert_eq!(s.baud, Some(19_200));
+        assert_eq!(s.profile, Some(LineProfile::Default));
+        assert_eq!(s.autodetect, Some(true));
     }
 }
