@@ -25,7 +25,9 @@ mod waterslide_panel;
 mod waterslide_sim;
 
 use eframe::egui;
-use egui::{Align2, CornerRadius, FontData, FontDefinitions, FontFamily, Pos2, Rect, Stroke, Vec2};
+use egui::{
+    Align2, CornerRadius, FontData, FontDefinitions, FontFamily, Pos2, Rect, Sense, Stroke, Vec2,
+};
 use egui_tiles::{Behavior, Container, Tile, TileId, Tiles, Tree, UiResponse};
 
 use app::App;
@@ -623,21 +625,23 @@ impl App {
 
         let cell_h = TRACK_H - PAD * 2.0;
         let mut x = track.left() + PAD;
-        let mut clicks = Vec::with_capacity(cells.len());
         for (i, ((label, active), w)) in cells.iter().zip(widths.iter()).enumerate() {
             let cell = Rect::from_min_size(Pos2::new(x, track.top() + PAD), Vec2::new(*w, cell_h));
-            let resp = key_cell(
-                ui,
-                painter,
-                pal,
-                cell,
-                label,
-                *active,
-                ui.id().with((id_src, i)),
-            );
-            clicks.push(resp.clicked());
+            // Cells are draw-only; the whole track owns the click (below).
+            key_cell(ui, painter, pal, cell, label, *active, ui.id().with((id_src, i)));
             x += w + GAP;
         }
+
+        // The entire switch is one toggle target: a click anywhere on the track
+        // flips it, so you can hit the lit label (not just the inactive one) to
+        // switch. These are binary switches — a click registers on the currently
+        // inactive cell. Interacted after the cells so it sits on top and owns the
+        // click; the per-cell key_cell responses are discarded.
+        let track_resp = ui.interact(track, ui.id().with((id_src, "track")), Sense::click());
+        let clicks = cells
+            .iter()
+            .map(|(_, active)| track_resp.clicked() && !*active)
+            .collect();
         (track.left(), clicks)
     }
 }
