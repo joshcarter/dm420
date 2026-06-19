@@ -166,10 +166,10 @@ impl BusView {
         let applied = Arc::new(Mutex::new(settings.hardware()));
         let _guard = rt.enter();
         let control = if real {
-            // Real rig + decode producers; mocks still drive the topics `core`
-            // doesn't cover yet (clock, logbook, scanner). Note: decodes are NOT
-            // among them — `spawn_support` deliberately omits `run_decodes`, so the
-            // decode stream is the real decoder's alone.
+            // Real rig + decode + clock + logbook producers; mocks still drive only
+            // the topics `core` doesn't cover yet (the scanner). Note: decodes are
+            // NOT among them — `spawn_support` deliberately omits `run_decodes`, so
+            // the decode stream is the real decoder's alone.
             let control = app_core::spawn(&bus, settings.core_config());
             mocks::spawn_support(&bus);
             control

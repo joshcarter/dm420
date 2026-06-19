@@ -267,7 +267,7 @@ pub struct HeardStation { pub call: Callsign, pub grid: Option<GridSquare>, pub 
 ## 10. Clock + interlock
 
 ```rust
-pub struct ClockStatus { pub offset_ms: f32, pub slot_phase: f32 } // clock/status (State)
+pub struct ClockStatus { pub offset_ms: f32, pub slot_phase: f32, pub slot: SlotId } // clock/status (State); slot = authoritative mode-aware slot id (FT8 15s / FT4 7.5s)
 
 pub struct InterlockToken(pub u64);
 pub enum InterlockError { Denied, Expired, NotHolder }

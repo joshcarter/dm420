@@ -170,11 +170,13 @@ async fn transmit(
         );
     };
 
-    // `into_slot` (ms past the 15 s FT8 slot edge) is the FT8-critical metric: the
-    // tones must reach the air near the top of the slot or the far end's DT goes out
-    // of range. Logged at each step so the lateness budget is visible on real hw.
+    // `into_slot` (ms past the mode's slot edge — 15 s FT8 / 7.5 s FT4) is the
+    // timing-critical metric: the tones must reach the air near the top of the slot
+    // or the far end's DT goes out of range. Logged at each step so the lateness
+    // budget is visible on real hw.
+    let slot_ms = slot_period_ms(mode);
     tracing::info!(
-        ?slot, ?mode, offset = offset.0, into_slot_ms = now_ms().rem_euclid(15_000),
+        ?slot, ?mode, offset = offset.0, into_slot_ms = now_ms().rem_euclid(slot_ms),
         message = %message.text, "audio-tx: begin over",
     );
 
@@ -234,7 +236,7 @@ async fn transmit(
     // `synth/key/load_ms` break down the gap from "begin over" so we can see which
     // step dominates. Plus the ~0.2 s lead trimmed above, this is our effective DT.
     tracing::info!(
-        into_slot_ms = now_ms().rem_euclid(15_000),
+        into_slot_ms = now_ms().rem_euclid(slot_ms),
         synth_ms,
         key_ms,
         load_ms,
@@ -375,4 +377,14 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// Slot length in ms for the `into_slot_ms` audit metric (mode-aware: FT4 = 7.5 s).
+/// Streaming modes have no slot and don't reach the slotted-message path, so they
+/// fall through to the FT8 period.
+fn slot_period_ms(mode: t::OverAirMode) -> i64 {
+    match mode {
+        t::OverAirMode::Ft4 => 7_500,
+        _ => 15_000,
+    }
 }

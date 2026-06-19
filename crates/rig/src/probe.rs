@@ -335,6 +335,49 @@ fn order_ports(mut ports: Vec<PortInfo>, all: bool) -> Vec<String> {
     ports.into_iter().map(|p| p.name).collect()
 }
 
+/// Resolve a remembered USB device identity to the port path it currently holds.
+///
+/// The device path (`/dev/cu.usbserial-{location}`) is the USB *location id* and
+/// changes whenever the cable moves to a different port/hub. The USB serial
+/// number is stable, so we persist that and re-resolve it to the live path on
+/// every connect. Returns `None` if nothing matches — the caller falls back to
+/// the saved path, then autodetect.
+pub fn resolve_port_by_identity(
+    serial: Option<&str>,
+    vid: Option<u16>,
+    pid: Option<u16>,
+) -> Option<String> {
+    let ports = ports::list_ports().ok()?;
+    resolve_in(&ports, serial, vid, pid)
+}
+
+/// The pure matching core (testable without hardware): an exact serial-number
+/// match is the strong key; with no serial we accept a *unique* vid/pid match and
+/// otherwise refuse to guess.
+fn resolve_in(
+    ports: &[PortInfo],
+    serial: Option<&str>,
+    vid: Option<u16>,
+    pid: Option<u16>,
+) -> Option<String> {
+    if let Some(want) = serial.filter(|s| !s.is_empty()) {
+        return ports
+            .iter()
+            .find(|p| p.serial_number.as_deref() == Some(want))
+            .map(|p| p.name.clone());
+    }
+    // No serial recorded: fall back to vid/pid, but only when it identifies a
+    // single port — two same-model adapters can't be told apart this way.
+    if let (Some(vid), Some(pid)) = (vid, pid) {
+        let mut hits = ports.iter().filter(|p| p.vid == Some(vid) && p.pid == Some(pid));
+        let first = hits.next()?;
+        if hits.next().is_none() {
+            return Some(first.name.clone());
+        }
+    }
+    None
+}
+
 /// Form a plain-language hypothesis from a failed sweep's aggregate outcomes.
 fn hypothesis(attempts: &[ProbeResult]) -> String {
     use ProbeOutcome::*;
@@ -507,8 +550,53 @@ mod tests {
             vid: None,
             pid: None,
             product: None,
+            serial_number: None,
             likely_radio: likely,
         }
+    }
+
+    fn usb_port(name: &str, vid: u16, pid: u16, serial: Option<&str>) -> PortInfo {
+        PortInfo {
+            name: name.to_string(),
+            description: None,
+            vid: Some(vid),
+            pid: Some(pid),
+            product: None,
+            serial_number: serial.map(str::to_string),
+            likely_radio: vid == 0x10C4,
+        }
+    }
+
+    #[test]
+    fn resolve_matches_by_usb_serial_regardless_of_path() {
+        // Same radio, different path than last time (replugged).
+        let ports = vec![
+            usb_port("/dev/cu.usbserial-120", 0x10C4, 0xEA60, Some("ABC123")),
+            usb_port("/dev/cu.Bluetooth", 0x0000, 0x0000, None),
+        ];
+        assert_eq!(
+            resolve_in(&ports, Some("ABC123"), Some(0x10C4), Some(0xEA60)),
+            Some("/dev/cu.usbserial-120".to_string())
+        );
+        // Serial not present -> no match (don't fall through to a wrong device).
+        assert_eq!(resolve_in(&ports, Some("NOPE"), None, None), None);
+    }
+
+    #[test]
+    fn resolve_falls_back_to_unique_vid_pid_without_serial() {
+        let one = vec![usb_port("/dev/cu.usbserial-120", 0x10C4, 0xEA60, None)];
+        assert_eq!(
+            resolve_in(&one, None, Some(0x10C4), Some(0xEA60)),
+            Some("/dev/cu.usbserial-120".to_string())
+        );
+        // Two identical-model adapters are ambiguous -> refuse to guess.
+        let two = vec![
+            usb_port("/dev/cu.usbserial-120", 0x10C4, 0xEA60, None),
+            usb_port("/dev/cu.usbserial-130", 0x10C4, 0xEA60, None),
+        ];
+        assert_eq!(resolve_in(&two, None, Some(0x10C4), Some(0xEA60)), None);
+        // No identity at all -> None.
+        assert_eq!(resolve_in(&two, None, None, None), None);
     }
 
     #[test]

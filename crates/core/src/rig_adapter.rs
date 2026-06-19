@@ -186,10 +186,36 @@ fn run_until_lost(
     }
 }
 
-/// Open the rig per `serial`: try the explicit port first, then (if enabled) an
-/// autodetect sweep. Returns a human description plus the opened device, or a
-/// short error string for the health message.
+/// Open the rig per `serial`. Resolution order, stopping at the first success:
+/// (1) the remembered **USB identity** resolved to its current path — robust to
+/// the macOS `usbserial-{location}` path changing on replug; (2) the saved
+/// `port` path as a hint; (3) an autodetect sweep when enabled. Returns a human
+/// description plus the opened device, or a short error for the health message.
 fn open(serial: &SerialConfig) -> Result<(String, rig::KenwoodRig), String> {
+    // (1) Stable USB identity first: find the live path for the remembered device.
+    if serial.usb_serial.is_some() || (serial.usb_vid.is_some() && serial.usb_pid.is_some()) {
+        if let Some(path) = rig::probe::resolve_port_by_identity(
+            serial.usb_serial.as_deref(),
+            serial.usb_vid,
+            serial.usb_pid,
+        ) {
+            match rig::open_serial(&path, serial.baud, serial.profile) {
+                Ok(d) => {
+                    return Ok((
+                        format!("{path} @ {} baud (matched USB identity)", serial.baud),
+                        d,
+                    ));
+                }
+                Err(e) => tracing::warn!(
+                    "rig open on {path} (USB-identity match) failed ({e}); trying saved port / autodetect"
+                ),
+            }
+        } else {
+            tracing::info!("rig USB identity not present; trying saved port / autodetect");
+        }
+    }
+
+    // (2) Saved path hint.
     if let Some(port) = &serial.port {
         match rig::open_serial(port, serial.baud, serial.profile) {
             Ok(d) => return Ok((format!("{port} @ {} baud", serial.baud), d)),
@@ -203,6 +229,7 @@ fn open(serial: &SerialConfig) -> Result<(String, rig::KenwoodRig), String> {
         }
     }
 
+    // (3) Autodetect sweep.
     if serial.autodetect {
         autodetect_open()
     } else {

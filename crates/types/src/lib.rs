@@ -543,11 +543,18 @@ pub struct BandActivity {
 // §10  Clock + interlock
 // =====================================================================
 
-/// `clock/status` (State) — clock health for the UI's sync indicator.
+/// `clock/status` (State) — clock health for the UI's sync indicator *and* the
+/// authoritative slot identity for sequencing. The clock module owns the
+/// mode-aware slot period (FT8 = 15 s, FT4 = 7.5 s), so consumers must read
+/// [`slot`](Self::slot) from here rather than recompute it from the wall clock —
+/// that keeps the QSO tick parity commensurate with the decode pipeline's slot
+/// numbering (mismatched periods were the FT4 TX-window bug).
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 pub struct ClockStatus {
     pub offset_ms: f32,
     pub slot_phase: f32,
+    /// The slot the clock is currently in (mode-aware period).
+    pub slot: SlotId,
 }
 
 /// A PTT interlock grant. Flow: `Request -> Grant{token, ttl} -> PttRequest{token}
@@ -945,6 +952,7 @@ mod tests {
         round_trip(ClockStatus {
             offset_ms: -3.5,
             slot_phase: 0.42,
+            slot: SlotId(7),
         });
         round_trip(InterlockToken(12345));
         for e in [

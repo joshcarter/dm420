@@ -23,6 +23,7 @@ use std::sync::Arc;
 use bus::BusHandle;
 use bus::types::RadioId;
 
+mod clock;
 mod control;
 mod decode;
 mod health;
@@ -68,6 +69,17 @@ pub fn list_serial_ports() -> Vec<String> {
     rig::probe::candidate_ports(true).unwrap_or_default()
 }
 
+/// The stable USB identity (vid, pid, serial number) of the device currently at
+/// `port`, for persisting alongside the path so it can be re-resolved after a
+/// replug. Any field may be `None` (non-USB port, or the OS doesn't expose it).
+pub fn usb_identity_for_port(port: &str) -> (Option<u16>, Option<u16>, Option<String>) {
+    rig::list_ports()
+        .ok()
+        .and_then(|ports| ports.into_iter().find(|p| p.name == port))
+        .map(|p| (p.vid, p.pid, p.serial_number))
+        .unwrap_or((None, None, None))
+}
+
 /// The default radio id. Matches `mocks::radio_id()` so the GUI's existing topic
 /// subscriptions line up whether the data comes from `core` or `mocks`.
 pub fn radio_id() -> RadioId {
@@ -100,10 +112,20 @@ pub enum DecodeSource {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SerialConfig {
     /// Device path, e.g. `"/dev/cu.usbserial-120"`. `None` ⇒ autodetect only.
+    /// On macOS the path embeds the USB location id and changes on every replug,
+    /// so it is only a *hint* — the stable USB identity below is tried first.
     pub port: Option<String>,
+    /// Stable USB serial number (iSerial) of the radio's CAT interface. When set,
+    /// the supervisor resolves it to whatever path the device currently has,
+    /// surviving replug/port renumbering. The strong key for "this is my radio".
+    pub usb_serial: Option<String>,
+    /// USB vendor/product id — a weaker fallback used to identify the device when
+    /// no serial number is exposed (only when it picks out a single port).
+    pub usb_vid: Option<u16>,
+    pub usb_pid: Option<u16>,
     pub baud: u32,
     pub profile: LineProfile,
-    /// Sweep ports/bauds to find the radio when `port` is unset or fails to open.
+    /// Sweep ports/bauds to find the radio when the identity/`port` don't resolve.
     pub autodetect: bool,
 }
 
@@ -111,6 +133,9 @@ impl Default for SerialConfig {
     fn default() -> Self {
         Self {
             port: None,
+            usb_serial: None,
+            usb_vid: None,
+            usb_pid: None,
             baud: 19_200,
             profile: LineProfile::Default,
             autodetect: true,
@@ -200,6 +225,12 @@ pub fn spawn(bus: &BusHandle, cfg: CoreConfig) -> CoreControl {
         control.rig = Some(rig);
     }
 
+    // The active mode for the slot clock below: live capture follows it through
+    // `AudioControl`, so capture this only as the WAV/none fallback.
+    let fallback_proto = match &decode {
+        DecodeSource::Wav { protocol, .. } | DecodeSource::Live { protocol, .. } => *protocol,
+        DecodeSource::None => Protocol::Ft8,
+    };
     match decode {
         DecodeSource::Wav {
             path,
@@ -213,6 +244,13 @@ pub fn spawn(bus: &BusHandle, cfg: CoreConfig) -> CoreControl {
         }
         DecodeSource::None => {}
     }
+
+    // Slot-timing clock: the single authoritative slot identity (`clock/status`),
+    // mode-aware so its slot numbering matches the decoder's and the QSO tick
+    // parity. Displaces the FT8-hardcoded mock clock that `spawn_support` used to
+    // inject into the real path. In live mode it tracks the operator's selected
+    // mode via `AudioControl`; otherwise it uses the configured protocol.
+    clock::spawn(bus, control.audio.clone(), fallback_proto);
 
     // The logbook owns `logbook/entries` in real mode: it persists QSOs the engine
     // logs on RR73 and replays history on startup. In mock mode there's no path, so

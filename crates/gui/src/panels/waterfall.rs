@@ -1055,11 +1055,21 @@ impl ConfigForm {
 
     /// The edited fields as a `HardwareConfig` ready to apply.
     fn to_config(&self) -> HardwareConfig {
+        // Capture the chosen device's stable USB identity (vid/pid/serial) so a
+        // later replug — which renumbers the `/dev/cu.usbserial-*` path — still
+        // resolves to the same radio. The path is kept as a fallback hint.
+        let (usb_vid, usb_pid, usb_serial) = match self.port.as_deref() {
+            Some(p) if !p.is_empty() => app_core::usb_identity_for_port(p),
+            _ => (None, None, None),
+        };
         HardwareConfig {
             audio_input: self.audio_input.clone(),
             audio_output: self.audio_output.clone(),
             serial: SerialConfig {
                 port: self.port.clone(),
+                usb_serial,
+                usb_vid,
+                usb_pid,
                 baud: self.baud,
                 profile: self.profile,
                 autodetect: self.autodetect,

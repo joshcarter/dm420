@@ -3,9 +3,15 @@
 //! One tokio task per radio owns an [`Engine`] and feeds it events from the bus:
 //! operator commands (`qso/{id}/command`), inbound decodes
 //! (`radio/{id}/decodes`), the selection (`selection/{id}/active`), and the clock
-//! (`clock/status`, whose phase wrap marks a slot boundary). It publishes the
-//! engine's [`QsoState`] on `qso/{id}/state` and logs completed contacts on
+//! (`clock/status`, whose `slot` id changes at each slot boundary). It publishes
+//! the engine's [`QsoState`] on `qso/{id}/state` and logs completed contacts on
 //! `logbook/entries`.
+//!
+//! The clock's [`ClockStatus::slot`] is the authoritative, mode-aware slot
+//! identity — the shell ticks the engine with it directly rather than recomputing
+//! one from the wall clock, so the engine's TX parity stays commensurate with the
+//! decoder's slot numbering under FT4's 7.5 s slots (the old fixed 15 s recompute
+//! was the FT4 "armed but never transmits" bug).
 //!
 //! Transmission is **gated behind `allow_transmit`** and, until the PTT interlock
 //! granter + audio-TX codec exist, has nowhere to go — so the task computes and
@@ -17,7 +23,8 @@ use std::time::Duration;
 
 use bus::types::{
     AbsHz, Band, ClockStatus, Decode, InterlockReply, InterlockRequest, LogEntry, OffsetHz,
-    OverAirMode, QsoCommand, QsoId, RadioId, Selection, StationId, Timestamp, TxAck, TxRequest,
+    OverAirMode, QsoCommand, QsoId, RadioId, Selection, SlotId, StationId, Timestamp, TxAck,
+    TxRequest,
 };
 use bus::{BusHandle, BusMessage, DeliveryClass, Topic, TopicSelector};
 use serde::{Deserialize, Serialize};
@@ -51,10 +58,6 @@ impl QsoControl {
         *self.station.lock().unwrap() = station;
     }
 }
-
-/// FT8 T/R period. TODO: derive from the active mode once `OperatingState` is
-/// published (FT4 = 7.5 s).
-const SLOT_PERIOD_MS: u64 = 15_000;
 
 /// Launch the QSO engine for `radio` onto `bus`. Must be called from within a
 /// tokio runtime (like `core::spawn` / `mocks::spawn`).
@@ -116,7 +119,14 @@ async fn run(
     // Publish an initial Idle state so late-joining UIs render immediately.
     let _ = bus.publish(&Topic::QsoState(radio.clone()), engine.state());
 
-    let mut prev_phase = 1.0f32;
+    // The clock's last-seen slot id; a change marks a T/R boundary (the tick).
+    let mut prev_slot: Option<SlotId> = None;
+    // The active on-air mode, tracked from inbound decodes (each carries the mode
+    // the decoder used). Drives the `mode` we hand the audio-TX codec so it never
+    // synthesizes the wrong protocol into a slot. Defaults to FT8 until the first
+    // decode (the answering flow always hears the partner first, so by the time we
+    // transmit a reply this reflects the real mode).
+    let mut mode = OverAirMode::Ft8;
     // Seed the per-contact sequence from the wall clock so `QsoId { origin, seq }`
     // stays unique *across sessions*. A plain 0 restart reused 1, 2, 3… every run,
     // colliding with already-logged ids — the logbook dedups by `QsoId`, so those
@@ -135,7 +145,10 @@ async fn run(
                 step
             }
             r = decodes.recv() => match r {
-                Ok(d) => engine.step(Event::Decode(d)),
+                Ok(d) => {
+                    mode = d.mode;
+                    engine.step(Event::Decode(d))
+                }
                 Err(_) => continue,
             },
             r = selection.recv() => match r {
@@ -144,12 +157,15 @@ async fn run(
             },
             r = clock.recv() => match r {
                 Ok(cs) => {
-                    let boundary = cs.slot_phase < prev_phase;
-                    prev_phase = cs.slot_phase;
+                    // A slot boundary is a change in the clock's authoritative slot
+                    // id. Seed `prev_slot` on the first message without firing (we
+                    // may be mid-slot), then tick on every change after.
+                    let boundary = prev_slot.is_some_and(|p| p != cs.slot);
+                    prev_slot = Some(cs.slot);
                     if !boundary {
                         continue;
                     }
-                    engine.step(Event::Tick { slot: current_slot() })
+                    engine.step(Event::Tick { slot: cs.slot })
                 }
                 Err(_) => continue,
             },
@@ -163,6 +179,7 @@ async fn run(
             &mut seq,
             step,
             allow_transmit,
+            mode,
         );
     }
 }
@@ -175,6 +192,7 @@ fn apply(
     seq: &mut u64,
     step: Step,
     allow_transmit: bool,
+    mode: OverAirMode,
 ) {
     let _ = bus.publish(&Topic::QsoState(radio.clone()), step.state);
 
@@ -183,7 +201,7 @@ fn apply(
             // Hand the over to the audio-TX codec on its own task (acquire token →
             // request TxRequest → release). The engine loop keeps running so it
             // still services decodes/clock during the ~13 s transmission.
-            spawn_transmit(bus.clone(), radio.clone(), tx);
+            spawn_transmit(bus.clone(), radio.clone(), tx, mode);
         } else {
             tracing::debug!(
                 "qso: TX gated off; would send {:?} @ {:?}",
@@ -197,7 +215,7 @@ fn apply(
         *seq += 1;
         let _ = bus.publish(
             &Topic::LogbookEntries,
-            build_log(done, radio.clone(), my_station.clone(), *seq),
+            build_log(done, radio.clone(), my_station.clone(), *seq, mode),
         );
     }
 }
@@ -206,7 +224,7 @@ fn apply(
 /// the message to the audio-TX codec (which keys, plays, and reports on
 /// `tx_report`), then release the token so the next slot can acquire it. Spawned so
 /// the engine loop keeps servicing decodes/clock through the ~13 s over.
-fn spawn_transmit(bus: BusHandle, radio: RadioId, tx: TxIntent) {
+fn spawn_transmit(bus: BusHandle, radio: RadioId, tx: TxIntent, mode: OverAirMode) {
     tokio::spawn(async move {
         tracing::debug!(
             offset = ?tx.offset, slot = ?tx.slot, message = %tx.message.text,
@@ -234,9 +252,10 @@ fn spawn_transmit(bus: BusHandle, radio: RadioId, tx: TxIntent) {
         tracing::debug!(?token, "qso: PTT token acquired; handing over to audio-tx");
         let req = TxRequest::SlottedMessage {
             radio: radio.clone(),
-            // TODO: derive the mode from OperatingState (FT4 = 7.5 s slots) once it
-            // is published; the audio-TX codec only synthesizes FT8 today.
-            mode: OverAirMode::Ft8,
+            // The mode the partner was heard on. The audio-TX codec only
+            // synthesizes FT8 today, so an FT4 over is rejected there with a clear
+            // "not implemented" — better than keying FT8 tones into an FT4 slot.
+            mode,
             offset: tx.offset,
             slot: tx.slot,
             message: tx.message,
@@ -259,11 +278,18 @@ fn spawn_transmit(bus: BusHandle, radio: RadioId, tx: TxIntent) {
     });
 }
 
-/// Build a [`LogEntry`] from a completed contact. Band/freq/mode are placeholders
-/// until the engine subscribes to `RigState`/`OperatingState`; logging is dormant
-/// while TX is blocked (no QSO can complete on the air), so this is wired for
-/// correctness, not yet exercised. TODO: stamp real band/freq/mode/time.
-fn build_log(done: CompletedQso, radio: RadioId, origin: StationId, seq: u64) -> LogEntry {
+/// Build a [`LogEntry`] from a completed contact. `mode` is the real on-air mode
+/// (tracked from the partner's decodes); band/freq remain placeholders until the
+/// engine subscribes to `RigState`. Logging is dormant while TX is blocked (no QSO
+/// can complete on the air), so this is wired for correctness, not yet exercised.
+/// TODO: stamp real band/freq/time.
+fn build_log(
+    done: CompletedQso,
+    radio: RadioId,
+    origin: StationId,
+    seq: u64,
+    mode: OverAirMode,
+) -> LogEntry {
     LogEntry {
         id: QsoId {
             origin: origin.clone(),
@@ -272,7 +298,7 @@ fn build_log(done: CompletedQso, radio: RadioId, origin: StationId, seq: u64) ->
         origin,
         radio: Some(radio),
         call: done.call,
-        mode: OverAirMode::Ft8,
+        mode,
         band: Band::B20m,
         freq: AbsHz(14_074_000),
         time: Timestamp(now_ms() as i64),
@@ -284,13 +310,6 @@ fn build_log(done: CompletedQso, radio: RadioId, origin: StationId, seq: u64) ->
 
 fn station_call(shared: &Arc<Mutex<StationConfig>>) -> StationId {
     StationId(shared.lock().unwrap().call.0.clone())
-}
-
-/// The current slot id, derived from UTC. Consistent parity with UTC-aligned
-/// decode slots; the WAV-replay path numbers slots differently (a known seam to
-/// reconcile when TX lands — `docs/live_pipeline_notes.md`).
-fn current_slot() -> types::SlotId {
-    types::SlotId(now_ms() / SLOT_PERIOD_MS)
 }
 
 fn now_ms() -> u64 {

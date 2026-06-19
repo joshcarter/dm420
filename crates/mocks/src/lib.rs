@@ -56,15 +56,16 @@ pub fn spawn(bus: &BusHandle) {
     tokio::spawn(run_scanner(bus.clone()));
 }
 
-/// Launch only the producers the real `core` adapter does not yet cover (clock,
+/// Launch only the producers the real `core` adapter does not yet cover (the
 /// scanner). Use this alongside `core::spawn` so the real rig/decode/logbook
 /// producers own their topics without a second writer fighting them.
 ///
-/// The logbook is no longer here: `core::spawn` runs the real persistent logbook
-/// in real mode, so a mock writer must not also publish fake QSOs onto
-/// `logbook/entries`.
+/// The clock and logbook are no longer here: `core::spawn` runs the real
+/// mode-aware slot clock (`core::clock`) and the real persistent logbook in real
+/// mode, so a mock writer must not also publish onto `clock/status` /
+/// `logbook/entries`. (A 15 s-hardcoded mock clock on the real path was the FT4
+/// TX-window bug.)
 pub fn spawn_support(bus: &BusHandle) {
-    tokio::spawn(run_clock(bus.clone()));
     tokio::spawn(run_scanner(bus.clone()));
 }
 
@@ -85,23 +86,26 @@ fn publish_rig_state(bus: &BusHandle) {
 
 // --------------------------------------------------------------------- clock
 
-/// Publish the slot phase frequently so the clock UI has a heartbeat *and* the QSO
-/// engine detects the slot boundary promptly: the shell starts an over when it sees
-/// `slot_phase` wrap, so this interval is the worst-case lateness added to every
-/// transmit. FT8 wants the tones on-air near the top of the slot, so keep it small
-/// (50 ms ⇒ ≤50 ms boundary-detection lag, vs ½ s at the old UI-only rate).
+/// Mock-mode slot clock (no-hardware `DM420_MOCK=1` path; the real path uses
+/// `core::clock`). Mock traffic is FT8, so the 15 s period here is correct — and
+/// it matches `run_decodes`' own slot numbering, so the QSO engine's tick parity
+/// lines up with the seeded decodes. Republished frequently so the clock UI has a
+/// heartbeat and the QSO shell detects the slot boundary promptly (50 ms ⇒ ≤50 ms
+/// boundary-detection lag).
 async fn run_clock(bus: BusHandle) {
+    const SLOT_MS: i64 = 15_000; // mock traffic is FT8
     let mut tick = tokio::time::interval(Duration::from_millis(50));
     loop {
         tick.tick().await;
         let ms = now_ms();
-        // FT8 is a 15 s slot; phase is the fraction elapsed into the current one.
-        let slot_phase = (ms.rem_euclid(15_000) as f32) / 15_000.0;
+        let slot_phase = (ms.rem_euclid(SLOT_MS) as f32) / SLOT_MS as f32;
+        let slot = SlotId(ms.div_euclid(SLOT_MS) as u64);
         let _ = bus.publish(
             &Topic::ClockStatus,
             ClockStatus {
                 offset_ms: 0.0,
                 slot_phase,
+                slot,
             },
         );
     }

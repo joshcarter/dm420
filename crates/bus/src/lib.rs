@@ -26,12 +26,12 @@
 //!
 //! ```
 //! use bus::{BusHandle, Topic, TopicSelector};
-//! use bus::types::{ClockStatus};
+//! use bus::types::{ClockStatus, SlotId};
 //!
 //! # async fn ex() -> Result<(), bus::BusError> {
 //! let bus = BusHandle::new();
 //! let mut sub = bus.subscribe::<ClockStatus>(TopicSelector::Exact(Topic::ClockStatus))?;
-//! bus.publish(&Topic::ClockStatus, ClockStatus { offset_ms: -3.0, slot_phase: 0.1 })?;
+//! bus.publish(&Topic::ClockStatus, ClockStatus { offset_ms: -3.0, slot_phase: 0.1, slot: SlotId(0) })?;
 //! let got = sub.recv().await?; // late-join: yields the current State value
 //! assert_eq!(got.offset_ms, -3.0);
 //! # Ok(()) }

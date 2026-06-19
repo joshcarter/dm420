@@ -97,6 +97,7 @@ async fn state_late_join() {
         ClockStatus {
             offset_ms: 1.0,
             slot_phase: 0.5,
+            slot: SlotId(0),
         },
     )
     .unwrap();
@@ -294,6 +295,7 @@ async fn record_replay_golden() {
         ClockStatus {
             offset_ms: 1.0,
             slot_phase: 0.1,
+            slot: SlotId(0),
         },
     )
     .unwrap();

@@ -1,3 +1,11 @@
+# Next
+
+FT4 not working for tx
+
+FT4 needs to scroll faster
+
+Map unreadable in light mode--needs to go lighter with texture, not darker.
+
 # Soon
 
 Review if hashed callsigns are properly implemented.

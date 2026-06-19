@@ -320,20 +320,38 @@ fn parse_audio_config(text: &str) -> (Option<String>, Option<String>) {
 #[derive(Default)]
 struct SerialFile {
     port: Option<String>,
+    /// Stable USB identity of the radio's CAT interface, captured when the device
+    /// was picked. Resolved to the live path on connect (replug-proof).
+    usb_serial: Option<String>,
+    usb_vid: Option<u16>,
+    usb_pid: Option<u16>,
     baud: Option<u32>,
     profile: Option<LineProfile>,
     autodetect: Option<bool>,
 }
 
 /// Pull the rig serial settings from the `[serial]` table. Unparseable
-/// baud/profile/autodetect values are treated as unset (the caller's default
-/// applies) rather than failing the whole read.
+/// baud/profile/autodetect/vid/pid values are treated as unset (the caller's
+/// default applies) rather than failing the whole read. vid/pid accept a `0x`
+/// hex prefix (how they're written) or plain decimal.
 fn parse_serial_config(text: &str) -> SerialFile {
     SerialFile {
         port: parse_table_value(text, "serial", "port"),
+        usb_serial: parse_table_value(text, "serial", "usb_serial"),
+        usb_vid: parse_table_value(text, "serial", "usb_vid").and_then(|s| parse_u16(&s)),
+        usb_pid: parse_table_value(text, "serial", "usb_pid").and_then(|s| parse_u16(&s)),
         baud: parse_table_value(text, "serial", "baud").and_then(|s| s.parse().ok()),
         profile: parse_table_value(text, "serial", "profile").and_then(|s| LineProfile::parse(&s)),
         autodetect: parse_table_value(text, "serial", "autodetect").and_then(|s| s.parse().ok()),
+    }
+}
+
+/// Parse a `u16` written as `0x10C4` (hex) or plain decimal.
+fn parse_u16(s: &str) -> Option<u16> {
+    let s = s.trim();
+    match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        Some(hex) => u16::from_str_radix(hex, 16).ok(),
+        None => s.parse().ok(),
     }
 }
 
@@ -430,6 +448,12 @@ pub fn save_hardware_config(cfg: &HardwareConfig) {
         "# DM420 config — written from the UI; safe to hand-edit.\n".to_string()
     });
     let baud = cfg.serial.baud.to_string();
+    // The stable USB identity (captured in `SettingsForm::to_config`) is the
+    // durable key; persist it so a replug that renumbers the path still resolves
+    // the radio. vid/pid as `0x….`, serial verbatim; empty when not a USB device.
+    let usb_vid = cfg.serial.usb_vid.map(|v| format!("0x{v:04X}")).unwrap_or_default();
+    let usb_pid = cfg.serial.usb_pid.map(|v| format!("0x{v:04X}")).unwrap_or_default();
+    let usb_serial = cfg.serial.usb_serial.as_deref().unwrap_or("");
     // Two passes over the same text, so both tables land in one file while every
     // other table and all comments are preserved.
     let text = update_toml_table(
@@ -445,6 +469,9 @@ pub fn save_hardware_config(cfg: &HardwareConfig) {
         "serial",
         &[
             ("port", cfg.serial.port.as_deref().unwrap_or("")),
+            ("usb_serial", usb_serial),
+            ("usb_vid", &usb_vid),
+            ("usb_pid", &usb_pid),
             ("baud", &baud),
             ("profile", cfg.serial.profile.label()),
             ("autodetect", if cfg.serial.autodetect { "true" } else { "false" }),
@@ -507,6 +534,11 @@ fn serial_from_env() -> SerialConfig {
 
     SerialConfig {
         port,
+        // The stable USB identity captured when the device was last picked. Tried
+        // before `port`, so a replug that renumbers the path still finds the radio.
+        usb_serial: file.usb_serial,
+        usb_vid: file.usb_vid,
+        usb_pid: file.usb_pid,
         baud,
         profile,
         // Default on so the operator isn't stuck guessing a port/baud; an explicit
@@ -633,6 +665,9 @@ mod tests {
             "serial",
             &[
                 ("port", "/dev/ttyUSB0"),
+                ("usb_serial", "52238a72"),
+                ("usb_vid", "0x10C4"),
+                ("usb_pid", "0xEA60"),
                 ("baud", "19200"),
                 ("profile", LineProfile::Default.label()),
                 ("autodetect", "true"),
@@ -640,8 +675,19 @@ mod tests {
         );
         let s = parse_serial_config(&text);
         assert_eq!(s.port.as_deref(), Some("/dev/ttyUSB0"));
+        assert_eq!(s.usb_serial.as_deref(), Some("52238a72"));
+        assert_eq!(s.usb_vid, Some(0x10C4));
+        assert_eq!(s.usb_pid, Some(0xEA60));
         assert_eq!(s.baud, Some(19_200));
         assert_eq!(s.profile, Some(LineProfile::Default));
         assert_eq!(s.autodetect, Some(true));
+    }
+
+    #[test]
+    fn usb_ids_parse_hex_and_decimal() {
+        assert_eq!(parse_u16("0x10C4"), Some(0x10C4));
+        assert_eq!(parse_u16("0X10c4"), Some(0x10C4));
+        assert_eq!(parse_u16("4292"), Some(4292));
+        assert_eq!(parse_u16("nope"), None);
     }
 }
