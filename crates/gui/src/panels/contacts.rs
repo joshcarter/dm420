@@ -311,27 +311,41 @@ fn draw_map(
         }
     };
 
-    // Land fill is a textured mesh: each vertex carries a UV into the shaded-relief
-    // texture, and an opaque base tint that the relief texel multiplies — so the
-    // land lightness varies with terrain (mountains shaded, plains flat).
+    // Land is drawn in two passes: a flat base fill, then a shaded-relief overlay
+    // composited on top. The relief texture carries the hillshade as alpha (RGB =
+    // white), so the overlay tint decides the direction of the depth cue — a dark
+    // tint shades the terrain (dark theme), a light tint highlights it (light
+    // theme). Plains have ~0 alpha and read as the flat base in either theme.
     let land_base = over(pal.map_land, pal.screen_bg);
+    let land_pos = project(geo_data::LAND_VERTS);
+    let mut land_mesh = Mesh::default();
+    for &pos in &land_pos {
+        land_mesh.colored_vertex(pos, land_base);
+    }
+    land_mesh.indices.extend_from_slice(geo_data::LAND_IDX);
+    painter.add(Shape::mesh(land_mesh));
+
+    let relief_tint = if pal.is_dark {
+        Color32::BLACK
+    } else {
+        Color32::WHITE
+    };
     let lon_span = pd::RELIEF_LON1 - pd::RELIEF_LON0;
     let lat_span = pd::RELIEF_LAT1 - pd::RELIEF_LAT0;
-    let land_pos = project(geo_data::LAND_VERTS);
-    let mut land_mesh = Mesh::with_texture(relief.id());
+    let mut relief_mesh = Mesh::with_texture(relief.id());
     for (i, &(la, lo)) in geo_data::LAND_VERTS.iter().enumerate() {
         let uv = Pos2::new(
             (lo - pd::RELIEF_LON0) / lon_span,
             (pd::RELIEF_LAT1 - la) / lat_span,
         );
-        land_mesh.vertices.push(egui::epaint::Vertex {
+        relief_mesh.vertices.push(egui::epaint::Vertex {
             pos: land_pos[i],
             uv,
-            color: land_base,
+            color: relief_tint,
         });
     }
-    land_mesh.indices.extend_from_slice(geo_data::LAND_IDX);
-    painter.add(Shape::mesh(land_mesh));
+    relief_mesh.indices.extend_from_slice(geo_data::LAND_IDX);
+    painter.add(Shape::mesh(relief_mesh));
     stroke_rings(
         &land_pos,
         geo_data::LAND_RINGS,

@@ -21,9 +21,12 @@ pub fn make_brushed(ctx: &egui::Context, pal: &Palette) -> TextureHandle {
     ctx.load_texture("brushed", img, TextureOptions::NEAREST_REPEAT)
 }
 
-/// Shaded-relief texture (grayscale multiplier) baked from GEBCO; see
-/// `tools/gen_relief.py`. Sampled by the land mesh to give the map topographic
-/// depth. Theme-independent — load once.
+/// Shaded-relief texture baked from GEBCO; see `tools/gen_relief.py`. Sampled by
+/// the land mesh to give the map topographic depth. The hillshade is carried in
+/// the ALPHA channel (RGB = white): flat terrain → transparent, mountain shadows
+/// → opaque. The land mesh composites a tint through this alpha, so the *same*
+/// texture can darken (dark theme) or lighten (light theme) the terrain — a plain
+/// grayscale multiplier could only ever darken. Theme-independent — load once.
 pub fn make_relief(ctx: &egui::Context) -> TextureHandle {
     let bytes = include_bytes!("../assets/relief.png");
     let gray = image::load_from_memory(bytes)
@@ -32,8 +35,9 @@ pub fn make_relief(ctx: &egui::Context) -> TextureHandle {
     let (w, h) = gray.dimensions();
     let mut rgba = Vec::with_capacity((w * h * 4) as usize);
     for p in gray.pixels() {
-        let v = p[0];
-        rgba.extend_from_slice(&[v, v, v, 255]);
+        // relief.png stores the multiplier (255 = flat); the shade "deficit"
+        // (255 - v) becomes the overlay alpha.
+        rgba.extend_from_slice(&[255, 255, 255, 255 - p[0]]);
     }
     let img = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
     ctx.load_texture("relief", img, TextureOptions::LINEAR)
