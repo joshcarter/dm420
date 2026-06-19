@@ -436,7 +436,7 @@ fn draw_map(
             .map(|(lon, lat)| proj(lon, lat))
     });
     if let Some(sp) = selected_pos {
-        let cross = Stroke::new(0.9, pal.accent2.gamma_multiply(0.5));
+        let cross = Stroke::new(0.9, pal.accent.gamma_multiply(0.5));
         painter.line_segment(
             [Pos2::new(content.left(), sp.y), Pos2::new(content.right(), sp.y)],
             cross,

@@ -110,7 +110,8 @@ Severity: 🔴 correctness/blocker · 🟡 should-fix · 🟢 polish.
 
 ## UI tunables (knobs that currently live as constants)
 
-- `WS_HISTORY_SECS` (waterfall.rs) — seconds per half / scroll rate.
+- `ws_history_secs()` (waterfall.rs) — seconds per half / scroll rate, derived per
+  frame from the rendered message width × slot period (FT8 15 s, FT4 7.5 s).
 - `SPECTRUM_HOP_S` (decode.rs) — spectrogram column cadence.
 - `COL_DB_FLOOR` / `COL_DB_CEIL` (dsp) — waterfall brightness range.
 - `FFT_SIZE` / `SPECTRUM_MAX_HZ` (decode.rs) — bin resolution & frequency span.

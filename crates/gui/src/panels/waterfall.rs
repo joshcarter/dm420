@@ -512,7 +512,7 @@ impl Panel for Waterfall {
                     let now_ms = chrono::Utc::now().timestamp_millis();
                     // Right half: real scrolling spectrogram (brightness = intensity),
                     // flowing right as the decode text flows left. Equal-width halves
-                    // each spanning WS_HISTORY_SECS, so the scroll rates match.
+                    // each spanning `ws_secs`, so the scroll rates match.
                     let now_x = body.center().x;
                     let right = Rect::from_min_max(Pos2::new(now_x, body.top()), body.max);
                     let cmap = if pal.is_dark {
@@ -527,8 +527,13 @@ impl Panel for Waterfall {
                     // so the timeline reads RX … my over … RX as it scrolls.
                     let tx_col = ctx.bus.tx_spectrum().filter(|r| now_ms - r.t.0 < 500);
                     let column = tx_col.or_else(|| ctx.bus.spectrum());
+                    // Scroll speed: set so one decode line clears as the next slot's
+                    // lands. Both halves share this span so their pixels-per-second
+                    // match (see `ws_history_secs`). FT4's shorter slots scroll faster.
+                    let protocol = ctx.bus.current_config().protocol;
+                    let ws_secs = ws_history_secs(painter, body, protocol);
                     self.spectro
-                        .update_and_paint(ctx.ui, right, ctx.dt, column.as_ref(), &cmap);
+                        .update_and_paint(ctx.ui, right, ctx.dt, ws_secs, column.as_ref(), &cmap);
                     // Click-to-select on the live waterslide (mock mode selects via
                     // the sim's own `ui()`; the real waterslide is draw-only). We
                     // hit-test here and let `draw_waterslide` resolve the click to a
@@ -558,7 +563,7 @@ impl Panel for Waterfall {
                     // spectrogram (graticule, NOW line, and Hz labels included). The
                     // returned selection (if the click resolved to one) is stored. The
                     // TX lane is sized to the on-air signal and tinted by armed state.
-                    let bandwidth_hz = signal_bandwidth_hz(ctx.bus.current_config().protocol);
+                    let bandwidth_hz = signal_bandwidth_hz(protocol);
                     let armed = !matches!(phase, QsoPhase::Idle);
                     if let Some(sel) = draw_waterslide(
                         painter,
@@ -571,6 +576,8 @@ impl Panel for Waterfall {
                         sel_call.as_deref(),
                         tag.as_deref(),
                         bandwidth_hz,
+                        ws_secs,
+                        slot_period_secs(protocol),
                         armed,
                     ) {
                         self.real_sel = sel;
@@ -642,7 +649,7 @@ const SPECTRO_MAX_H: usize = 512;
 /// A scrolling spectrogram texture for the right half. Newest column sits at the
 /// NOW line; older columns flow right, brightness = signal intensity. It scrolls
 /// at the same rate the decode text moves left: both halves are equal width and
-/// each spans `WS_HISTORY_SECS`, so the on-screen pixels-per-second match.
+/// each spans the same `history_secs`, so the on-screen pixels-per-second match.
 struct Spectrogram {
     w: usize,
     h: usize,
@@ -693,6 +700,7 @@ impl Spectrogram {
         ui: &egui::Ui,
         rect: Rect,
         dt: f64,
+        history_secs: f32,
         latest: Option<&SpectrumRow>,
         cmap: &[Color32; 256],
     ) {
@@ -704,7 +712,7 @@ impl Spectrogram {
         }
 
         // Scroll right by whole columns; carry the fraction across frames.
-        self.dx_frac += dt * (self.w as f64 / WS_HISTORY_SECS as f64);
+        self.dx_frac += dt * (self.w as f64 / history_secs as f64);
         let mut dx = self.dx_frac.floor() as usize;
         if dx > 0 {
             self.dx_frac -= dx as f64;
@@ -744,10 +752,34 @@ impl Spectrogram {
             .image(self.tex.as_ref().unwrap().id(), rect, uv, Color32::WHITE);
     }
 }
-/// Seconds of history the left (text) half spans: NOW at centre → oldest at left.
-/// Tuned so a decode column travels well clear of centre within one FT8 slot
-/// (~15 s); a smaller value scrolls faster, a larger one shows more history.
-const WS_HISTORY_SECS: f32 = 45.0;
+/// A representative decode line (SNR + a typical exchange) used to gauge how wide
+/// one message renders in the current font. The font is monospaced, so this is an
+/// exact stand-in for any same-length line; longer/shorter real messages vary a
+/// little, which is fine — the scroll speed only needs to be approximately right.
+const WS_REF_MSG: &str = "−15 KX1ABC W4XYZ R−12";
+
+/// Seconds of decode history the left (text) half spans (NOW at centre → oldest at
+/// left), chosen so one message clears as the next renders into place. We render
+/// `WS_REF_MSG` in the current font to get its pixel width `msg_w`, then scroll at
+/// `msg_w / slot_period` px/s — i.e. a message travels its own width in one slot,
+/// so the previous slot's line has moved off NOW before the next lands on top of
+/// it. That makes `history_secs = (left_w / msg_w) * slot_period`: faster for FT4
+/// (7.5 s slots), slower for FT8 (15 s), and it tracks font/window size so roughly
+/// the same number of messages always fit across the half.
+fn ws_history_secs(painter: &egui::Painter, body: Rect, protocol: Protocol) -> f32 {
+    let msg_pt = (12.0 * body.height() / WS_REF_H).clamp(MIN_FONT_PT, WS_MSG_FONT_MAX);
+    let msg_w = measure(painter, WS_REF_MSG, mono(msg_pt)).max(1.0);
+    let left_w = (body.width() * 0.5).max(1.0);
+    (left_w / msg_w) * slot_period_secs(protocol)
+}
+
+/// One transmit-slot period in seconds — FT8's 15 s windows, FT4's 7.5 s.
+fn slot_period_secs(protocol: Protocol) -> f32 {
+    match protocol {
+        Protocol::Ft8 => 15.0,
+        Protocol::Ft4 => 7.5,
+    }
+}
 
 /// Decode-text size on the waterslide scales with pane height, clamped to this
 /// band: `MIN_FONT_PT` (the app-wide floor) up to `WS_MSG_FONT_MAX`. The size is
@@ -807,12 +839,14 @@ fn draw_waterslide(
     sel_call: Option<&str>,
     tag: Option<&str>,
     bandwidth_hz: f32,
+    history_secs: f32,
+    slot_secs: f32,
     armed: bool,
 ) -> Option<RealSel> {
     let painter = painter.with_clip_rect(rect);
     let now_x = rect.center().x; // the NOW line
     let left_w = (now_x - rect.left()).max(1.0);
-    let pps = left_w / WS_HISTORY_SECS; // pixels per second of history
+    let pps = left_w / history_secs; // pixels per second of history
     let mut hit: Option<RealSel> = None;
 
     // Audio offset → vertical position (low Hz at bottom, high Hz at top).
@@ -833,6 +867,30 @@ fn draw_waterslide(
             mono(8.5),
             pal.sub,
         );
+    }
+
+    // Slot-interval dividers: a thin accent rule at each transmit-slot boundary,
+    // marching out of NOW as the lane scrolls. Boundaries align to real slot starts
+    // (multiples of the slot period in UTC), so a rule lands where each decode
+    // column does — separating the messages into discrete intervals. The spectrogram
+    // (right half) mirrors the text lane about NOW, so each boundary draws twice:
+    // left at `now_x - age·pps`, and its mirror over the spectrogram at `now_x + age·pps`.
+    let slot_ms = (slot_secs as f64 * 1000.0) as i64;
+    if slot_ms > 0 {
+        let stroke = egui::Stroke::new(1.0, pal.accent.gamma_multiply(0.5));
+        let mut t = (now_ms / slot_ms) * slot_ms; // most recent boundary ≤ now
+        loop {
+            let dx = ((now_ms - t) as f32 / 1000.0) * pps; // distance from NOW
+            let (xl, xr) = (now_x - dx, now_x + dx);
+            if xl < rect.left() {
+                break;
+            }
+            painter.line_segment([Pos2::new(xl, rect.top()), Pos2::new(xl, rect.bottom())], stroke);
+            if xr <= rect.right() {
+                painter.line_segment([Pos2::new(xr, rect.top()), Pos2::new(xr, rect.bottom())], stroke);
+            }
+            t -= slot_ms;
+        }
     }
 
     // Selected station's lane: a faint highlight band drawn behind the decodes so

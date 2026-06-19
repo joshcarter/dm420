@@ -1,7 +1,5 @@
 # Next
 
-Adapt the panel scroll speed to the estimated length of a message.
-
 Make panel layout show digital at 2/3 width and right panels at 1/3 width. And/or remember panel layout in config file.
 
 FT4/FT8 mode toggle: also switch to calling freq
