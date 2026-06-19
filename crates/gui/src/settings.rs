@@ -480,6 +480,118 @@ pub fn save_hardware_config(cfg: &HardwareConfig) {
     write_config(&path, &text);
 }
 
+/// The persisted window inner size (logical points). Read at startup to seed the
+/// `ViewportBuilder`, written on exit so the window reopens where it was left.
+#[derive(Clone, Copy, PartialEq)]
+pub struct WindowSize {
+    pub width: f32,
+    pub height: f32,
+    /// Top-left position in OS screen points, if it was saved. `None` lets the
+    /// window manager place the window (first run, or a file without `[window] x`).
+    /// May be negative on a multi-monitor desktop, so it isn't sign-checked.
+    pub pos: Option<(f32, f32)>,
+}
+
+/// The resizable tile-split proportions, as the raw `egui_tiles` linear shares.
+/// Stored relative (not pixels), so they survive a window resize. `band` is
+/// re-pinned to a fixed height each frame ([`crate::pin_band_height`]) so its
+/// saved value is cosmetic, but kept for a complete record of the layout.
+#[derive(Clone, Copy, PartialEq)]
+pub struct LayoutShares {
+    /// Root horizontal split: Waterfall column vs. the right-hand stack.
+    pub waterfall: f32,
+    pub right: f32,
+    /// Right vertical split: Log Book / Band Scan / Contacts map.
+    pub log: f32,
+    pub band: f32,
+    pub contacts: f32,
+}
+
+/// Read the saved `[window]` inner size, or `None` if absent/incomplete (then the
+/// caller uses the design default). A non-positive or non-finite value is treated
+/// as unset so a corrupt file can't open a zero-size window.
+pub fn read_window_size() -> Option<WindowSize> {
+    let text = std::fs::read_to_string(config_path()).ok()?;
+    let w = parse_float(&text, "window", "width")?;
+    let h = parse_float(&text, "window", "height")?;
+    // Position is optional and only honored if both coords are present & finite —
+    // a half-written pair is dropped rather than placing the window off-screen.
+    let pos = match (
+        parse_float(&text, "window", "x"),
+        parse_float(&text, "window", "y"),
+    ) {
+        (Some(x), Some(y)) if x.is_finite() && y.is_finite() => Some((x, y)),
+        _ => None,
+    };
+    (w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0).then_some(WindowSize {
+        width: w,
+        height: h,
+        pos,
+    })
+}
+
+/// Read the saved `[layout]` tile shares. Returns `None` unless every share is
+/// present and a positive finite number — a partial/garbled table falls back to
+/// the built-in layout rather than a lopsided one.
+pub fn read_layout_shares() -> Option<LayoutShares> {
+    let text = std::fs::read_to_string(config_path()).ok()?;
+    let get = |key| parse_float(&text, "layout", key).filter(|v: &f32| v.is_finite() && *v > 0.0);
+    Some(LayoutShares {
+        waterfall: get("waterfall")?,
+        right: get("right")?,
+        log: get("log")?,
+        band: get("band")?,
+        contacts: get("contacts")?,
+    })
+}
+
+/// Persist the window size and tile layout to the `[window]` / `[layout]` tables,
+/// preserving every other table and comment. Best-effort: called on exit (the
+/// macOS close path bypasses eframe's own save hook), errors are logged.
+pub fn save_window_layout(win: WindowSize, layout: LayoutShares) {
+    let path = config_path();
+    let existing = std::fs::read_to_string(&path).unwrap_or_else(|_| {
+        "# DM420 config — written from the UI; safe to hand-edit.\n".to_string()
+    });
+    // Width/height always; x/y only when known (otherwise leave any prior value
+    // in place rather than overwriting it with a bogus coordinate).
+    let mut win_kvs = vec![
+        ("width", format_f32(win.width)),
+        ("height", format_f32(win.height)),
+    ];
+    if let Some((x, y)) = win.pos {
+        win_kvs.push(("x", format_f32(x)));
+        win_kvs.push(("y", format_f32(y)));
+    }
+    let win_kvs: Vec<(&str, &str)> = win_kvs.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let text = update_toml_table(&existing, "window", &win_kvs);
+    let text = update_toml_table(
+        &text,
+        "layout",
+        &[
+            ("waterfall", &format_f32(layout.waterfall)),
+            ("right", &format_f32(layout.right)),
+            ("log", &format_f32(layout.log)),
+            ("band", &format_f32(layout.band)),
+            ("contacts", &format_f32(layout.contacts)),
+        ],
+    );
+    write_config(&path, &text);
+}
+
+/// Parse a numeric value from `table`'s `key` (stored as a quoted string, like
+/// every other config value — see [`parse_table_value`]).
+fn parse_float(text: &str, table: &str, key: &str) -> Option<f32> {
+    parse_table_value(text, table, key).and_then(|v| v.parse::<f32>().ok())
+}
+
+/// Format a size/share for the config file: one decimal place, trimmed — keeps
+/// the file readable without spurious float noise (`612.0`, not `612.0000305`).
+fn format_f32(v: f32) -> String {
+    let s = format!("{v:.1}");
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
 /// Rewrite a `key = value` line with a new quoted value, preserving the key, its
 /// spacing, and any trailing inline comment.
 fn rewrite_kv(raw: &str, new_val: &str) -> String {

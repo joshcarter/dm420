@@ -374,6 +374,25 @@ impl BusView {
         *self.applied.lock().unwrap() = cfg;
     }
 
+    /// Switch the on-air mode (FT8 ⇄ FT4) live, without disturbing the rig link.
+    /// Restarts only the capture/decode session with the new mode (a no-op under
+    /// mocks/WAV replay, where there's no live capture) and records + persists it
+    /// so the settings form and header readouts stay in sync across restarts.
+    pub fn set_protocol(&self, proto: app_core::Protocol) {
+        let cfg = {
+            let mut applied = self.applied.lock().unwrap();
+            if applied.protocol == proto {
+                return;
+            }
+            applied.protocol = proto;
+            if let Some(audio) = &self.control.audio {
+                audio.set(applied.audio_input.clone(), proto);
+            }
+            applied.clone()
+        };
+        crate::settings::save_hardware_config(&cfg);
+    }
+
     /// Whether a live audio capture producer is running and therefore
     /// reconfigurable. `false` for WAV replay or rig-only setups, where the audio
     /// device and decode mode are fixed at startup and the settings form should

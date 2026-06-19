@@ -102,7 +102,16 @@ impl Panel for Contacts {
             Pos2::new(block.right(), footer.top() - pd::GAP),
         );
         recessed_screen(painter, screen, pal);
-        draw_map(painter, screen, pal, ctx.relief, &spots, now, home);
+        draw_map(
+            painter,
+            screen,
+            pal,
+            ctx.relief,
+            &spots,
+            now,
+            home,
+            ctx.selected_station.as_deref(),
+        );
         self.draw_footer(ctx.ui, painter, footer, pal);
     }
 }
@@ -229,6 +238,7 @@ fn ellipse_pts(center: Pos2, rx: f32, ry: f32, n: usize) -> Vec<Pos2> {
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_map(
     painter: &egui::Painter,
     screen: Rect,
@@ -243,6 +253,9 @@ fn draw_map(
     // The operator's home location as `(lon, lat)` — a plotted bounds point and
     // the centre of the range rings.
     home_ll: (f32, f32),
+    // The callsign selected in the waterslide, if any. When it matches a plotted
+    // spot, a full-screen crosshair marks that station's location on the map.
+    selected: Option<&str>,
 ) {
     if screen.width() < 24.0 || screen.height() < 24.0 {
         return;
@@ -409,6 +422,31 @@ fn draw_map(
         );
     }
 
+    // 3.5) selection crosshair — when a station selected in the waterslide is
+    // plotted here, mark its location with a full-screen horizontal + vertical
+    // crosshair so the operator can find it at a glance. Position is taken from the
+    // matching spot's grid, so the crosshair lands exactly on its marker. Drawn
+    // under the spots (step 4) so the dot and label stay crisp; a highlight ring is
+    // added over the spots below.
+    let selected_pos = selected.and_then(|call| {
+        spots
+            .iter()
+            .find(|s| s.call.eq_ignore_ascii_case(call))
+            .and_then(|s| pd::station_lonlat(&s.call, &s.grid))
+            .map(|(lon, lat)| proj(lon, lat))
+    });
+    if let Some(sp) = selected_pos {
+        let cross = Stroke::new(0.9, pal.accent2.gamma_multiply(0.5));
+        painter.line_segment(
+            [Pos2::new(content.left(), sp.y), Pos2::new(content.right(), sp.y)],
+            cross,
+        );
+        painter.line_segment(
+            [Pos2::new(sp.x, content.top()), Pos2::new(sp.x, content.bottom())],
+            cross,
+        );
+    }
+
     // 4) station spots — position inferred from each station's grid; marker/label
     // sized in px (with clamp) so they stay readable at any zoom. A shared plotter
     // draws worked (filled) and heard-but-unworked (hollow, dimmed by age) spots.
@@ -464,6 +502,12 @@ fn draw_map(
             continue;
         };
         plot(&s.call, lon, lat, Some(pal.accent), pal.accent, pal.body);
+    }
+
+    // Highlight ring around the selected station's marker (over the spots, under
+    // the home marker) so the crosshair's target reads clearly.
+    if let Some(sp) = selected_pos {
+        painter.circle_stroke(sp, spot_r + 2.6, Stroke::new(1.3, pal.accent2));
     }
 
     // 5) home / QTH marker — the strongest indicator, drawn last so it sits on top.

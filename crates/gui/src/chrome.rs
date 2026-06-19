@@ -157,6 +157,136 @@ pub fn key_cell_accent(
     ui.interact(rect, id, egui::Sense::click())
 }
 
+/// A recessed LCD readout chip — a dim micro-label, a glowing value centered in a
+/// fixed-width cell, and an optional dim unit suffix — centered horizontally on
+/// `center_x`. The visual language matches the header clocks (see `lcd_clock`);
+/// `height`/`value_pt`/`readout_w` let it shrink into a tight panel header.
+/// Returns the chip's rect.
+#[allow(clippy::too_many_arguments)]
+pub fn lcd_readout(
+    painter: &egui::Painter,
+    pal: &Palette,
+    center_x: f32,
+    cy: f32,
+    height: f32,
+    label: &str,
+    value: &str,
+    unit: &str,
+    value_pt: f32,
+    readout_w: f32,
+) -> Rect {
+    const PAD_X: f32 = 10.0;
+    const GAP: f32 = 7.0;
+
+    let label_t = tracked(label);
+    let label_w = measure(painter, &label_t, mono(8.0));
+    let unit_w = if unit.is_empty() {
+        0.0
+    } else {
+        GAP + measure(painter, unit, mono(8.0))
+    };
+    let chip_w = PAD_X + label_w + GAP + readout_w + unit_w + PAD_X;
+    let chip = Rect::from_min_max(
+        Pos2::new(center_x - chip_w / 2.0, cy - height / 2.0),
+        Pos2::new(center_x + chip_w / 2.0, cy + height / 2.0),
+    );
+    lcd_panel(painter, chip, pal, 3);
+
+    let dim = pal.lcd_text.gamma_multiply(0.6);
+    let lx = chip.left() + PAD_X;
+    painter.text(Pos2::new(lx, cy), Align2::LEFT_CENTER, &label_t, mono(8.0), dim);
+    let cell = Rect::from_min_max(
+        Pos2::new(lx + label_w + GAP, chip.top()),
+        Pos2::new(lx + label_w + GAP + readout_w, chip.bottom()),
+    );
+    // faint glow under the value, then the value itself
+    painter.text(
+        cell.center(),
+        Align2::CENTER_CENTER,
+        value,
+        heading_bold(value_pt),
+        pal.accent.gamma_multiply(0.18),
+    );
+    painter.text(
+        cell.center(),
+        Align2::CENTER_CENTER,
+        value,
+        heading_bold(value_pt),
+        pal.lcd_text,
+    );
+    if !unit.is_empty() {
+        // Unit suffix in the same dim micro-label font as the leading label.
+        painter.text(Pos2::new(cell.right() + GAP, cy), Align2::LEFT_CENTER, unit, mono(8.0), dim);
+    }
+    chip
+}
+
+/// A segmented switch: a recessed track of key cells with an optional micro-label
+/// above it, flush to `right_x` and centered vertically on `track_cy`. The whole
+/// track is one click target (hit the lit label too); returns the left edge and a
+/// per-cell click flag. Used by the top bar (tall, with a micro-label) and panel
+/// headers (compact, no label).
+#[allow(clippy::too_many_arguments)]
+pub fn segmented(
+    ui: &mut egui::Ui,
+    painter: &egui::Painter,
+    pal: &Palette,
+    right_x: f32,
+    track_cy: f32,
+    track_h: f32,
+    micro: &str,
+    cells: &[(&str, bool)],
+    id_src: &str,
+) -> (f32, Vec<bool>) {
+    const PAD: f32 = 2.0;
+    const GAP: f32 = 2.0;
+    const CELL_PAD_X: f32 = 11.0;
+
+    let widths: Vec<f32> = cells
+        .iter()
+        .map(|(t, _)| measure(painter, &tracked(t), heading(9.0)) + CELL_PAD_X * 2.0)
+        .collect();
+    let track_w: f32 =
+        PAD * 2.0 + widths.iter().sum::<f32>() + GAP * (cells.len() as f32 - 1.0);
+
+    let track = Rect::from_min_max(
+        Pos2::new(right_x - track_w, track_cy - track_h / 2.0),
+        Pos2::new(right_x, track_cy + track_h / 2.0),
+    );
+    lcd_panel(painter, track, pal, 4);
+
+    if !micro.is_empty() {
+        painter.text(
+            Pos2::new(track.left(), track.top() - 3.0),
+            Align2::LEFT_BOTTOM,
+            tracked(micro),
+            mono(7.0),
+            pal.sub,
+        );
+    }
+
+    let cell_h = track_h - PAD * 2.0;
+    let mut x = track.left() + PAD;
+    for (i, ((label, active), w)) in cells.iter().zip(widths.iter()).enumerate() {
+        let cell = Rect::from_min_size(Pos2::new(x, track.top() + PAD), Vec2::new(*w, cell_h));
+        // Cells are draw-only; the whole track owns the click (below).
+        key_cell(ui, painter, pal, cell, label, *active, ui.id().with((id_src, i)));
+        x += w + GAP;
+    }
+
+    // The entire switch is one toggle target: a click anywhere on the track flips
+    // it, so you can hit the lit label (not just the inactive one) to switch.
+    // These are binary switches — a click registers on the currently inactive
+    // cell. Interacted after the cells so it sits on top and owns the click; the
+    // per-cell key_cell responses are discarded.
+    let track_resp = ui.interact(track, ui.id().with((id_src, "track")), egui::Sense::click());
+    let clicks = cells
+        .iter()
+        .map(|(_, active)| track_resp.clicked() && !*active)
+        .collect();
+    (track.left(), clicks)
+}
+
 // ---------------------------------------------------------------------------
 // Shared panel chrome: header (spine + legend + sub) + the standard block split.
 // ---------------------------------------------------------------------------

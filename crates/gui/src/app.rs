@@ -41,6 +41,10 @@ pub struct App {
     pub frame: u64,
     /// Live bus state the panels render from (mock-fed for now).
     pub view: BusView,
+    /// The callsign selected in the waterslide, shared between panels each frame.
+    /// The Waterfall panel publishes its current selection here; the Contacts map
+    /// reads it to crosshair that station's location. `None` when nothing is selected.
+    pub selected_station: Option<String>,
 }
 
 impl App {
@@ -74,6 +78,7 @@ impl App {
             shot_path: std::env::var("MARTIAN_SHOT").ok(),
             frame: 0,
             view,
+            selected_station: None,
         }
     }
 

@@ -46,6 +46,11 @@ pub struct PanelCtx<'a> {
     /// should act on Enter / typed input; others ignore keyboard events so the
     /// same key means different things per panel. The FT8 panel is active for now.
     pub active: bool,
+    /// The callsign currently selected in the waterslide (the station to work),
+    /// shared across panels for the frame. The Waterfall panel writes it from its
+    /// selection; the Contacts map reads it to crosshair that station's location.
+    /// `None` when nothing (or a bare spectrum offset) is selected.
+    pub selected_station: &'a mut Option<String>,
 }
 
 /// A drawable instrument. Implementers own their view state and render into the

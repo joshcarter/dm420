@@ -1,4 +1,4 @@
-//! Waterfall panel: header (FT8 + tuned-frequency readout) + the live Waterslide
+//! Waterfall panel: header (Digital mode + freq readout + FT8/FT4 toggle) + the live Waterslide
 //! FFT sim as the screen body + a decode ticker along the bottom.
 
 use eframe::egui;
@@ -12,7 +12,7 @@ use app_core::{LineProfile, Protocol, SerialConfig};
 
 use super::{Panel, PanelCtx};
 use crate::bus_view::BusView;
-use crate::chrome::{key_cell_accent, lcd_panel, measure, panel_header, shadow};
+use crate::chrome::{key_cell_accent, lcd_panel, measure, panel_header};
 use crate::panel_data as pd;
 use crate::send::{Activation, Command, SendState};
 use crate::settings::{DEFAULT_BAUD, HardwareConfig, KENWOOD_BAUDS};
@@ -372,50 +372,68 @@ impl Panel for Waterfall {
             block.min,
             Pos2::new(block.right(), block.top() + pd::HEADER_ROW_H),
         );
-        panel_header(
-            painter,
-            header,
-            pal,
-            "FT8",
-            "0–3000 Hz · time → left",
-            ctx.active,
-        );
-        // right side: prominent tuned-frequency readout
+        panel_header(painter, header, pal, "Digital", "", ctx.active);
+
+        // Right cluster, laid out right-to-left: the FT8/FT4 mode toggle, then the
+        // tuned-frequency readout styled like the header clocks.
         let cy = header.center().y;
-        let mut rx = header.right() - 2.0;
-        painter.text(
-            Pos2::new(rx, cy),
-            Align2::RIGHT_CENTER,
-            "MHz",
-            mono(8.5),
-            pal.sub,
+        let proto = ctx.bus.current_config().protocol;
+        let (_mode_left, mode_clicks) = crate::chrome::segmented(
+            ctx.ui,
+            painter,
+            pal,
+            header.right() - 2.0,
+            cy,
+            20.0,
+            "",
+            &[
+                ("FT8", proto == Protocol::Ft8),
+                ("FT4", proto == Protocol::Ft4),
+            ],
+            "sw_mode",
         );
-        rx -= measure(painter, "MHz", mono(8.5)) + 5.0;
-        // When the rig is faulted, don't show a (possibly stale) frequency as if
-        // it were live — show a dashed, dimmed placeholder instead.
+        if mode_clicks[0] {
+            ctx.bus.set_protocol(Protocol::Ft8);
+        }
+        if mode_clicks[1] {
+            ctx.bus.set_protocol(Protocol::Ft4);
+        }
+
+        // Tuned-frequency readout (FREQ chip), centered in the header bar like the
+        // top-bar clocks. When the rig is faulted, show a dashed placeholder rather
+        // than a stale freq.
         let rig_fault = ctx.bus.is_real()
             && ctx
                 .bus
                 .health(SubsystemId::Rig)
                 .map(|h| h.is_faulted())
                 .unwrap_or(false);
-        let (vfo_text, vfo_col) = if rig_fault {
-            ("---.---".to_string(), pal.dim)
+        let vfo_text = if rig_fault {
+            "---.---.--".to_string()
         } else {
-            let vfo_hz = self
+            let hz = self
                 .vfo_override_hz
                 .or_else(|| ctx.bus.rig_state().map(|r| r.vfo.0))
                 .unwrap_or(14_074_000);
-            (format!("{:.3}", vfo_hz as f64 / 1_000_000.0), pal.accent)
+            // MHz.kHz.daHz grouping, matching the rig's front panel (10 Hz step).
+            format!(
+                "{}.{:03}.{:02}",
+                hz / 1_000_000,
+                hz % 1_000_000 / 1_000,
+                hz % 1_000 / 10
+            )
         };
-        engraved_text(
+        crate::chrome::lcd_readout(
             painter,
-            Pos2::new(rx, cy),
+            pal,
+            header.center().x,
+            cy,
+            20.0,
+            "FREQ",
             &vfo_text,
-            heading_bold(15.0),
-            vfo_col,
-            shadow(pal),
-            Align2::RIGHT_CENTER,
+            "MHz",
+            13.0,
+            80.0,
         );
 
         // send row (bottom) + screen (fills between header and the send row).
@@ -582,6 +600,24 @@ impl Panel for Waterfall {
         // and commands (no local arm cadence to step).
         if !ctx.unlocked {
             self.draw_send_row(ctx, send_row);
+        }
+
+        // Publish the selected station so other panels (the Contacts map) can
+        // highlight it. Real mode reads the live `real_sel`; mock mode the sim's
+        // outgoing target. `None` when a bare offset or nothing is selected.
+        *ctx.selected_station = self.selected_call(ctx.bus.is_real());
+    }
+}
+
+impl Waterfall {
+    /// The callsign currently selected in the waterslide (the station to work), or
+    /// `None` when the selection is a bare spectrum offset or nothing is selected.
+    /// Real mode reads `real_sel`; mock mode the simulation's outgoing target.
+    fn selected_call(&self, real: bool) -> Option<String> {
+        if real {
+            self.real_sel.target.as_ref().map(|(c, _)| c.clone())
+        } else {
+            self.slide.outgoing().station().map(str::to_owned)
         }
     }
 }

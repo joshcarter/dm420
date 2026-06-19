@@ -26,13 +26,13 @@ mod waterslide_sim;
 
 use eframe::egui;
 use egui::{
-    Align2, CornerRadius, FontData, FontDefinitions, FontFamily, Pos2, Rect, Sense, Stroke, Vec2,
+    Align2, CornerRadius, FontData, FontDefinitions, FontFamily, Pos2, Rect, Stroke, Vec2,
 };
 use egui_tiles::{Behavior, Container, Tile, TileId, Tiles, Tree, UiResponse};
 
 use app::App;
 use bus_view::BusView;
-use chrome::{key_cell, lcd_panel, make_brushed, make_relief, measure, paint_chassis, shadow};
+use chrome::{lcd_panel, make_brushed, make_relief, measure, paint_chassis, shadow};
 use panel_data as pd;
 use panels::{BandScan, Contacts, LogBook, Panel, PanelCtx, Waterfall};
 use theme::*;
@@ -43,11 +43,20 @@ fn main() -> eframe::Result<()> {
     let _log_guard = logging::init();
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "DM420 starting");
 
+    // Reopen at the last session's window size & position. The screenshot path
+    // keeps a fixed canvas (deterministic shots), so it ignores the saved geometry.
+    let deterministic = std::env::var("MARTIAN_SHOT").is_ok() || std::env::var("MARTIAN_LIGHT").is_ok();
+    let saved = (!deterministic).then(settings::read_window_size).flatten();
+    let size = saved.map_or([pd::PANEL_W, pd::PANEL_H], |w| [w.width, w.height]);
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size(size)
+        .with_min_inner_size([900.0, 650.0])
+        .with_title("Dingus Mangler 420");
+    if let Some((x, y)) = saved.and_then(|w| w.pos) {
+        viewport = viewport.with_position([x, y]);
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([pd::PANEL_W, pd::PANEL_H])
-            .with_min_inner_size([900.0, 650.0])
-            .with_title("Dingus Mangler 420"),
+        viewport,
         ..Default::default()
     };
     eframe::run_native(
@@ -141,6 +150,11 @@ struct Tactical<'a> {
     /// Set to a pane id when that pane is clicked this frame, so the app can move
     /// focus after the tree finishes laying out.
     clicked: &'a mut Option<TileId>,
+    /// Shared selected-station cell: the Waterfall panel writes the callsign it has
+    /// selected; the Contacts map reads it to crosshair that station. The Waterfall
+    /// pane renders before Contacts, so the write is visible the same frame; held on
+    /// the `App` so it also survives across frames regardless of pane order.
+    selected_station: &'a mut Option<String>,
 }
 
 impl<'a> Behavior<Box<dyn Panel>> for Tactical<'a> {
@@ -175,6 +189,7 @@ impl<'a> Behavior<Box<dyn Panel>> for Tactical<'a> {
             grid: self.grid,
             unlocked: self.unlocked,
             active: id == self.focused,
+            selected_station: &mut *self.selected_station,
         };
         pane.ui(&mut ctx, block);
         UiResponse::None
@@ -239,6 +254,48 @@ impl TreeIds {
     }
 }
 
+impl App {
+    /// Save the current window size and tile-split proportions to the config file
+    /// so the next launch reopens the same way. Called from the close-request path
+    /// (which bypasses eframe's own save). The screenshot run keeps a fixed canvas,
+    /// so it doesn't write its layout back over the operator's.
+    fn persist_window_layout(&self, ctx: &egui::Context) {
+        if self.shot_path.is_some() {
+            return;
+        }
+        let (sz, outer) = ctx.input(|i| (i.content_rect().size(), i.viewport().outer_rect));
+        let win = settings::WindowSize {
+            width: sz.x,
+            height: sz.y,
+            // The window's top-left in OS points; `None` if the platform doesn't
+            // report it, in which case the size is saved but the position isn't.
+            pos: outer.map(|r| (r.min.x, r.min.y)),
+        };
+        let layout = settings::LayoutShares {
+            waterfall: self.share_of(self.tree_ids.waterfall),
+            right: self.share_of(self.tree_ids.right),
+            log: self.share_of(self.tree_ids.log),
+            band: self.share_of(self.tree_ids.band),
+            contacts: self.share_of(self.tree_ids.contacts),
+        };
+        settings::save_window_layout(win, layout);
+    }
+
+    /// The linear-container share currently assigned to `id` (its parent split's
+    /// weight). Falls back to `1.0` if the tile isn't in a linear container — every
+    /// pane here is, so that's a defensive default, not an expected path.
+    fn share_of(&self, id: TileId) -> f32 {
+        for parent in [self.tree_ids.root, self.tree_ids.right] {
+            if let Some(Tile::Container(Container::Linear(lin))) = self.tree.tiles.get(parent)
+                && lin.children.contains(&id)
+            {
+                return lin.shares[id];
+            }
+        }
+        1.0
+    }
+}
+
 fn build_tree() -> (Tree<Box<dyn Panel>>, TreeIds) {
     let mut tiles = Tiles::default();
     let waterfall = tiles.insert_pane(Box::new(Waterfall::new()) as Box<dyn Panel>);
@@ -246,20 +303,30 @@ fn build_tree() -> (Tree<Box<dyn Panel>>, TreeIds) {
     let band = tiles.insert_pane(Box::new(BandScan::new()) as Box<dyn Panel>);
     let contacts = tiles.insert_pane(Box::new(Contacts::new()) as Box<dyn Panel>);
 
+    // Saved tile proportions from a previous session, if any; otherwise the
+    // design defaults (Log 142, Band 112, Contacts fills the rest; Waterfall on
+    // the left). Resizable from here either way.
+    let saved = settings::read_layout_shares();
+
     let right = tiles.insert_vertical_tile(vec![log, band, contacts]);
-    // Initial right-column proportions ≈ the design heights (Log 142, Band 112,
-    // Contacts fills the rest). Resizable from here.
     if let Some(Tile::Container(Container::Linear(lin))) = tiles.get_mut(right) {
-        lin.shares.set_share(log, pd::LOG_H);
-        lin.shares.set_share(band, pd::BANDSCAN_H);
-        lin.shares
-            .set_share(contacts, pd::PANEL_H - pd::LOG_H - pd::BANDSCAN_H);
+        let (log_s, band_s, contacts_s) = match saved {
+            Some(s) => (s.log, s.band, s.contacts),
+            None => (pd::LOG_H, pd::BANDSCAN_H, pd::PANEL_H - pd::LOG_H - pd::BANDSCAN_H),
+        };
+        lin.shares.set_share(log, log_s);
+        lin.shares.set_share(band, band_s);
+        lin.shares.set_share(contacts, contacts_s);
     }
 
     let root = tiles.insert_horizontal_tile(vec![waterfall, right]);
     if let Some(Tile::Container(Container::Linear(lin))) = tiles.get_mut(root) {
-        lin.shares.set_share(waterfall, pd::LEFT_COL_W);
-        lin.shares.set_share(right, pd::PANEL_W - pd::LEFT_COL_W);
+        let (wf_s, right_s) = match saved {
+            Some(s) => (s.waterfall, s.right),
+            None => (pd::LEFT_COL_W, pd::PANEL_W - pd::LEFT_COL_W),
+        };
+        lin.shares.set_share(waterfall, wf_s);
+        lin.shares.set_share(right, right_s);
     }
     (
         Tree::new("martian_tree", root, tiles),
@@ -340,7 +407,10 @@ impl eframe::App for App {
 
         // Work around an upstream macOS/AppKit teardown crash: exit immediately
         // when a close is requested, skipping winit's responder-chain teardown.
+        // Because this bypasses eframe's own on-exit `save`, persist the window
+        // size + tile layout here, the last reliable point before we exit.
         if ctx.input(|i| i.viewport().close_requested()) {
+            self.persist_window_layout(&ctx);
             std::process::exit(0);
         }
 
@@ -430,6 +500,7 @@ impl eframe::App for App {
                     unlocked: self.edit_mode,
                     focused: self.focused,
                     clicked: &mut clicked,
+                    selected_station: &mut self.selected_station,
                 };
                 enforce_min_width(
                     &mut self.tree,
@@ -571,11 +642,19 @@ impl App {
             self.system_seeded = true;
         }
 
-        // ---- clocks (two LCD chips), to the left of the switches ----
+        // ---- clocks (two LCD chips), centered in the header ----
+        // The pair (LOCAL | UTC) is centered on the bar, independent of the
+        // right-hand switch cluster. `disp_left` is left unused for placement so
+        // the clocks stay put regardless of switch-label width.
+        let _ = disp_left;
         let utc = format!("{}", chrono::Utc::now().format("%H:%M:%S"));
         let local = format!("{}", chrono::Local::now().format("%H:%M:%S"));
-        let utc_left = lcd_clock(painter, pal, disp_left - 16.0, cy, "UTC", &utc);
-        let _ = lcd_clock(painter, pal, utc_left - 10.0, cy, "LOCAL", &local);
+        const CLOCK_GAP: f32 = 10.0;
+        let pair_w =
+            lcd_clock_width(painter, "UTC") + CLOCK_GAP + lcd_clock_width(painter, "LOCAL");
+        let pair_right = bar.center().x + pair_w / 2.0;
+        let utc_left = lcd_clock(painter, pal, pair_right, cy, "UTC", &utc);
+        let _ = lcd_clock(painter, pal, utc_left - CLOCK_GAP, cy, "LOCAL", &local);
 
         // Tick the clocks at least once a second even if nothing animates.
         ui.ctx()
@@ -596,54 +675,23 @@ impl App {
         cells: &[(&str, bool)],
         id_src: &str,
     ) -> (f32, Vec<bool>) {
-        const TRACK_H: f32 = 22.0;
-        const PAD: f32 = 2.0;
-        const GAP: f32 = 2.0;
-        const CELL_PAD_X: f32 = 11.0;
-
-        let widths: Vec<f32> = cells
-            .iter()
-            .map(|(t, _)| measure(painter, &tracked(t), heading(9.0)) + CELL_PAD_X * 2.0)
-            .collect();
-        let track_w: f32 =
-            PAD * 2.0 + widths.iter().sum::<f32>() + GAP * (cells.len() as f32 - 1.0);
-
-        let track_cy = cy + 5.0;
-        let track = Rect::from_min_max(
-            Pos2::new(right_x - track_w, track_cy - TRACK_H / 2.0),
-            Pos2::new(right_x, track_cy + TRACK_H / 2.0),
-        );
-        lcd_panel(painter, track, pal, 4);
-
-        painter.text(
-            Pos2::new(track.left(), track.top() - 3.0),
-            Align2::LEFT_BOTTOM,
-            tracked(micro),
-            mono(7.0),
-            pal.sub,
-        );
-
-        let cell_h = TRACK_H - PAD * 2.0;
-        let mut x = track.left() + PAD;
-        for (i, ((label, active), w)) in cells.iter().zip(widths.iter()).enumerate() {
-            let cell = Rect::from_min_size(Pos2::new(x, track.top() + PAD), Vec2::new(*w, cell_h));
-            // Cells are draw-only; the whole track owns the click (below).
-            key_cell(ui, painter, pal, cell, label, *active, ui.id().with((id_src, i)));
-            x += w + GAP;
-        }
-
-        // The entire switch is one toggle target: a click anywhere on the track
-        // flips it, so you can hit the lit label (not just the inactive one) to
-        // switch. These are binary switches — a click registers on the currently
-        // inactive cell. Interacted after the cells so it sits on top and owns the
-        // click; the per-cell key_cell responses are discarded.
-        let track_resp = ui.interact(track, ui.id().with((id_src, "track")), Sense::click());
-        let clicks = cells
-            .iter()
-            .map(|(_, active)| track_resp.clicked() && !*active)
-            .collect();
-        (track.left(), clicks)
+        // 22px track dropped 5px below center so the micro-label clears it above —
+        // tuned for the 46px top bar. (Panel headers call `chrome::segmented`
+        // directly with a compact, label-less geometry.)
+        chrome::segmented(ui, painter, pal, right_x, cy + 5.0, 22.0, micro, cells, id_src)
     }
+}
+
+/// LCD clock chip geometry (shared by `lcd_clock` and `lcd_clock_width`).
+const CLOCK_READOUT_W: f32 = 79.0;
+const CLOCK_PAD_X: f32 = 12.0;
+const CLOCK_GAP_X: f32 = 8.0;
+
+/// Total chip width an `lcd_clock` would occupy for `label` — used to center the
+/// pair in the header before drawing.
+fn lcd_clock_width(painter: &egui::Painter, label: &str) -> f32 {
+    let label_w = measure(painter, &tracked(label), mono(8.0));
+    CLOCK_PAD_X + label_w + CLOCK_GAP_X + CLOCK_READOUT_W + CLOCK_PAD_X
 }
 
 /// One recessed LCD clock chip flush to `right_x`; returns its left edge.
@@ -655,14 +703,14 @@ fn lcd_clock(
     label: &str,
     value: &str,
 ) -> f32 {
-    const READOUT_W: f32 = 79.0;
-    const PAD_X: f32 = 12.0;
-    const GAP: f32 = 8.0;
+    const READOUT_W: f32 = CLOCK_READOUT_W;
+    const PAD_X: f32 = CLOCK_PAD_X;
+    const GAP: f32 = CLOCK_GAP_X;
     const H: f32 = 26.0;
 
     let label_t = tracked(label);
     let label_w = measure(painter, &label_t, mono(8.0));
-    let chip_w = PAD_X + label_w + GAP + READOUT_W + PAD_X;
+    let chip_w = lcd_clock_width(painter, label);
     let chip = Rect::from_min_max(
         Pos2::new(right_x - chip_w, cy - H / 2.0),
         Pos2::new(right_x, cy + H / 2.0),

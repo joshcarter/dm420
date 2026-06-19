@@ -1,12 +1,14 @@
 # Next
 
-FT4 not working for tx
+Adapt the panel scroll speed to the estimated length of a message.
 
-FT4 needs to scroll faster
+Make panel layout show digital at 2/3 width and right panels at 1/3 width. And/or remember panel layout in config file.
 
-Map unreadable in light mode--needs to go lighter with texture, not darker.
+FT4/FT8 mode toggle: also switch to calling freq
 
 # Soon
+
+Really need to handle highlighting unworked stations calling CQ
 
 Review if hashed callsigns are properly implemented.
 
