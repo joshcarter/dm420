@@ -8,7 +8,7 @@ Evaluate FFT algorithm--maybe move to rust crate before doing FT4?
 
 FT4 encode needs to be done
 
-Evaluate porting some of WSJT-X's decoding algoritm to ours
+Evaluate porting some of WSJT-X's decoding algorithm to ours
 (see `docs/wsjtx_decoder_comparison.md`).
 
 
