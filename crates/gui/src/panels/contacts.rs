@@ -1,7 +1,7 @@
 //! Contacts panel: a world map (relief-shaded land mesh + graticule +
 //! range rings + station spots) over a flat tactical footer (toggles + SNR bars).
 //! Plots worked stations (accent plus, from the log) and heard-but-unworked
-//! stations (accent circle, or triangle while calling CQ — dimming with last-heard
+//! stations (hollow accent circle, or filled disc while calling CQ — dimming with last-heard
 //! age, `docs/map_panel.md`). Spots are filtered to the header-selected band so the
 //! per-band "worked" rule holds. Bounds auto-fit the plotted spots, so it reads as a
 //! regional map when contacts cluster and zooms out to the globe when DX comes in.
@@ -287,7 +287,7 @@ enum Marker {
     /// Worked (in the log).
     Plus,
     /// Unworked and calling CQ — an answerable caller.
-    Triangle,
+    Disc,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -296,9 +296,9 @@ fn draw_map(
     screen: Rect,
     pal: &Palette,
     relief: &TextureHandle,
-    // Worked (plus) and heard-but-unworked (circle / CQ triangle) stations in one
-    // list; the `worked`/`cq` flags pick the marker shape. Worked markers are drawn
-    // last so they paint over the heard ones.
+    // Worked (plus) and heard-but-unworked (hollow circle / filled CQ disc) stations
+    // in one list; the `worked`/`cq` flags pick the marker shape. Worked markers are
+    // drawn last so they paint over the heard ones.
     spots: &[MapSpot],
     // Wall-clock now (ms since epoch) — the reference for dimming heard markers.
     now_ms: i64,
@@ -503,7 +503,7 @@ fn draw_map(
     // sized in px (with clamp) so they stay readable at any zoom. Every marker is in
     // the accent color; the *shape* carries the category (`docs/map_panel.md`):
     //   • heard but unworked  → hollow circle
-    //   • unworked, calling CQ → triangle (an answerable caller)
+    //   • unworked, calling CQ → filled circle (an answerable caller)
     //   • worked (in the log)  → plus sign
     let spot_r = sl(3.4).clamp(3.2, 5.4);
     let stroke_w = (spot_r * 0.42).clamp(1.3, 2.0);
@@ -525,14 +525,8 @@ fn draw_map(
                     stroke,
                 );
             }
-            Marker::Triangle => {
-                // Equilateral-ish, point up, centroid on the spot.
-                let tri = vec![
-                    Pos2::new(pos.x, pos.y - spot_r),
-                    Pos2::new(pos.x - spot_r * 0.92, pos.y + spot_r * 0.72),
-                    Pos2::new(pos.x + spot_r * 0.92, pos.y + spot_r * 0.72),
-                ];
-                painter.add(Shape::closed_line(tri, stroke));
+            Marker::Disc => {
+                painter.circle_filled(pos, spot_r, color);
             }
         }
         // Flip the label to the inboard side near the right/top edges so it stays on-screen.
@@ -556,14 +550,14 @@ fn draw_map(
 
     // Heard-but-unworked first, then worked, so worked markers paint on top. Heard
     // markers dim with last-heard age (full → 0.2 over the hour; spots older than an
-    // hour are filtered upstream); a CQ caller reads as a triangle, others a circle.
+    // hour are filtered upstream); a CQ caller reads as a filled disc, others a circle.
     for s in spots.iter().filter(|s| !s.worked) {
         let Some((lon, lat)) = pd::station_lonlat(&s.call, &s.grid) else {
             continue;
         };
         let age = ((now_ms - s.last_ms).max(0) as f32 / 3_600_000.0).clamp(0.0, 1.0);
         let alpha = 1.0 - 0.8 * age;
-        let kind = if s.cq { Marker::Triangle } else { Marker::Circle };
+        let kind = if s.cq { Marker::Disc } else { Marker::Circle };
         plot(
             &s.call,
             lon,

@@ -27,8 +27,8 @@ the theme accent color):
 - Heard but unworked station: unfilled circle. The intensity dims based
   on last-heard time, disappearing at one hour.
 
-- Unworked station calling CQ: triangle (an answerable caller). Dims
-  with last-heard time like the circle.
+- Unworked station calling CQ: filled circle (an answerable caller).
+  Dims with last-heard time like the hollow circle.
 
 - Currently selected station (the call selected in the waterslide): a
   full-screen accent crosshair plus a highlight ring on its marker.

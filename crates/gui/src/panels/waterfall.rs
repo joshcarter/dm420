@@ -887,7 +887,7 @@ fn draw_waterslide(
     tx_off: f32,
     sel_call: Option<&str>,
     // Calls already logged on the current band (upper-cased). Decodes from these
-    // stations render dimmed; an unworked station's CQ renders bold.
+    // stations get a "+" status icon; an unworked CQ caller gets a filled circle.
     worked: &HashSet<String>,
     tag: Option<&str>,
     bandwidth_hz: f32,
@@ -1063,8 +1063,10 @@ fn draw_waterslide(
             snr_col,
         );
         // Status icon, left of the report and sized to read in sunlight: a
-        // right-facing triangle (accent2) marks the selected station; a filled
-        // circle (accent) flags an unworked station calling CQ — the one to work.
+        // right-facing triangle (accent2) marks the selected station; a plus
+        // (accent) flags a station already worked on this band; a filled circle
+        // (accent) flags an unworked station calling CQ — the one to work. Worked
+        // outranks CQ so a station we've logged never reads as "answer me".
         let worked_here = station
             .as_ref()
             .is_some_and(|(c, _)| worked.contains(&c.to_ascii_uppercase()));
@@ -1080,7 +1082,12 @@ fn draw_waterslide(
                 pal.accent2,
                 egui::Stroke::NONE,
             ));
-        } else if is_cq(d) && !worked_here {
+        } else if worked_here {
+            let stroke = egui::Stroke::new((icon_r * 0.42).clamp(1.3, 2.0), pal.accent);
+            let c = Pos2::new(icon_cx, p.final_y);
+            painter.line_segment([Pos2::new(c.x - icon_r, c.y), Pos2::new(c.x + icon_r, c.y)], stroke);
+            painter.line_segment([Pos2::new(c.x, c.y - icon_r), Pos2::new(c.x, c.y + icon_r)], stroke);
+        } else if is_cq(d) {
             painter.circle_filled(Pos2::new(icon_cx, p.final_y), icon_r, pal.accent);
         }
         // Bumped off its lane: draw a faint leader just left of the text from the
