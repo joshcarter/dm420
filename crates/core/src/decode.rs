@@ -158,6 +158,19 @@ fn publish_one(
     let ms = slot_start_ms;
     let slot_ms = (modes::slot_period(proto) * 1000.0) as i64;
     let slot = t::SlotId(ms.div_euclid(slot_ms.max(1)) as u64);
+    // Audit trail symmetric with the TX log (`core::tx: audio-tx: begin over …`):
+    // one line per decode that reaches the bus, so a QSO can be reconstructed end
+    // to end from the log. Live decodes are deduped before they get here, so this
+    // logs each distinct received message once per slot.
+    tracing::info!(
+        "decode: slot={} mode={:?} offset={:.1} snr={:+} dt={:+.1} {}",
+        slot.0,
+        over_air(proto),
+        d.freq_hz,
+        d.snr_db.round() as i64,
+        d.dt,
+        d.message,
+    );
     let msg = t::Decode {
         radio: radio.clone(),
         mode: over_air(proto),
