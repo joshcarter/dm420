@@ -591,7 +591,7 @@ impl Panel for Waterfall {
                         tag.as_deref(),
                         bandwidth_hz,
                         ws_secs,
-                        slot_period_secs(protocol),
+                        app_core::slot_period(protocol) as f32,
                         armed,
                     ) {
                         self.real_sel = sel;
@@ -790,23 +790,17 @@ const WS_REF_MSG: &str = "−15 KX1ABC W4XYZ R−12";
 /// (7.5 s slots), slower for FT8 (15 s), and it tracks font/window size so roughly
 /// the same number of messages always fit across the half.
 fn ws_history_secs(painter: &egui::Painter, body: Rect, protocol: Protocol) -> f32 {
-    let msg_pt = (12.0 * body.height() / WS_REF_H).clamp(MIN_FONT_PT, WS_MSG_FONT_MAX);
+    let msg_pt = (WS_MSG_FONT_MAX * body.height() / WS_REF_H).clamp(MIN_FONT_PT, WS_MSG_FONT_MAX);
     let msg_w = measure(painter, WS_REF_MSG, mono(msg_pt)).max(1.0);
     let left_w = (body.width() * 0.5).max(1.0);
-    (left_w / msg_w) * slot_period_secs(protocol)
-}
-
-/// One transmit-slot period in seconds — FT8's 15 s windows, FT4's 7.5 s.
-fn slot_period_secs(protocol: Protocol) -> f32 {
-    match protocol {
-        Protocol::Ft8 => 15.0,
-        Protocol::Ft4 => 7.5,
-    }
+    (left_w / msg_w) * app_core::slot_period(protocol) as f32
 }
 
 /// Decode-text size on the waterslide scales with pane height, clamped to this
 /// band: `MIN_FONT_PT` (the app-wide floor) up to `WS_MSG_FONT_MAX`. The size is
-/// tuned against `WS_REF_H` — at that pane height the message renders at 12 pt.
+/// tuned against `WS_REF_H` — at that pane height the message renders at the
+/// `WS_MSG_FONT_MAX` ceiling. Both `ws_history_secs` and `draw_waterslide` derive
+/// the font size from this constant, so scroll calibration tracks any change to it.
 const WS_MSG_FONT_MAX: f32 = 12.0;
 const WS_REF_H: f32 = 460.0;
 
@@ -955,7 +949,7 @@ fn draw_waterslide(
     // tall pane doesn't bloat it and a short one doesn't shrink it past legibility
     // (`MIN_FONT_PT` is the app-wide floor — see `theme.rs`). The de-collision
     // gap below is keyed to the resulting line height.
-    let msg_pt = (12.0 * rect.height() / WS_REF_H).clamp(MIN_FONT_PT, WS_MSG_FONT_MAX);
+    let msg_pt = (WS_MSG_FONT_MAX * rect.height() / WS_REF_H).clamp(MIN_FONT_PT, WS_MSG_FONT_MAX);
     let snr_pt = (msg_pt - 1.5).max(MIN_FONT_PT);
     let line_h = msg_pt * 1.25; // minimum vertical spacing between two decode centres
 

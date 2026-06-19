@@ -34,7 +34,7 @@ mod rig_adapter;
 mod tx;
 
 pub use control::{AudioControl, CoreControl, RigControl, TxControl};
-pub use modes::Protocol;
+pub use modes::{Protocol, slot_period};
 pub use parse::parse_message;
 pub use rig::LineProfile;
 pub use rig_adapter::CommandResult;
