@@ -17,9 +17,11 @@ from scipy.ndimage import gaussian_filter
 
 # Relief box (must match RELIEF_* constants in Rust for UV mapping). Whole world.
 LON0, LON1, LAT0, LAT1 = -180.0, 180.0, -90.0, 90.0
-OUT_W = 1440         # 2:1 world → 720 tall; enough for continental terrain
+OUT_W = 4320         # 2:1 world → 2160 tall; 12 px/° matches the old NA-only bake
 STRENGTH = 0.475     # how dark the deepest shadow gets
-EXAG = 8.0           # vertical exaggeration of the gradient
+# Gradient is per-pixel, so finer output weakens the hillshade. Scale EXAG with
+# resolution to keep the terrain relief looking the same as the 12.5 px/° bake.
+EXAG = 8.0 * (OUT_W / 360.0) / 12.5  # vertical exaggeration of the gradient
 EDGE_BAND = 0.02     # light feather of the pole/dateline edges only
 
 Image.MAX_IMAGE_PIXELS = None
