@@ -327,6 +327,19 @@ impl BusView {
         out
     }
 
+    /// Distinct callsigns already logged on `band`, upper-cased for case-folded
+    /// matching. "Worked" is **per band** (the Field Day rule): the same call on
+    /// another band is still unworked there. Feeds the waterslide's worked-station
+    /// dimming.
+    pub fn worked_calls_on_band(&self, band: Band) -> HashSet<String> {
+        self.logs
+            .snapshot()
+            .into_iter()
+            .filter(|e| e.band == band)
+            .map(|e| e.call.0.to_ascii_uppercase())
+            .collect()
+    }
+
     /// Stations heard with a grid in the last hour, most-recent per call. Feeds the
     /// Contacts map's "unworked" (hollow, dimming) layer. Older spots are dropped
     /// per `docs/map_panel.md` (transient points last at most an hour). Callers

@@ -3,9 +3,11 @@
 
 use eframe::egui;
 use egui::{Align2, Color32, ColorImage, Pos2, Rect, TextureHandle, TextureOptions};
+use std::collections::HashSet;
+
 use types::{
-    Decode, DecodeContent, ExchangePayload, HealthState, OverAirMode, ParsedMessage, QsoPhase,
-    Signoff, SlotId, SpectrumRow, SubsystemHealth, SubsystemId,
+    Band, Decode, DecodeContent, ExchangePayload, HealthState, OverAirMode, ParsedMessage,
+    QsoPhase, Signoff, SlotId, SpectrumRow, SubsystemHealth, SubsystemId,
 };
 
 use app_core::{LineProfile, Protocol, SerialConfig};
@@ -565,6 +567,17 @@ impl Panel for Waterfall {
                     // TX lane is sized to the on-air signal and tinted by armed state.
                     let bandwidth_hz = signal_bandwidth_hz(protocol);
                     let armed = !matches!(phase, QsoPhase::Idle);
+                    // Stations already logged on the band we're currently tuned to
+                    // (the dial freq → band). "Worked" is per-band, so a contact on
+                    // another band doesn't dim a caller here. Empty when off-band.
+                    let worked = ctx
+                        .bus
+                        .rig_state()
+                        .map(|r| r.vfo.0)
+                        .or(self.vfo_override_hz)
+                        .and_then(band_for_hz)
+                        .map(|b| ctx.bus.worked_calls_on_band(b))
+                        .unwrap_or_default();
                     if let Some(sel) = draw_waterslide(
                         painter,
                         body,
@@ -574,6 +587,7 @@ impl Panel for Waterfall {
                         click,
                         self.real_sel.offset,
                         sel_call.as_deref(),
+                        &worked,
                         tag.as_deref(),
                         bandwidth_hz,
                         ws_secs,
@@ -631,6 +645,15 @@ impl Waterfall {
 
 /// Audio-offset axis span (Hz): FT8/FT4 decodes land in roughly 0..3000 Hz.
 const WS_MAX_HZ: f32 = 3000.0;
+
+/// Gap (px) between the outgoing-lane's shaded band (sized to the signal's
+/// nominal bandwidth) and its bracketing rules. Real signals smear a little
+/// taller than the nominal width on the spectrogram, so the rules sit just
+/// outside the shading rather than clipping the trace.
+const WS_RULE_GAP: f32 = 3.0;
+
+/// Gap (px) between a decode row's status icon and its signal-report field.
+const WS_ICON_GAP: f32 = 4.0;
 
 /// Occupied bandwidth (Hz) of one transmission in the given mode — `num_tones ×
 /// tone_spacing` (FT8: 8 × 6.25 ≈ 50 Hz; FT4: 4 × 20.83 ≈ 83 Hz). Used to size
@@ -816,6 +839,38 @@ fn decode_station(d: &Decode) -> Option<(String, SlotId)> {
     }
 }
 
+/// The ham band a dial frequency falls in, for deciding which logged contacts
+/// count as "worked" on the band we're currently on. `None` outside the amateur
+/// allocations (e.g. while tuned to WWV). Edges are the full band limits, so any
+/// in-band dial frequency resolves.
+fn band_for_hz(hz: u64) -> Option<Band> {
+    Some(match hz {
+        1_800_000..=2_000_000 => Band::B160m,
+        3_500_000..=4_000_000 => Band::B80m,
+        7_000_000..=7_300_000 => Band::B40m,
+        10_100_000..=10_150_000 => Band::B30m,
+        14_000_000..=14_350_000 => Band::B20m,
+        18_068_000..=18_168_000 => Band::B17m,
+        21_000_000..=21_450_000 => Band::B15m,
+        24_890_000..=24_990_000 => Band::B12m,
+        28_000_000..=29_700_000 => Band::B10m,
+        50_000_000..=54_000_000 => Band::B6m,
+        _ => return None,
+    })
+}
+
+/// Whether a decode is a CQ call (the message type the waterslide bolds when the
+/// caller is still unworked).
+fn is_cq(d: &Decode) -> bool {
+    matches!(
+        &d.content,
+        DecodeContent::Slotted {
+            message: ParsedMessage::Cq { .. },
+            ..
+        }
+    )
+}
+
 /// The "waterslide" decode view: each decode placed by audio offset (vertical)
 /// and age (horizontal), newest at the centre NOW line and sliding left as it
 /// ages. The right (FFT) half is left blank until a spectrum producer is wired.
@@ -837,6 +892,9 @@ fn draw_waterslide(
     click: Option<Pos2>,
     tx_off: f32,
     sel_call: Option<&str>,
+    // Calls already logged on the current band (upper-cased). Decodes from these
+    // stations render dimmed; an unworked station's CQ renders bold.
+    worked: &HashSet<String>,
     tag: Option<&str>,
     bandwidth_hz: f32,
     history_secs: f32,
@@ -891,20 +949,6 @@ fn draw_waterslide(
             }
             t -= slot_ms;
         }
-    }
-
-    // Selected station's lane: a faint highlight band drawn behind the decodes so
-    // the text stays readable on top of it.
-    if tag.is_some() {
-        let sy = y_of(tx_off);
-        painter.rect_filled(
-            Rect::from_min_max(
-                Pos2::new(rect.left(), sy - 9.0),
-                Pos2::new(rect.right(), sy + 9.0),
-            ),
-            corner_radius(2),
-            pal.accent2.gamma_multiply(0.12),
-        );
     }
 
     // Text size scales with pane height but is clamped to a readable band, so a
@@ -973,24 +1017,31 @@ fn draw_waterslide(
         i = j;
     }
 
-    // Second pass: draw. Each message is left-aligned so it starts at its decode
-    // time and reads rightward; the SNR sits just to its left. Both ride `final_y`.
+    // Second pass: draw. Each message is left-aligned and bumped half a space
+    // right of its slot rule so it doesn't crowd it, reading rightward; the
+    // signal report sits half a space to the *left* of the rule (its status icon
+    // further left still). Both ride `final_y`.
     let msg_font = mono(msg_pt);
     let snr_font = mono(snr_pt);
+    // Half a monospace cell — the breathing room either side of the slot rule.
+    let half_space = 0.5 * measure(&painter, "0", msg_font.clone());
+    // Reserved width of the (always 3-char) signal report, so the status icon
+    // lands at a fixed column whether or not the decode carries an SNR.
+    let snr_field_w = 3.0 * measure(&painter, "0", snr_font.clone());
     for p in &placed {
         let d = &decodes[p.idx];
         let station = decode_station(d);
         // A decode from the selected station reads in the secondary accent so the
-        // whole lane is easy to follow. All decodes render at full brightness (no
-        // SNR-based dimming).
+        // whole lane is easy to follow.
         let is_sel = match (&station, sel_call) {
             (Some((c, _)), Some(s)) => c.as_str() == s,
             _ => false,
         };
         let msg_col = if is_sel { pal.accent2 } else { pal.body };
         let snr_col = if is_sel { pal.accent2 } else { pal.accent };
+        let text_x = p.x + half_space;
         let msg_rect = painter.text(
-            Pos2::new(p.x, p.final_y),
+            Pos2::new(text_x, p.final_y),
             Align2::LEFT_CENTER,
             decode_text(d),
             msg_font.clone(),
@@ -1007,24 +1058,48 @@ fn draw_waterslide(
                 target: Some((call.clone(), *slot)),
             });
         }
+        // Signal report: right-aligned, half a space to the left of the slot rule.
         let snr = d.snr_db.map(fmt_snr).unwrap_or_else(|| "   ".into());
+        let snr_right = p.x - half_space;
         painter.text(
-            Pos2::new(msg_rect.left() - 6.0, p.final_y),
+            Pos2::new(snr_right, p.final_y),
             Align2::RIGHT_CENTER,
             snr,
             snr_font.clone(),
             snr_col,
         );
-        // Bumped off its lane: draw a faint leader from the true audio centre to
-        // the shifted text so the eye still maps the row to its real frequency.
+        // Status icon, left of the report and sized to read in sunlight: a
+        // right-facing triangle (accent2) marks the selected station; a filled
+        // circle (accent) flags an unworked station calling CQ — the one to work.
+        let worked_here = station
+            .as_ref()
+            .is_some_and(|(c, _)| worked.contains(&c.to_ascii_uppercase()));
+        let icon_r = (snr_pt * 0.32).clamp(2.5, 5.0);
+        let icon_cx = snr_right - snr_field_w - WS_ICON_GAP - icon_r;
+        if is_sel {
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    Pos2::new(icon_cx - icon_r, p.final_y - icon_r),
+                    Pos2::new(icon_cx - icon_r, p.final_y + icon_r),
+                    Pos2::new(icon_cx + icon_r, p.final_y),
+                ],
+                pal.accent2,
+                egui::Stroke::NONE,
+            ));
+        } else if is_cq(d) && !worked_here {
+            painter.circle_filled(Pos2::new(icon_cx, p.final_y), icon_r, pal.accent);
+        }
+        // Bumped off its lane: draw a faint leader just left of the text from the
+        // true audio centre to the shifted text so the eye still maps the row to
+        // its real frequency.
         if (p.final_y - p.true_y).abs() > 1.0 {
             let leader = snr_col.gamma_multiply(0.5);
             painter.line_segment(
-                [Pos2::new(p.x - 4.0, p.true_y), Pos2::new(p.x - 4.0, p.final_y)],
+                [Pos2::new(text_x - 1.0, p.true_y), Pos2::new(text_x - 1.0, p.final_y)],
                 egui::Stroke::new(1.0, leader),
             );
             painter.line_segment(
-                [Pos2::new(p.x - 6.0, p.true_y), Pos2::new(p.x - 2.0, p.true_y)],
+                [Pos2::new(text_x - 3.0, p.true_y), Pos2::new(text_x + 1.0, p.true_y)],
                 egui::Stroke::new(1.0, leader),
             );
         }
@@ -1040,10 +1115,12 @@ fn draw_waterslide(
     );
 
     // Outgoing-frequency lane (matches the mock-mode indicator): a translucent
-    // full-width band with bright rules top and bottom. It spans
-    // [offset, offset + bandwidth] — the decode/TX offset is the signal's
-    // *lowest* tone, so the energy sits above it (FT8 ≈ 50 Hz, FT4 ≈ 83 Hz);
-    // basing the band there lines it up with the traffic on the spectrogram.
+    // full-width band shaded to the signal's bandwidth, with bright rules a hair
+    // above and below it. The shading spans [offset, offset + bandwidth] — the
+    // decode/TX offset is the signal's *lowest* tone, so the energy sits above it
+    // (FT8 ≈ 50 Hz, FT4 ≈ 83 Hz); basing the band there lines it up with the
+    // traffic on the spectrogram. The rules sit `WS_RULE_GAP` outside the shading
+    // so they frame the (slightly taller-looking) real trace rather than cut it.
     // Cyan while armed to transmit, amber otherwise — same convention as
     // SEND/STOP. Labelled with the selected station's QSO phase (`tag`) or a
     // bare offset.
@@ -1052,12 +1129,14 @@ fn draw_waterslide(
     let top = y_of(tx_off + bandwidth_hz).min(bottom - 3.0); // floor at 3px so it stays visible
     let band = Rect::from_min_max(Pos2::new(rect.left(), top), Pos2::new(rect.right(), bottom));
     painter.rect_filled(band, 0.0, lane.gamma_multiply(0.10));
+    let rule_top = band.top() - WS_RULE_GAP;
+    let rule_bottom = band.bottom() + WS_RULE_GAP;
     painter.line_segment(
-        [band.left_top(), band.right_top()],
+        [Pos2::new(band.left(), rule_top), Pos2::new(band.right(), rule_top)],
         egui::Stroke::new(1.5, lane),
     );
     painter.line_segment(
-        [band.left_bottom(), band.right_bottom()],
+        [Pos2::new(band.left(), rule_bottom), Pos2::new(band.right(), rule_bottom)],
         egui::Stroke::new(1.5, lane),
     );
     let tx_label = match tag {
@@ -1065,7 +1144,7 @@ fn draw_waterslide(
         None => format!("\u{25B6} TX {} Hz", tx_off as i32),
     };
     painter.text(
-        Pos2::new(rect.left() + 4.0, band.top() - 1.0),
+        Pos2::new(rect.left() + 4.0, rule_top - 1.0),
         Align2::LEFT_BOTTOM,
         tx_label,
         snr_font,
