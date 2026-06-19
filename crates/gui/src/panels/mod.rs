@@ -13,7 +13,7 @@ use crate::theme::Palette;
 mod band_scan;
 mod contacts;
 mod log_book;
-mod waterfall;
+pub(crate) mod waterfall;
 
 pub use band_scan::BandScan;
 pub use contacts::Contacts;

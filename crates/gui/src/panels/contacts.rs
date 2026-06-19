@@ -1,9 +1,11 @@
 //! Contacts panel: a world map (relief-shaded land mesh + graticule +
 //! range rings + station spots) over a flat tactical footer (toggles + SNR bars).
-//! Plots both worked stations (filled, from the log) and heard-but-unworked
-//! stations (hollow, dimming with last-heard age — `docs/map_panel.md`). Bounds
-//! auto-fit the plotted spots, so it reads as a regional map when contacts cluster
-//! and zooms out to the globe when DX comes in. Owns the two footer toggle states.
+//! Plots worked stations (accent plus, from the log) and heard-but-unworked
+//! stations (accent circle, or triangle while calling CQ — dimming with last-heard
+//! age, `docs/map_panel.md`). Spots are filtered to the header-selected band so the
+//! per-band "worked" rule holds. Bounds auto-fit the plotted spots, so it reads as a
+//! regional map when contacts cluster and zooms out to the globe when DX comes in.
+//! Owns the footer toggle states and the selected band.
 //! The map/footer drawing helpers (`over`, `dashed_polyline`, `ellipse_pts`) are
 //! single-consumer and live here.
 
@@ -14,23 +16,35 @@ use egui::{
     Align2, Color32, CornerRadius, Mesh, Pos2, Rect, Shape, Stroke, StrokeKind, TextureHandle, Vec2,
 };
 
+use types::Band;
+
 use super::{Panel, PanelCtx};
 use crate::bus_view::MapSpot;
-use crate::chrome::{measure, panel_header};
+use crate::chrome::{measure, panel_header, segmented_select};
 use crate::geo_data;
 use crate::panel_data as pd;
 use crate::theme::*;
+
+/// The bands the map plots, in switcher order. "Worked" is per band (the Field Day
+/// rule), so the map shows one band at a time — mirroring the waterslide.
+const MAP_BANDS: [Band; 4] = [Band::B40m, Band::B20m, Band::B15m, Band::B10m];
+const MAP_BAND_LABELS: [&str; 4] = ["40", "20", "15", "10"];
 
 pub struct Contacts {
     /// Footer toggles: `[0]` recent-only (last 24 h) vs. all logged entries;
     /// `[1]` include heard-but-unworked stations. Per `docs/map_panel.md`.
     toggles: [bool; 2],
+    /// The band the map is showing — its spots are filtered to this band, so the
+    /// per-band "worked" rule holds (a call worked on another band still reads as
+    /// unworked here). Chosen via the header band switcher.
+    band: Band,
 }
 
 impl Contacts {
     pub fn new() -> Self {
         Self {
             toggles: [true, true], // recent-only + show unworked
+            band: Band::B20m,
         }
     }
 }
@@ -44,17 +58,22 @@ impl Panel for Contacts {
         let painter = ctx.painter;
         let pal = ctx.pal;
 
-        // Worked stations from the log; optionally trimmed to the last 24 h.
+        // Worked stations from the log on the selected band; optionally trimmed to
+        // the last 24 h. Band-filtering first keeps "worked" per band — a call
+        // logged on another band doesn't count here.
+        let band = self.band;
         let now = ctx.bus.now_ms();
         let mut worked = ctx.bus.worked_spots();
+        worked.retain(|s| s.band == Some(band));
         if self.toggles[0] {
             let cutoff = now - 24 * 3_600_000;
             worked.retain(|s| s.last_ms >= cutoff);
         }
-        // Heard-but-unworked stations, excluding any we've already worked (a worked
-        // station is shown filled, not as a transient). Empty unless the "unworked"
-        // toggle is on. Order in the combined list doesn't matter — `draw_map`
-        // paints hollow then filled so worked markers always sit on top.
+        // Heard-but-unworked stations on this band, excluding any already worked
+        // here (a worked station is shown as a plus, not as a transient). Empty
+        // unless the "unworked" toggle is on. Order in the combined list doesn't
+        // matter — `draw_map` paints unworked then worked so worked markers sit on
+        // top.
         let mut spots = worked;
         if self.toggles[1] {
             let worked_calls: HashSet<String> = spots.iter().map(|s| s.call.clone()).collect();
@@ -62,6 +81,7 @@ impl Panel for Contacts {
                 ctx.bus
                     .heard_spots()
                     .into_iter()
+                    .filter(|s| s.band == Some(band))
                     .filter(|s| !worked_calls.contains(&s.call)),
             );
         }
@@ -85,8 +105,28 @@ impl Panel for Contacts {
             &format!("World · {}", ctx.grid),
             ctx.active,
         );
+        // Band switcher (right cluster): pick which band's spots the map shows, the
+        // same per-band partition the waterslide uses. The spot count tucks in just
+        // left of it.
+        let cy = header.center().y;
+        let sel = MAP_BANDS.iter().position(|b| *b == self.band).unwrap_or(0);
+        let (sw_left, clicked) = segmented_select(
+            ctx.ui,
+            painter,
+            pal,
+            header.right() - 2.0,
+            cy,
+            18.0,
+            "",
+            &MAP_BAND_LABELS,
+            sel,
+            "map_band",
+        );
+        if let Some(i) = clicked {
+            self.band = MAP_BANDS[i];
+        }
         painter.text(
-            Pos2::new(header.right() - 2.0, header.center().y),
+            Pos2::new(sw_left - 8.0, cy),
             Align2::RIGHT_CENTER,
             format!("{spot_count} spots"),
             mono(8.5),
@@ -238,15 +278,27 @@ fn ellipse_pts(center: Pos2, rx: f32, ry: f32, n: usize) -> Vec<Pos2> {
         .collect()
 }
 
+/// The shape of a plotted station marker — the category cue on the map. All are
+/// drawn in the accent color; the shape (not the color) distinguishes them.
+#[derive(Clone, Copy)]
+enum Marker {
+    /// Heard but unworked.
+    Circle,
+    /// Worked (in the log).
+    Plus,
+    /// Unworked and calling CQ — an answerable caller.
+    Triangle,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_map(
     painter: &egui::Painter,
     screen: Rect,
     pal: &Palette,
     relief: &TextureHandle,
-    // Worked (filled) and heard-but-unworked (hollow) stations in one list; the
-    // `worked` flag picks the marker style. Filled markers come last so they paint
-    // over hollow ones.
+    // Worked (plus) and heard-but-unworked (circle / CQ triangle) stations in one
+    // list; the `worked`/`cq` flags pick the marker shape. Worked markers are drawn
+    // last so they paint over the heard ones.
     spots: &[MapSpot],
     // Wall-clock now (ms since epoch) — the reference for dimming heard markers.
     now_ms: i64,
@@ -436,7 +488,7 @@ fn draw_map(
             .map(|(lon, lat)| proj(lon, lat))
     });
     if let Some(sp) = selected_pos {
-        let cross = Stroke::new(0.9, pal.accent.gamma_multiply(0.5));
+        let cross = Stroke::new(1.8, pal.accent.gamma_multiply(0.6));
         painter.line_segment(
             [Pos2::new(content.left(), sp.y), Pos2::new(content.right(), sp.y)],
             cross,
@@ -448,66 +500,91 @@ fn draw_map(
     }
 
     // 4) station spots — position inferred from each station's grid; marker/label
-    // sized in px (with clamp) so they stay readable at any zoom. A shared plotter
-    // draws worked (filled) and heard-but-unworked (hollow, dimmed by age) spots.
-    let spot_r = sl(2.4).clamp(2.0, 3.6);
+    // sized in px (with clamp) so they stay readable at any zoom. Every marker is in
+    // the accent color; the *shape* carries the category (`docs/map_panel.md`):
+    //   • heard but unworked  → hollow circle
+    //   • unworked, calling CQ → triangle (an answerable caller)
+    //   • worked (in the log)  → plus sign
+    let spot_r = sl(3.4).clamp(3.2, 5.4);
+    let stroke_w = (spot_r * 0.42).clamp(1.3, 2.0);
     let label_font = mono(sl(4.8).clamp(5.0, 8.0));
-    let plot =
-        |call: &str, lon: f32, lat: f32, fill: Option<Color32>, ring: Color32, label: Color32| {
-            let pos = proj(lon, lat);
-            match fill {
-                Some(c) => painter.circle_filled(pos, spot_r, c),
-                None => painter.circle_stroke(pos, spot_r, Stroke::new(1.2, ring)),
-            };
-            // Flip the label to the inboard side near the right/top edges so it stays on-screen.
-            let right = pos.x > content.right() - 42.0;
-            let near_top = pos.y < content.top() + 12.0;
-            let off = Vec2::new(
-                if right { -(spot_r + 1.5) } else { spot_r + 1.5 },
-                if near_top {
-                    spot_r + 5.0
-                } else {
-                    -(spot_r + 1.0)
-                },
-            );
-            let align = if right {
-                Align2::RIGHT_BOTTOM
+    let plot = |call: &str, lon: f32, lat: f32, kind: Marker, color: Color32, label: Color32| {
+        let pos = proj(lon, lat);
+        let stroke = Stroke::new(stroke_w, color);
+        match kind {
+            Marker::Circle => {
+                painter.circle_stroke(pos, spot_r, stroke);
+            }
+            Marker::Plus => {
+                painter.line_segment(
+                    [Pos2::new(pos.x - spot_r, pos.y), Pos2::new(pos.x + spot_r, pos.y)],
+                    stroke,
+                );
+                painter.line_segment(
+                    [Pos2::new(pos.x, pos.y - spot_r), Pos2::new(pos.x, pos.y + spot_r)],
+                    stroke,
+                );
+            }
+            Marker::Triangle => {
+                // Equilateral-ish, point up, centroid on the spot.
+                let tri = vec![
+                    Pos2::new(pos.x, pos.y - spot_r),
+                    Pos2::new(pos.x - spot_r * 0.92, pos.y + spot_r * 0.72),
+                    Pos2::new(pos.x + spot_r * 0.92, pos.y + spot_r * 0.72),
+                ];
+                painter.add(Shape::closed_line(tri, stroke));
+            }
+        }
+        // Flip the label to the inboard side near the right/top edges so it stays on-screen.
+        let right = pos.x > content.right() - 42.0;
+        let near_top = pos.y < content.top() + 12.0;
+        let off = Vec2::new(
+            if right { -(spot_r + 1.5) } else { spot_r + 1.5 },
+            if near_top {
+                spot_r + 5.0
             } else {
-                Align2::LEFT_BOTTOM
-            };
-            painter.text(pos + off, align, call, label_font.clone(), label);
+                -(spot_r + 1.0)
+            },
+        );
+        let align = if right {
+            Align2::RIGHT_BOTTOM
+        } else {
+            Align2::LEFT_BOTTOM
         };
+        painter.text(pos + off, align, call, label_font.clone(), label);
+    };
 
-    // Heard-but-unworked first, then worked, so filled markers paint over hollow
-    // ones. Heard → hollow cyan (secondary accent), dimming with last-heard age
-    // (full → 0.2 over the hour; spots older than an hour are filtered upstream).
+    // Heard-but-unworked first, then worked, so worked markers paint on top. Heard
+    // markers dim with last-heard age (full → 0.2 over the hour; spots older than an
+    // hour are filtered upstream); a CQ caller reads as a triangle, others a circle.
     for s in spots.iter().filter(|s| !s.worked) {
         let Some((lon, lat)) = pd::station_lonlat(&s.call, &s.grid) else {
             continue;
         };
         let age = ((now_ms - s.last_ms).max(0) as f32 / 3_600_000.0).clamp(0.0, 1.0);
         let alpha = 1.0 - 0.8 * age;
+        let kind = if s.cq { Marker::Triangle } else { Marker::Circle };
         plot(
             &s.call,
             lon,
             lat,
-            None,
-            pal.accent2.gamma_multiply(alpha),
+            kind,
+            pal.accent.gamma_multiply(alpha),
             pal.sub.gamma_multiply(alpha),
         );
     }
-    // Worked → filled amber.
+    // Worked → accent plus sign.
     for s in spots.iter().filter(|s| s.worked) {
         let Some((lon, lat)) = pd::station_lonlat(&s.call, &s.grid) else {
             continue;
         };
-        plot(&s.call, lon, lat, Some(pal.accent), pal.accent, pal.body);
+        plot(&s.call, lon, lat, Marker::Plus, pal.accent, pal.body);
     }
 
     // Highlight ring around the selected station's marker (over the spots, under
     // the home marker) so the crosshair's target reads clearly.
     if let Some(sp) = selected_pos {
-        painter.circle_stroke(sp, spot_r + 2.6, Stroke::new(1.3, pal.accent2));
+        painter.circle_stroke(sp, spot_r + 2.6, Stroke::new(1.5, pal.accent));
     }
 
     // 5) home / QTH marker — the strongest indicator, drawn last so it sits on top.

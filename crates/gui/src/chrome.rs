@@ -287,6 +287,66 @@ pub fn segmented(
     (track.left(), clicks)
 }
 
+/// A multi-state segmented selector: like [`segmented`], but each cell is its own
+/// click target, so it works with more than two options. `selected` lights the
+/// matching cell; the return is the track's left edge and the index of the cell
+/// clicked this frame (if any). Used for the Contacts map's band switcher.
+#[allow(clippy::too_many_arguments)]
+pub fn segmented_select(
+    ui: &mut egui::Ui,
+    painter: &egui::Painter,
+    pal: &Palette,
+    right_x: f32,
+    track_cy: f32,
+    track_h: f32,
+    micro: &str,
+    labels: &[&str],
+    selected: usize,
+    id_src: &str,
+) -> (f32, Option<usize>) {
+    const PAD: f32 = 2.0;
+    const GAP: f32 = 2.0;
+    const CELL_PAD_X: f32 = 9.0;
+
+    let widths: Vec<f32> = labels
+        .iter()
+        .map(|t| measure(painter, &tracked(t), heading(9.0)) + CELL_PAD_X * 2.0)
+        .collect();
+    let track_w: f32 =
+        PAD * 2.0 + widths.iter().sum::<f32>() + GAP * (labels.len() as f32 - 1.0);
+
+    let track = Rect::from_min_max(
+        Pos2::new(right_x - track_w, track_cy - track_h / 2.0),
+        Pos2::new(right_x, track_cy + track_h / 2.0),
+    );
+    lcd_panel(painter, track, pal, 4);
+
+    if !micro.is_empty() {
+        painter.text(
+            Pos2::new(track.left(), track.top() - 3.0),
+            Align2::LEFT_BOTTOM,
+            tracked(micro),
+            mono(7.0),
+            pal.sub,
+        );
+    }
+
+    let cell_h = track_h - PAD * 2.0;
+    let mut x = track.left() + PAD;
+    let mut clicked = None;
+    for (i, (label, w)) in labels.iter().zip(widths.iter()).enumerate() {
+        let cell = Rect::from_min_size(Pos2::new(x, track.top() + PAD), Vec2::new(*w, cell_h));
+        // Unlike `segmented`, each cell owns its own click — that's how a >2-way
+        // selector knows which option was picked.
+        let resp = key_cell(ui, painter, pal, cell, label, i == selected, ui.id().with((id_src, i)));
+        if resp.clicked() {
+            clicked = Some(i);
+        }
+        x += w + GAP;
+    }
+    (track.left(), clicked)
+}
+
 // ---------------------------------------------------------------------------
 // Shared panel chrome: header (spine + legend + sub) + the standard block split.
 // ---------------------------------------------------------------------------

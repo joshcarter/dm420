@@ -116,7 +116,7 @@ pub const GRAPHITE: Palette = Palette {
     lcd_bottom: rgb(0x0D, 0x0A, 0x04),
     lcd_text: rgb(0xFF, 0xB2, 0x4D),
     on_accent: rgb(0x1D, 0x14, 0x08),
-    map_land: rgba(247, 211, 162, 165), // warm tan base; relief texel shades it
+    map_land: rgba(247, 211, 162, 92), // warm tan base; relief texel shades it
     map_coast: rgba(247, 160, 60, 102), // rgba(...,0.40)
     is_dark: true,
 };
@@ -140,7 +140,7 @@ pub const SILVER: Palette = Palette {
     lcd_bottom: rgb(0xD4, 0xC6, 0x9E),
     lcd_text: rgb(0x3A, 0x2A, 0x10),
     on_accent: rgb(0xFD, 0xF6, 0xEC),
-    map_land: rgba(150, 96, 36, 110), // warm tan base; relief texel shades it
+    map_land: rgba(150, 96, 36, 62), // warm tan base; relief texel shades it
     map_coast: rgba(150, 80, 10, 115), // rgba(...,0.45)
     is_dark: false,
 };

@@ -843,7 +843,7 @@ fn decode_station(d: &Decode) -> Option<(String, SlotId)> {
 /// count as "worked" on the band we're currently on. `None` outside the amateur
 /// allocations (e.g. while tuned to WWV). Edges are the full band limits, so any
 /// in-band dial frequency resolves.
-fn band_for_hz(hz: u64) -> Option<Band> {
+pub(crate) fn band_for_hz(hz: u64) -> Option<Band> {
     Some(match hz {
         1_800_000..=2_000_000 => Band::B160m,
         3_500_000..=4_000_000 => Band::B80m,

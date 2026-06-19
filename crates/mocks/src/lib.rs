@@ -142,7 +142,23 @@ const LOG_EXTRA: &[(&str, &str, i8, i8)] = &[
     ("ZL2AB", "RE78", -24, -18),
 ];
 
-fn log_entry(seq: u64, call: &str, grid: &str, snt: i8, rcv: i8, time_ms: i64) -> LogEntry {
+/// The FT8 dial frequency for a band — just enough to make a mock log entry's
+/// `freq` consistent with its `band`.
+fn band_freq(band: Band) -> u64 {
+    match band {
+        Band::B40m => 7_074_000,
+        Band::B20m => 14_074_000,
+        Band::B15m => 21_074_000,
+        Band::B10m => 28_074_000,
+        _ => 14_074_000,
+    }
+}
+
+/// Bands the seed log spreads across, so the Contacts map's band switcher has spots
+/// on each — mirroring the real per-band partition.
+const LOG_BANDS: [Band; 4] = [Band::B40m, Band::B20m, Band::B15m, Band::B10m];
+
+fn log_entry(seq: u64, call: &str, grid: &str, snt: i8, rcv: i8, time_ms: i64, band: Band) -> LogEntry {
     LogEntry {
         id: QsoId {
             origin: station_id(),
@@ -152,8 +168,8 @@ fn log_entry(seq: u64, call: &str, grid: &str, snt: i8, rcv: i8, time_ms: i64) -
         radio: Some(radio_id()),
         call: Callsign(call.into()),
         mode: OverAirMode::Ft8,
-        band: Band::B20m,
-        freq: AbsHz(14_074_000),
+        band,
+        freq: AbsHz(band_freq(band)),
         time: Timestamp(time_ms),
         exchange_sent: fmt_snr(snt),
         exchange_rcvd: fmt_snr(rcv),
@@ -173,7 +189,8 @@ async fn run_logbook(bus: BusHandle) {
     for (i, &(call, grid, snt, rcv)) in LOG_SEED.iter().enumerate() {
         seq += 1;
         let age = (n - i as i64) * 47_000 + 60_000;
-        let _ = bus.publish(&topic, log_entry(seq, call, grid, snt, rcv, base - age));
+        let band = LOG_BANDS[i % LOG_BANDS.len()];
+        let _ = bus.publish(&topic, log_entry(seq, call, grid, snt, rcv, base - age, band));
     }
 
     // Live: a new contact every 9 s.
@@ -183,9 +200,10 @@ async fn run_logbook(bus: BusHandle) {
     loop {
         tick.tick().await;
         let (call, grid, snt, rcv) = LOG_EXTRA[k % LOG_EXTRA.len()];
+        let band = LOG_BANDS[k % LOG_BANDS.len()];
         k += 1;
         seq += 1;
-        let _ = bus.publish(&topic, log_entry(seq, call, grid, snt, rcv, now_ms()));
+        let _ = bus.publish(&topic, log_entry(seq, call, grid, snt, rcv, now_ms(), band));
     }
 }
 

@@ -65,9 +65,27 @@ pub struct MapSpot {
     pub call: String,
     pub grid: String,
     pub last_ms: i64,
-    /// `true` if worked (in the log) → filled marker; `false` if only heard →
-    /// hollow marker that dims with age.
+    /// `true` if worked (in the log) → plus marker; `false` if only heard →
+    /// circle (or triangle while calling CQ) that dims with age.
     pub worked: bool,
+    /// The band this spot belongs to: a worked spot's logged band, or the band the
+    /// rig was on when an unworked station was heard. `None` for heard stations
+    /// caught while off any amateur band. The map filters spots to its selected
+    /// band (the per-band "worked" rule, mirroring the waterslide).
+    pub band: Option<Band>,
+    /// `true` if the most recent sighting was a CQ call (heard spots only) — the
+    /// map marks these with a triangle so the operator can spot answerable callers.
+    pub cq: bool,
+}
+
+/// A station heard with a placeable grid: the grid we placed it from, the
+/// last-heard time (ms since epoch), the band the rig was on when heard, and
+/// whether its newest sighting was a CQ. Accumulated by [`pump_heard`].
+struct HeardEntry {
+    grid: GridSquare,
+    last_ms: i64,
+    band: Option<Band>,
+    cq: bool,
 }
 
 /// The GUI-facing view of live bus state. Cheap to construct once at startup and
@@ -91,11 +109,11 @@ pub struct BusView {
     bands: Arc<Mutex<HashMap<Band, BandActivity>>>,
     logs: Ring<LogEntry>,
     decodes: Ring<Decode>,
-    /// Stations heard with a grid, keyed by call → (grid, last-heard ms).
+    /// Stations heard with a grid, keyed by call → newest [`HeardEntry`].
     /// Accumulated from the decode stream and pruned to the last hour on read; the
     /// Contacts map plots these as dimming "unworked" markers. A dedicated map
     /// (not the bounded `decodes` ring) so an hour of spots survives a busy band.
-    heard: Arc<Mutex<HashMap<String, (GridSquare, i64)>>>,
+    heard: Arc<Mutex<HashMap<String, HeardEntry>>>,
     /// Latest QSO-engine state (phase, partner, queued next message). Drives the
     /// FT8 send row.
     qso: Cell<QsoState>,
@@ -147,7 +165,7 @@ impl BusView {
         let bands: Arc<Mutex<HashMap<Band, BandActivity>>> = Arc::new(Mutex::new(HashMap::new()));
         let logs = Ring::new(512);
         let decodes = Ring::new(64);
-        let heard: Arc<Mutex<HashMap<String, (GridSquare, i64)>>> =
+        let heard: Arc<Mutex<HashMap<String, HeardEntry>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let health: Arc<Mutex<HashMap<SubsystemId, SubsystemHealth>>> =
             Arc::new(Mutex::new(HashMap::new()));
@@ -221,7 +239,7 @@ impl BusView {
         // Heard stations for the map: a second decode subscriber that keeps a
         // longer-lived (call → grid) map than the bounded `decodes` ring. Runs in
         // both modes — heard spots come from whatever decoder is live.
-        pump_heard(&bus, heard.clone(), egui_ctx.clone());
+        pump_heard(&bus, heard.clone(), rig.clone(), egui_ctx.clone());
         // Health is only produced in real mode (by `core`); in mock mode the map
         // stays empty and panels treat everything as healthy.
         if real {
@@ -321,6 +339,8 @@ impl BusView {
                     grid: grid.0.clone(),
                     last_ms: e.time.0,
                     worked: true,
+                    band: Some(e.band),
+                    cq: false,
                 });
             }
         }
@@ -350,12 +370,14 @@ impl BusView {
             .lock()
             .unwrap()
             .iter()
-            .filter(|(_, (_, t))| *t >= cutoff)
-            .map(|(call, (grid, t))| MapSpot {
+            .filter(|(_, e)| e.last_ms >= cutoff)
+            .map(|(call, e)| MapSpot {
                 call: call.clone(),
-                grid: grid.0.clone(),
-                last_ms: *t,
+                grid: e.grid.0.clone(),
+                last_ms: e.last_ms,
                 worked: false,
+                band: e.band,
+                cq: e.cq,
             })
             .collect()
     }
@@ -558,13 +580,14 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// Extract a placeable `(call, grid)` from a decode, if it advertises a locator —
-/// a CQ with a grid, or a standard grid exchange.
+/// Extract a placeable `(call, grid, calling_cq)` from a decode, if it advertises a
+/// locator — a CQ with a grid, or a standard grid exchange. The third element marks
+/// the CQ case so the map can flag answerable callers.
 ///
 /// NOTE (Field Day): a Field Day exchange carries an ARRL `Section`, not a grid
 /// (`ExchangePayload::FieldDay`), so those stations yield `None` here and won't be
 /// placed yet. Plotting them needs section → coordinate inference — see TODO.md.
-fn station_grid(d: &Decode) -> Option<(String, GridSquare)> {
+fn station_grid(d: &Decode) -> Option<(String, GridSquare, bool)> {
     let DecodeContent::Slotted { message, .. } = &d.content else {
         return None;
     };
@@ -573,12 +596,12 @@ fn station_grid(d: &Decode) -> Option<(String, GridSquare)> {
             caller,
             grid: Some(g),
             ..
-        } => Some((caller.0.clone(), g.clone())),
+        } => Some((caller.0.clone(), g.clone(), true)),
         ParsedMessage::Exchange {
             from,
             payload: ExchangePayload::Grid(g),
             ..
-        } => Some((from.0.clone(), g.clone())),
+        } => Some((from.0.clone(), g.clone(), false)),
         _ => None,
     }
 }
@@ -676,11 +699,14 @@ fn pump_stream<T: BusMessage>(
 }
 
 /// Spawn a pump that folds grid-bearing decodes into the heard-stations map
-/// (call → newest (grid, time)). Lets the Contacts map plot stations heard but
-/// not worked, retained far longer than the bounded `decodes` ring.
+/// (call → newest [`HeardEntry`]). Lets the Contacts map plot stations heard but
+/// not worked, retained far longer than the bounded `decodes` ring. The band is
+/// taken from the rig's current dial frequency at decode time, so the map can apply
+/// the same per-band "worked" rule as the waterslide.
 fn pump_heard(
     bus: &BusHandle,
-    heard: Arc<Mutex<HashMap<String, (GridSquare, i64)>>>,
+    heard: Arc<Mutex<HashMap<String, HeardEntry>>>,
+    rig: Cell<RigState>,
     ctx: egui::Context,
 ) {
     let mut sub =
@@ -695,13 +721,28 @@ fn pump_heard(
         loop {
             match sub.recv().await {
                 Ok(d) => {
-                    if let Some((call, grid)) = station_grid(&d) {
+                    if let Some((call, grid, cq)) = station_grid(&d) {
                         let t = d.t.0;
+                        // The band the rig is parked on now — the band this station
+                        // was heard on. `None` if the rig state isn't known yet.
+                        let band = rig
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .and_then(|r| crate::panels::waterfall::band_for_hz(r.vfo.0));
                         let mut m = heard.lock().unwrap();
                         // Keep the newest sighting per call.
-                        let newer = m.get(&call).is_none_or(|(_, prev)| t >= *prev);
+                        let newer = m.get(&call).is_none_or(|e| t >= e.last_ms);
                         if newer {
-                            m.insert(call, (grid, t));
+                            m.insert(
+                                call,
+                                HeardEntry {
+                                    grid,
+                                    last_ms: t,
+                                    band,
+                                    cq,
+                                },
+                            );
                             drop(m);
                             ctx.request_repaint();
                         }
