@@ -67,8 +67,9 @@ impl WaterslideTheme {
             screen_bg: pal.screen_bg,
             grid: pal.dim.gamma_multiply(0.35),
             grid_mid: pal.accent.gamma_multiply(0.55),
-            // Dark face → dark-background map (signal = bright). Light face →
-            // inverted map: a paper background with signal as dark amber pixels.
+            // Dark face: a dark-background amber map (signal = bright). Light face:
+            // the "Martian Ink" spectral map — a paper floor ramping up through
+            // gold/orange/magenta/violet to deep indigo at the peaks.
             cmap: if pal.is_dark {
                 martian_cmap()
             } else {
@@ -121,18 +122,39 @@ pub fn martian_cmap() -> [Color32; 256] {
     ])
 }
 
-/// The light / "silver" colormap: the dark map inverted in lightness — a paper
-/// background (noise floor blends into the silver screen) with the signal
-/// rendered as progressively darker amber/brown. Reads correctly on a light face.
+/// The light-mode spectrogram colormap: the Daylight "Martian Ink" spectral map.
+/// Low signal stays clean paper; peaks ramp gold → orange → coral → magenta →
+/// violet → deep indigo, so traces carry color depth *and* contrast on the light
+/// display (instead of faint orange-on-white). Per the handoff, raw intensity is
+/// normalized (noise-floor clamp + gamma lift) before the color lookup; that curve
+/// is baked into the LUT here, so the renderer keeps indexing it by raw intensity
+/// exactly as it does the dark map. See `design_handoff_daylight_color/README.md`.
 pub fn martian_cmap_light() -> [Color32; 256] {
-    build_cmap(&[
-        (0.00, [239, 231, 220]), // ≈ silver screen_bg → noise floor disappears
-        (0.22, [228, 200, 150]),
-        (0.42, [210, 150, 70]),
-        (0.60, [180, 100, 20]),
-        (0.78, [120, 55, 8]),
-        (1.00, [40, 20, 5]), // strongest signal → near-dark brown
-    ])
+    let spectral = build_cmap(&[
+        (0.00, [240, 236, 226]), // paper (no signal)
+        (0.10, [242, 196, 112]), // gold
+        (0.26, [230, 144, 52]),  // orange
+        (0.44, [210, 76, 76]),   // coral/red
+        (0.62, [168, 46, 114]),  // magenta
+        (0.80, [96, 42, 136]),   // violet
+        (1.00, [32, 26, 84]),    // deep indigo (peaks)
+    ]);
+    // Normalize raw intensity before the lookup. Intensity is dsp's fixed dB
+    // brightness (COL_DB_FLOOR..COL_DB_CEIL); with real traffic the noise floor
+    // sits well up that range, so the handoff's 0.105 floor pinned the whole
+    // background to the indigo peak (solid blue). FLOOR clamps everything below it
+    // to clean paper; signals ramp over FLOOR..FLOOR+SPAN up to the indigo peak,
+    // with a gamma lift biasing toward the low end. Raise FLOOR if the noise floor
+    // still carries colour; lower it if weak signals disappear.
+    const FLOOR: f32 = 0.40;
+    const SPAN: f32 = 0.45;
+    let mut lut = [Color32::BLACK; 256];
+    for (i, slot) in lut.iter_mut().enumerate() {
+        let l = i as f32 / 255.0;
+        let t = (((l - FLOOR) / SPAN).clamp(0.0, 1.0)).powf(0.72);
+        *slot = spectral[(t * 255.0) as usize];
+    }
+    lut
 }
 
 /// What the next transmission is aimed at. A click on empty spectrum is a bare

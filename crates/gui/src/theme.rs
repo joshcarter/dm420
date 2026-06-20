@@ -75,6 +75,11 @@ pub struct Palette {
     /// "active/normal" but we need a distinct state — e.g. the Send button armed
     /// vs. idle, or an unworked station calling CQ.
     pub accent2: Color32,
+    /// Transmit accent (electric violet). The "we are keyed and on
+    /// the air" state — distinct from amber (idle) and accent2 (armed). Used by
+    /// the Digital panel's corner brackets, NOW divider, TX lane, Send key, and
+    /// the outgoing-message text.
+    pub accent3: Color32,
     pub screen_bg: Color32,
     pub ring: Color32,
     pub body: Color32,
@@ -108,6 +113,7 @@ pub const GRAPHITE: Palette = Palette {
     sub: rgba(202, 180, 150, 184), // 0.72
     accent: rgb(0xF7, 0x92, 0x0F),
     accent2: rgb(0x3A, 0xD0, 0xE0), // bright cyan, reads against the dark face
+    accent3: rgb(0x3A, 0xD0, 0xE0), // TODO: same as accent2 for now — TX/keyed state, dark face
     screen_bg: rgb(0x08, 0x06, 0x04),
     ring: rgba(247, 146, 15, 102), // 0.40
     body: rgb(0xF4, 0xEE, 0xE6),
@@ -121,27 +127,31 @@ pub const GRAPHITE: Palette = Palette {
     is_dark: true,
 };
 
-/// LIGHT — "silver"
+/// LIGHT — "Daylight Color": a brushed-silver chassis with near-black ink legends,
+/// a deep burnt-orange accent, and the "Martian Ink" spectral waterfall. The
+/// high-contrast daytime theme; values come from the authoritative handoff in
+/// `design_handoff_daylight_color/README.md`.
 pub const SILVER: Palette = Palette {
-    face_top: rgb(0xE9, 0xE4, 0xD9),
-    face_bottom: rgb(0xCD, 0xC6, 0xB7),
-    edge: rgb(0xA3, 0x98, 0x80),
-    stripe_light: rgba(255, 255, 255, 140), // 0.55
-    stripe_dark: rgba(0, 0, 0, 9),          // 0.035
-    legend: rgb(0x36, 0x26, 0x0F),
-    sub: rgba(95, 68, 32, 199), // 0.78
-    accent: rgb(0xC2, 0x66, 0x0F),
-    accent2: rgb(0x0E, 0x70, 0x82), // deeper teal, reads against the silver face
-    screen_bg: rgb(0xEF, 0xE7, 0xDC),
-    ring: rgba(150, 80, 10, 107), // 0.42
-    body: rgb(0x24, 0x18, 0x08),
-    dim: rgba(120, 80, 40, 158), // 0.62
-    lcd_top: rgb(0xE8, 0xDC, 0xC0),
-    lcd_bottom: rgb(0xD4, 0xC6, 0x9E),
-    lcd_text: rgb(0x3A, 0x2A, 0x10),
-    on_accent: rgb(0xFD, 0xF6, 0xEC),
-    map_land: rgba(150, 96, 36, 44), // warm tan base; relief texel shades it
-    map_coast: rgba(150, 80, 10, 115), // rgba(...,0.45)
+    face_top: rgb(0xF3, 0xF4, 0xF1),
+    face_bottom: rgb(0xD9, 0xDB, 0xD5),
+    edge: rgb(0x9A, 0x9C, 0x97),
+    stripe_light: rgba(255, 255, 255, 153), // 0.60
+    stripe_dark: rgba(0, 0, 0, 11),         // 0.045
+    legend: rgb(0x19, 0x1C, 0x20),          // near-black ink
+    sub: rgba(64, 70, 78, 230),             // 0.90
+    accent: rgb(0xB8, 0x53, 0x0A),  // deep burnt orange — brackets, NOW line, ticks
+    accent2: rgb(0x0E, 0x6F, 0x7A), // dark cyan — armed state on the silver face
+    accent3: rgb(0x9E, 0x1C, 0x22), // dark red — TX/keyed state on the silver face
+    screen_bg: rgb(0xF0, 0xEC, 0xE2), // paper
+    ring: rgba(120, 90, 40, 102),     // 0.40 — recessed-screen hairline frame
+    body: rgb(0x20, 0x24, 0x2A),      // dark ink, in-screen content
+    dim: rgba(92, 100, 110, 184),     // 0.72
+    lcd_top: rgb(0xE9, 0xE2, 0xD2),
+    lcd_bottom: rgb(0xD2, 0xC9, 0xB2),
+    lcd_text: rgb(0x2A, 0x20, 0x10),
+    on_accent: rgb(0xFD, 0xF6, 0xEC), // near-white text on the burnt-orange fill
+    map_land: rgba(60, 52, 32, 26),   // 0.10
+    map_coast: rgba(120, 72, 16, 128), // 0.50
     is_dark: false,
 };
 
@@ -191,6 +201,18 @@ pub fn corner_brackets(painter: &egui::Painter, rect: Rect, accent: Color32) {
 /// gradient that fakes the inset/recessed bevel (no inset-shadow primitive in
 /// egui). Then the four corner brackets on top.
 pub fn recessed_screen(painter: &egui::Painter, rect: Rect, pal: &Palette) {
+    recessed_screen_accent(painter, rect, pal, pal.accent);
+}
+
+/// Like [`recessed_screen`], but with the corner brackets drawn in an explicit
+/// `accent` instead of the palette's amber. Lets the Digital panel tint its
+/// frame by operating state (amber idle / accent2 armed / accent3 transmitting).
+pub fn recessed_screen_accent(
+    painter: &egui::Painter,
+    rect: Rect,
+    pal: &Palette,
+    accent: Color32,
+) {
     painter.rect_filled(rect, CornerRadius::ZERO, pal.screen_bg);
 
     // Top-edge shadow gradient: darker at the top fading to transparent — reads
@@ -211,7 +233,7 @@ pub fn recessed_screen(painter: &egui::Painter, rect: Rect, pal: &Palette) {
         StrokeKind::Inside,
     );
 
-    corner_brackets(painter, rect, pal.accent);
+    corner_brackets(painter, rect, accent);
 }
 
 /// Draw the header focus marker at `left_center` (its left-center point),

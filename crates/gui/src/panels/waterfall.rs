@@ -282,7 +282,15 @@ impl Waterfall {
             egui::Stroke::new(1.0, pal.edge),
             egui::StrokeKind::Inside,
         );
-        let text_color = if active_qso { pal.accent2 } else { pal.body };
+        // Body before arming, accent2 once armed, accent3 while actually keyed —
+        // the same three-state progression as the Send key and the panel frame.
+        let text_color = if transmitting {
+            pal.accent3
+        } else if active_qso {
+            pal.accent2
+        } else {
+            pal.body
+        };
         painter.with_clip_rect(box_rect).text(
             Pos2::new(box_rect.left() + 6.0, cy),
             Align2::LEFT_CENTER,
@@ -291,13 +299,20 @@ impl Waterfall {
             text_color,
         );
 
-        // Lit key in its recessed track. Cyan fill while armed/transmitting.
+        // Lit key in its recessed track. Amber idle, accent2 while armed, accent3
+        // (pink/red) once we're actually keyed on the air — matching the panel frame.
         lcd_panel(painter, track, pal, 4);
         let cell = Rect::from_min_max(
             Pos2::new(track.left() + 2.0, track.top() + 2.0),
             Pos2::new(track.right() - 2.0, track.bottom() - 2.0),
         );
-        let accent = if active_qso { pal.accent2 } else { pal.accent };
+        let accent = if transmitting {
+            pal.accent3
+        } else if active_qso {
+            pal.accent2
+        } else {
+            pal.accent
+        };
         let btn = key_cell_accent(
             ctx.ui,
             painter,
@@ -447,7 +462,31 @@ impl Panel for Waterfall {
             Pos2::new(block.left(), header.bottom() + pd::HEADER_GAP),
             Pos2::new(block.right(), send_row.top() - pd::GAP),
         );
-        recessed_screen(painter, screen, pal);
+        // Operating state tints the panel frame so it's obvious at a glance: amber
+        // when idle, accent2 (blue/cyan) once armed to transmit, accent3 (pink/red)
+        // while actually keyed on the air. The corner brackets, the NOW divider, and
+        // the TX lane all read this so they agree. Only when locked (operating) — the
+        // unlocked screen is the radio-setup form, where state tinting is meaningless.
+        let op_phase = ctx
+            .bus
+            .qso_state()
+            .map(|s| s.phase)
+            .unwrap_or(QsoPhase::Idle);
+        let op_armed = !matches!(op_phase, QsoPhase::Idle);
+        let op_transmitting = {
+            let now = chrono::Utc::now().timestamp_millis();
+            ctx.bus.tx_spectrum().is_some_and(|r| now - r.t.0 < 500)
+        };
+        let op_accent = if ctx.unlocked {
+            pal.accent
+        } else if op_transmitting {
+            pal.accent3
+        } else if op_armed {
+            pal.accent2
+        } else {
+            pal.accent
+        };
+        recessed_screen_accent(painter, screen, pal, op_accent);
 
         let body_big = screen.width() > 24.0 && screen.height() > 24.0;
 
@@ -566,7 +605,6 @@ impl Panel for Waterfall {
                     // returned selection (if the click resolved to one) is stored. The
                     // TX lane is sized to the on-air signal and tinted by armed state.
                     let bandwidth_hz = signal_bandwidth_hz(protocol);
-                    let armed = !matches!(phase, QsoPhase::Idle);
                     // Stations already logged on the band we're currently tuned to
                     // (the dial freq → band). "Worked" is per-band, so a contact on
                     // another band doesn't dim a caller here. Empty when off-band.
@@ -587,12 +625,13 @@ impl Panel for Waterfall {
                         click,
                         self.real_sel.offset,
                         sel_call.as_deref(),
+                        (!ctx.call.trim().is_empty()).then(|| ctx.call.trim()),
                         &worked,
                         tag.as_deref(),
                         bandwidth_hz,
                         ws_secs,
                         app_core::slot_period(protocol) as f32,
-                        armed,
+                        op_accent,
                     ) {
                         self.real_sel = sel;
                     }
@@ -886,6 +925,9 @@ fn draw_waterslide(
     click: Option<Pos2>,
     tx_off: f32,
     sel_call: Option<&str>,
+    // Our own station call (upper-cased), so decodes that echo our own over can be
+    // drawn in the transmit accent. `None`/empty when no callsign is configured.
+    my_call: Option<&str>,
     // Calls already logged on the current band (upper-cased). Decodes from these
     // stations get a "+" status icon; an unworked CQ caller gets a filled circle.
     worked: &HashSet<String>,
@@ -893,7 +935,9 @@ fn draw_waterslide(
     bandwidth_hz: f32,
     history_secs: f32,
     slot_secs: f32,
-    armed: bool,
+    // The operating-state accent (amber idle / accent2 armed / accent3 keyed),
+    // resolved by the caller. Tints the NOW divider and the TX lane.
+    accent: Color32,
 ) -> Option<RealSel> {
     let painter = painter.with_clip_rect(rect);
     let now_x = rect.center().x; // the NOW line
@@ -1031,7 +1075,21 @@ fn draw_waterslide(
             (Some((c, _)), Some(s)) => c.as_str() == s,
             _ => false,
         };
-        let msg_col = if is_sel { pal.accent2 } else { pal.body };
+        // A decode whose sender is our own station is the echo of what we put on the
+        // air (the decoder hears our own over). Draw it in the transmit accent
+        // (accent3) so the lane shows our outgoing text in our own colour. This
+        // outranks the selected-station tint — it's our message, not one we're working.
+        let is_own_tx = match (&station, my_call) {
+            (Some((c, _)), Some(mine)) => c.eq_ignore_ascii_case(mine),
+            _ => false,
+        };
+        let msg_col = if is_own_tx {
+            pal.accent3
+        } else if is_sel {
+            pal.accent2
+        } else {
+            pal.body
+        };
         let snr_col = if is_sel { pal.accent2 } else { pal.accent };
         let text_x = p.x + half_space;
         let msg_rect = painter.text(
@@ -1106,13 +1164,14 @@ fn draw_waterslide(
         }
     }
 
-    // NOW line at the centre.
+    // NOW line at the centre. Tinted by operating state (amber idle / accent2
+    // armed / accent3 keyed) so the dividing line echoes the panel frame.
     painter.line_segment(
         [
             Pos2::new(now_x, rect.top()),
             Pos2::new(now_x, rect.bottom()),
         ],
-        egui::Stroke::new(2.0, pal.accent),
+        egui::Stroke::new(2.0, accent),
     );
 
     // Outgoing-frequency lane (matches the mock-mode indicator): a translucent
@@ -1122,10 +1181,10 @@ fn draw_waterslide(
     // (FT8 ≈ 50 Hz, FT4 ≈ 83 Hz); basing the band there lines it up with the
     // traffic on the spectrogram. The rules sit `WS_RULE_GAP` outside the shading
     // so they frame the (slightly taller-looking) real trace rather than cut it.
-    // Cyan while armed to transmit, amber otherwise — same convention as
-    // SEND/STOP. Labelled with the selected station's QSO phase (`tag`) or a
-    // bare offset.
-    let lane = if armed { pal.accent2 } else { pal.accent };
+    // Tinted by operating state — amber idle, accent2 while armed, accent3 while
+    // keyed — the same convention as SEND/STOP and the panel frame. Labelled with
+    // the selected station's QSO phase (`tag`) or a bare offset.
+    let lane = accent;
     let bottom = y_of(tx_off);
     let top = y_of(tx_off + bandwidth_hz).min(bottom - 3.0); // floor at 3px so it stays visible
     let band = Rect::from_min_max(Pos2::new(rect.left(), top), Pos2::new(rect.right(), bottom));
