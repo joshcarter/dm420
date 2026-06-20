@@ -2,6 +2,51 @@
 
 Running notes, gotchas, and reminders. Newest at the top.
 
+## 2026-06-20
+
+- **FFT A/B: realfft vs. our Bluestein, switchable live (built, awaiting your eval).**
+  Implements `docs/fft_migration_proposal.md` as a runtime A/B instead of a one-way
+  swap, so we decide on real on-air evidence.
+  - **What.** `modes::fft` now has an `Fft` enum wrapping the original `Bluestein`
+    and a new `RealFftEngine` (`realfft` 3.x on `rustfft`). `Monitor`/`decode`/
+    `decode_streaming` take an `FftBackend`. Drop-in: the `2/nfft` gain lives in the
+    analysis window (not the FFT) and both transforms are unnormalized, so only the
+    transform differs; the decoder reads only the `N/2+1` bins realfft returns.
+  - **Switch it live.** BLST/RFFT toggle in the waterslide header (shown only in real
+    decode — live capture or `DM420_WAV`; hidden under mocks). Read **fresh per slot**
+    via `core::FftControl` — no capture restart, waterfall undisturbed (the scrolling
+    display uses a *separate* `dsp` FFT, so the toggle only changes decoding). Seed the
+    starting backend with `DM420_FFT=bluestein|realfft`.
+  - **Logs to compare (this is the eval).** Set `[logging] level = "debug"` (or
+    `RUST_LOG=modes=debug,info`). Per decoded slot, `modes` emits
+    `fft a/b: slot decoded  fft=… build_us=… stft_us=… candidates=… decodes=…` —
+    `stft_us` is the apples-to-apples front-end cost, `build_us` the per-slot setup
+    (both backends rebuild per slot today). `core` also tags each pass:
+    `live decode [full] fft=realfft: …`. Run a while on each, hand me the log, and
+    we'll compare yield + timing.
+  - **Validated.** Decode **parity** is a test now: `fixtures_decode.rs` decodes every
+    reference FT8/FT4 fixture under *both* backends and asserts identical messages;
+    plus `fft::tests::realfft_matches_naive_dft` (incl. N=3840/1152). Offline A/B:
+    `cargo run -p core --example decode_wav -- <wav> [ft4] [realfft]`.
+  - **Outstanding.** (1) Your live A/B + the call on which to keep. (2) Per-slot engine
+    rebuild — if realfft wins we can cache the planner across slots (watch `build_us`).
+    (3) Not committed yet — on branch `joel-20-june`, pending your eval.
+
+- **UI/config persistence (done).** Dark/light **and** window geometry (size, position,
+  **fullscreen**) now persist in `~/.dm420/config.toml`. Window save is **reactive +
+  debounced**, not close-only: the macOS close path only fires `ui` with
+  `close_requested` on the red button, so **Cmd+Q skipped it** and nothing saved — now
+  it writes ~700 ms after geometry settles, surviving any exit. On macOS the global
+  (x, y) already restores the right monitor, so no separate monitor id is stored.
+
+- **Config path cleanup (done).** Retired `dm420.toml`; `~/.dm420/config.toml` is the
+  only config path (code already used it). Deleted the stale repo-root `dm420.toml`,
+  dropped its `.gitignore` entry, fixed `dm420.example.toml` + `JOEL.md`. (These notes
+  still mention `dm420.toml` in the 2026-06-18 entry below — left as historical.)
+
+- **Shared builds (done).** Added a `group:staff` ACL on the repo + `target/` so any
+  local user (i.e. you as `joelodom`) can `cargo build` regardless of who built last.
+
 ## 2026-06-18
 
 - **Decode/TX timing — optimizations done + planned (the "answered a repeated CQ but

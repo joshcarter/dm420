@@ -33,8 +33,8 @@ mod parse;
 mod rig_adapter;
 mod tx;
 
-pub use control::{AudioControl, CoreControl, RigControl, TxControl};
-pub use modes::{Protocol, slot_period};
+pub use control::{AudioControl, CoreControl, FftControl, RigControl, TxControl};
+pub use modes::{FftBackend, Protocol, slot_period};
 pub use parse::parse_message;
 pub use rig::LineProfile;
 pub use rig_adapter::CommandResult;
@@ -158,6 +158,9 @@ pub struct CoreConfig {
     /// Initial TX audio output device; `None` = system default. Live-editable
     /// afterward via [`CoreControl::tx`].
     pub tx_output: Option<String>,
+    /// Initial decoder FFT backend (A/B); live-switchable afterward via
+    /// [`CoreControl::fft`]. Defaults to the proven [`FftBackend::Bluestein`].
+    pub fft_backend: FftBackend,
 }
 
 impl Default for CoreConfig {
@@ -169,6 +172,7 @@ impl Default for CoreConfig {
             serial: None,
             logbook: None,
             tx_output: None,
+            fft_backend: FftBackend::Bluestein,
         }
     }
 }
@@ -189,6 +193,7 @@ pub fn spawn(bus: &BusHandle, cfg: CoreConfig) -> CoreControl {
         serial,
         logbook,
         tx_output,
+        fft_backend,
     } = cfg;
 
     tracing::info!(
@@ -231,16 +236,24 @@ pub fn spawn(bus: &BusHandle, cfg: CoreConfig) -> CoreControl {
         DecodeSource::Wav { protocol, .. } | DecodeSource::Live { protocol, .. } => *protocol,
         DecodeSource::None => Protocol::Ft8,
     };
+    // The decoder FFT A/B switch: shared with the decode passes, which read it
+    // fresh per slot, and handed back via `control.fft` for the live UI toggle.
     match decode {
         DecodeSource::Wav {
             path,
             protocol,
             looping,
-        } => decode::spawn_wav(bus, radio, path, protocol, looping),
+        } => {
+            let fft = Arc::new(control::FftControl::new(fft_backend));
+            decode::spawn_wav(bus, radio, path, protocol, looping, fft.clone());
+            control.fft = Some(fft);
+        }
         DecodeSource::Live { input, protocol } => {
             let audio = Arc::new(AudioControl::new(input, protocol));
-            decode::spawn_live(bus, radio, audio.clone());
+            let fft = Arc::new(control::FftControl::new(fft_backend));
+            decode::spawn_live(bus, radio, audio.clone(), fft.clone());
             control.audio = Some(audio);
+            control.fft = Some(fft);
         }
         DecodeSource::None => {}
     }

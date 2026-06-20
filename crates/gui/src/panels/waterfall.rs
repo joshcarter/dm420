@@ -380,7 +380,7 @@ impl Panel for Waterfall {
         // tuned-frequency readout styled like the header clocks.
         let cy = header.center().y;
         let proto = ctx.bus.current_config().protocol;
-        let (_mode_left, mode_clicks) = crate::chrome::segmented(
+        let (mode_left, mode_clicks) = crate::chrome::segmented(
             ctx.ui,
             painter,
             pal,
@@ -399,6 +399,33 @@ impl Panel for Waterfall {
         }
         if mode_clicks[1] {
             ctx.bus.set_protocol(Protocol::Ft4);
+        }
+
+        // Decoder FFT A/B toggle (BLST = our Bluestein, RFFT = realfft/rustfft),
+        // just left of the mode toggle. Shown only with a real decode producer —
+        // under mocks the decode FFT is unused, so the switch would do nothing.
+        if ctx.bus.has_fft_control() {
+            let fft = ctx.bus.current_fft_backend();
+            let (_fft_left, fft_clicks) = crate::chrome::segmented(
+                ctx.ui,
+                painter,
+                pal,
+                mode_left - 10.0,
+                cy,
+                20.0,
+                "",
+                &[
+                    ("BLST", fft == app_core::FftBackend::Bluestein),
+                    ("RFFT", fft == app_core::FftBackend::RealFft),
+                ],
+                "sw_fft",
+            );
+            if fft_clicks[0] {
+                ctx.bus.set_fft_backend(app_core::FftBackend::Bluestein);
+            }
+            if fft_clicks[1] {
+                ctx.bus.set_fft_backend(app_core::FftBackend::RealFft);
+            }
         }
 
         // Tuned-frequency readout (FREQ chip), centered in the header bar like the

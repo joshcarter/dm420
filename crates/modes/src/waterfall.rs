@@ -5,7 +5,7 @@
 //! magnitudes as `u8` (0.5 dB steps, like the reference) for the sync/demod
 //! stages. Layout of `mag`: `[block][time_sub][freq_sub][bin]`, flattened.
 
-use crate::fft::Bluestein;
+use crate::fft::{Fft, FftBackend};
 
 /// FT8 or FT4 — selects the symbol/slot timing throughout the pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,7 +65,7 @@ pub struct Monitor {
     max_bin: usize,
     window: Vec<f32>,
     last_frame: Vec<f32>,
-    fft: Bluestein,
+    fft: Fft,
     pub wf: Waterfall,
     pub max_mag: f32,
 }
@@ -83,6 +83,7 @@ impl Monitor {
         freq_osr: usize,
         f_min: f32,
         f_max: f32,
+        backend: FftBackend,
     ) -> Monitor {
         let symbol_period = protocol.symbol_period();
         let block_size = (sample_rate as f32 * symbol_period) as usize;
@@ -105,7 +106,7 @@ impl Monitor {
             max_bin,
             window,
             last_frame: vec![0.0; nfft],
-            fft: Bluestein::new(nfft),
+            fft: Fft::new(backend, nfft),
             wf: Waterfall {
                 protocol,
                 time_osr,

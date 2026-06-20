@@ -227,7 +227,25 @@ impl Settings {
             serial: Some(self.serial.clone()),
             logbook: Some(logbook_path()),
             tx_output: self.audio_output.clone(),
+            fft_backend: fft_backend_from_env(),
         }
+    }
+}
+
+/// The initial decoder FFT backend: `DM420_FFT=bluestein|realfft` (default
+/// Bluestein). Live-switchable afterward from the waterslide header; the env just
+/// seeds a known starting point for reproducible A/B runs.
+fn fft_backend_from_env() -> app_core::FftBackend {
+    match env_nonempty("DM420_FFT") {
+        Some(s) => match s.trim().to_lowercase().as_str() {
+            "bluestein" | "blst" | "b" => app_core::FftBackend::Bluestein,
+            "realfft" | "rfft" | "real" | "r" => app_core::FftBackend::RealFft,
+            _ => {
+                tracing::warn!(value = %s, "DM420_FFT unknown (use bluestein|realfft); using bluestein");
+                app_core::FftBackend::Bluestein
+            }
+        },
+        None => app_core::FftBackend::default(),
     }
 }
 

@@ -12,7 +12,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use modes::Protocol;
+use modes::{FftBackend, Protocol};
 
 use crate::SerialConfig;
 
@@ -108,6 +108,35 @@ impl TxControl {
     }
 }
 
+/// Shared, live-editable decoder FFT backend — the A/B switch between our
+/// hand-rolled Bluestein FFT and the `realfft`/`rustfft` path. Read **fresh per
+/// slot** by the decode passes (no generation counter, no capture restart): a flip
+/// takes effect on the very next decoded slot, leaving the audio device and the
+/// scrolling waterfall untouched (the waterfall uses a separate FFT). Held under a
+/// `Mutex` only to be `Sync` for the `Arc`; the value is a trivial `Copy` enum.
+pub struct FftControl {
+    backend: Mutex<FftBackend>,
+}
+
+impl FftControl {
+    pub(crate) fn new(backend: FftBackend) -> Self {
+        Self {
+            backend: Mutex::new(backend),
+        }
+    }
+
+    /// Switch the decoder FFT backend; picked up on the next slot's decode.
+    pub fn set(&self, backend: FftBackend) {
+        *self.backend.lock().unwrap() = backend;
+    }
+
+    /// The active backend — read by the decode passes per slot, and by the UI to
+    /// show/seed the current selection.
+    pub fn backend(&self) -> FftBackend {
+        *self.backend.lock().unwrap()
+    }
+}
+
 /// Handle for live reconfiguration of the running producers from the UI. Each
 /// field is present only when that producer is running (e.g. `audio` is `None`
 /// for WAV replay or rig-only setups). Cheap to clone (the controls live behind
@@ -117,6 +146,9 @@ pub struct CoreControl {
     pub rig: Option<std::sync::Arc<RigControl>>,
     pub audio: Option<std::sync::Arc<AudioControl>>,
     pub tx: Option<std::sync::Arc<TxControl>>,
+    /// The decoder FFT A/B switch; present whenever a real decode producer (live
+    /// capture or WAV replay) is running.
+    pub fft: Option<std::sync::Arc<FftControl>>,
 }
 
 /// Why a supervisor's connected session ended — distinguishes a real fault from

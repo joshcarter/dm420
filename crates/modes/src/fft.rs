@@ -9,8 +9,20 @@
 //!
 //! This is our own implementation; correctness is checked against a naive DFT in
 //! the unit tests.
+//!
+//! [`Fft`] wraps this Bluestein path and a [`realfft`]/`rustfft` path behind one
+//! interface, selected by [`FftBackend`] so the decoder's FFT can be swapped live
+//! for A/B comparison (the magnitude pipeline and every downstream stage are
+//! identical; only the transform differs). Both return the *unnormalized* forward
+//! DFT, so they're drop-in: the `2/nfft` window gain lives in the analysis window,
+//! not the FFT, and the decoder only reads bins well below Nyquist (inside the
+//! `N/2+1` that the real-input transform returns).
 
 use std::f64::consts::PI;
+use std::sync::Arc;
+
+use realfft::num_complex::Complex;
+use realfft::{RealFftPlanner, RealToComplex};
 
 /// In-place iterative radix-2 Cooley–Tukey FFT. `re`/`im` must have equal,
 /// power-of-two length. Forward transform uses the e^{-2πi·nk/N} sign.
@@ -160,6 +172,100 @@ impl Bluestein {
     }
 }
 
+/// Which FFT implementation the decoder's STFT front-end uses. Switchable live for
+/// A/B comparison (the live toggle picks one per slot via `core::FftControl`).
+/// [`Bluestein`] is the original, proven path and the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FftBackend {
+    /// Our hand-rolled radix-2 + Bluestein chirp-z FFT (no external crates).
+    #[default]
+    Bluestein,
+    /// `realfft` (real-input) on top of `rustfft` — SIMD, planner-cached twiddles.
+    RealFft,
+}
+
+impl FftBackend {
+    /// Short stable tag for logs/UI (`"bluestein"` / `"realfft"`).
+    pub fn tag(self) -> &'static str {
+        match self {
+            FftBackend::Bluestein => "bluestein",
+            FftBackend::RealFft => "realfft",
+        }
+    }
+}
+
+/// Forward real FFT via [`realfft`]/`rustfft`. Holds the plan plus reusable input/
+/// output/scratch buffers, so steady-state has no per-call allocation (matching
+/// [`Bluestein`]'s precompute-once design). Returns the `N/2 + 1` non-redundant
+/// bins — all the decoder reads, since its used bins sit well below Nyquist.
+pub struct RealFftEngine {
+    n: usize,
+    r2c: Arc<dyn RealToComplex<f32>>,
+    input: Vec<f32>,
+    spectrum: Vec<Complex<f32>>,
+    scratch: Vec<Complex<f32>>,
+}
+
+impl RealFftEngine {
+    pub fn new(n: usize) -> RealFftEngine {
+        let mut planner = RealFftPlanner::<f32>::new();
+        let r2c = planner.plan_fft_forward(n);
+        let input = r2c.make_input_vec(); // len n
+        let spectrum = r2c.make_output_vec(); // len n/2 + 1
+        let scratch = r2c.make_scratch_vec();
+        RealFftEngine {
+            n,
+            r2c,
+            input,
+            spectrum,
+            scratch,
+        }
+    }
+
+    /// Forward DFT of a real input of length `n`. Writes the first `n/2 + 1` complex
+    /// bins into `out_re`/`out_im`; higher indices are left as-is — the caller only
+    /// reads bins below `n/2` (real-transform conjugate symmetry covers the rest).
+    pub fn forward_real(&mut self, x: &[f32], out_re: &mut [f32], out_im: &mut [f32]) {
+        debug_assert_eq!(x.len(), self.n);
+        self.input.copy_from_slice(x);
+        // `process_with_scratch` overwrites `input`; that's why we copy in each call.
+        self.r2c
+            .process_with_scratch(&mut self.input, &mut self.spectrum, &mut self.scratch)
+            .expect("realfft forward transform (buffer lengths are fixed at construction)");
+        for (k, c) in self.spectrum.iter().enumerate() {
+            out_re[k] = c.re;
+            out_im[k] = c.im;
+        }
+    }
+}
+
+/// The decoder's FFT, selectable between implementations ([`FftBackend`]). Built
+/// once per [`crate::waterfall::Monitor`]; the live A/B toggle decides which
+/// backend the next slot's Monitor is constructed with.
+pub enum Fft {
+    Bluestein(Bluestein),
+    RealFft(RealFftEngine),
+}
+
+impl Fft {
+    pub fn new(backend: FftBackend, n: usize) -> Fft {
+        match backend {
+            FftBackend::Bluestein => Fft::Bluestein(Bluestein::new(n)),
+            FftBackend::RealFft => Fft::RealFft(RealFftEngine::new(n)),
+        }
+    }
+
+    /// Forward real FFT into `out_re`/`out_im` (see each backend's `forward_real`).
+    /// `&mut self` because `realfft` writes through reusable scratch; the Bluestein
+    /// arm simply ignores the mutability.
+    pub fn forward_real(&mut self, x: &[f32], out_re: &mut [f32], out_im: &mut [f32]) {
+        match self {
+            Fft::Bluestein(b) => b.forward_real(x, out_re, out_im),
+            Fft::RealFft(r) => r.forward_real(x, out_re, out_im),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,5 +319,35 @@ mod tests {
         check(10); // FT4-ish factor
         check(96);
         check(3840); // the actual FT8 nfft at 12 kHz, freq_osr=2
+    }
+
+    /// The `realfft` engine must match the naive DFT over the `N/2+1` bins it
+    /// returns — the decoder reads only this lower half, so this pins exactly what
+    /// the A/B alternate backend feeds the sync/demod stages.
+    fn check_realfft(n: usize) {
+        let x: Vec<f32> = (0..n)
+            .map(|i| (i as f32 * 0.3).sin() + (i as f32 * 0.07).cos() * 0.5)
+            .collect();
+        let mut eng = RealFftEngine::new(n);
+        let mut re = vec![0.0f32; n];
+        let mut im = vec![0.0f32; n];
+        eng.forward_real(&x, &mut re, &mut im);
+        let (rr, ri) = naive_dft(&x);
+        for k in 0..=n / 2 {
+            assert!(
+                (re[k] - rr[k]).abs() < 1e-2 * (n as f32),
+                "re[{k}] N={n}: {} vs {}",
+                re[k],
+                rr[k]
+            );
+            assert!((im[k] - ri[k]).abs() < 1e-2 * (n as f32), "im[{k}] N={n}");
+        }
+    }
+
+    #[test]
+    fn realfft_matches_naive_dft() {
+        check_realfft(16);
+        check_realfft(1152); // FT4 nfft at 12 kHz
+        check_realfft(3840); // FT8 nfft at 12 kHz, freq_osr=2
     }
 }

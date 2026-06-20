@@ -25,6 +25,7 @@ mod waterfall;
 
 pub use decode::{Decode, decode, decode_streaming};
 pub use encode::synth_ft8;
+pub use fft::FftBackend;
 pub use message::MessageType;
 
 /// Synthesize a full FT8 slot of audio for a text message (e.g.

@@ -9,3 +9,6 @@ description = "From-scratch FT8/FT4 decoder/encoder (pure Rust) and the UTC slot
 [dependencies]
 serde = { workspace = true }
 tracing = { workspace = true }
+# Real-input FFT (on rustfft) — the alternate decoder front-end, A/B-switchable
+# against our hand-rolled Bluestein FFT at runtime (see `fft::FftBackend`).
+realfft = "3"
