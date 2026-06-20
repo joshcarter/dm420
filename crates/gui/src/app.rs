@@ -45,24 +45,50 @@ pub struct App {
     /// The Waterfall panel publishes its current selection here; the Contacts map
     /// reads it to crosshair that station's location. `None` when nothing is selected.
     pub selected_station: Option<String>,
+    /// The most recent *windowed* geometry (size + position), refreshed each frame
+    /// the window isn't fullscreen. Persisted on a fullscreen close so the saved
+    /// fallback size is the real window, not the whole screen. `None` until the
+    /// first windowed frame. (`fullscreen` on the stored value is always `false`.)
+    pub last_windowed: Option<crate::settings::WindowSize>,
+    /// Skip writing geometry/theme back to the config — set for the deterministic
+    /// screenshot paths (`MARTIAN_SHOT`/`MARTIAN_LIGHT`) so a capture run never
+    /// clobbers the operator's saved window.
+    pub deterministic: bool,
+    /// The window geometry last written to the config, so the reactive save only
+    /// writes on a real change. Seeded from the file at startup; `None` if none was
+    /// saved yet (so the first stable frame creates the `[window]` table).
+    pub persisted_window: Option<crate::settings::WindowSize>,
+    /// Debounce state for the reactive save: the geometry seen and the time (eframe
+    /// seconds) it was first seen. Flushed to disk once it holds still; reset on
+    /// every change so a drag/resize writes once, when it settles.
+    pub window_pending: Option<(crate::settings::WindowSize, f64)>,
 }
 
 impl App {
     /// Build the app. `egui_ctx` is handed to the bus bridge so background data
     /// arriving off-frame can wake the UI.
     pub fn new(egui_ctx: &egui::Context) -> Self {
-        // `MARTIAN_LIGHT` pins light (used by the headless screenshot path); when
-        // it isn't set we boot dark, then seed from the OS appearance on the first
-        // frame (`seed_theme_from_system`). The env always wins over the OS seed.
+        // Theme precedence: `MARTIAN_LIGHT` (the headless screenshot path) pins
+        // light → a saved `[display] dark` choice → the OS appearance, seeded on
+        // the first frame (`seed_theme_from_system`). The env always wins; a saved
+        // choice wins over the OS seed and turns the startup follow off.
         let forced_light = std::env::var("MARTIAN_LIGHT").is_ok();
-        let dark = !forced_light;
+        // The screenshot paths keep a fixed canvas and must not write geometry back.
+        let deterministic = forced_light || std::env::var("MARTIAN_SHOT").is_ok();
+        let saved_dark = (!forced_light).then(crate::settings::read_theme_dark).flatten();
+        let dark = if forced_light {
+            false
+        } else {
+            saved_dark.unwrap_or(true)
+        };
         let (tree, tree_ids) = build_tree();
         let focused = tree_ids.waterfall; // FT8 panel holds focus at startup
         let station = Station::load();
         let view = BusView::start(egui_ctx.clone(), station.to_qso_config());
         Self {
             dark,
-            follow_system_at_startup: !forced_light,
+            // Only seed from the OS when light isn't pinned and nothing was saved.
+            follow_system_at_startup: !forced_light && saved_dark.is_none(),
             system_seeded: false,
             // No default callsign: when the station identity isn't set yet, boot
             // straight into config (unlocked) so the operator is prompted for it.
@@ -79,6 +105,12 @@ impl App {
             frame: 0,
             view,
             selected_station: None,
+            last_windowed: None,
+            deterministic,
+            // Seed from the file so we don't re-write an unchanged geometry on boot;
+            // `None` (no saved `[window]` yet) means the first stable frame creates it.
+            persisted_window: (!deterministic).then(crate::settings::read_window_size).flatten(),
+            window_pending: None,
         }
     }
 

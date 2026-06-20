@@ -24,6 +24,8 @@ mod theme;
 mod waterslide_panel;
 mod waterslide_sim;
 
+use std::time::Duration;
+
 use eframe::egui;
 use egui::{
     Align2, CornerRadius, FontData, FontDefinitions, FontFamily, Pos2, Rect, Stroke, Vec2,
@@ -54,6 +56,11 @@ fn main() -> eframe::Result<()> {
         .with_title("Dingus Mangler 420");
     if let Some((x, y)) = saved.and_then(|w| w.pos) {
         viewport = viewport.with_position([x, y]);
+    }
+    // Reopen in fullscreen if that's how it was left; the inner size above is the
+    // last windowed geometry, so exiting fullscreen returns to a sane window.
+    if saved.is_some_and(|w| w.fullscreen) {
+        viewport = viewport.with_fullscreen(true);
     }
     let options = eframe::NativeOptions {
         viewport,
@@ -254,31 +261,100 @@ impl TreeIds {
     }
 }
 
+/// How long the window geometry must hold still before the reactive save writes
+/// it — long enough that a drag/resize coalesces into a single file write, short
+/// enough that a quick resize-then-quit still lands before exit.
+const WINDOW_SAVE_DEBOUNCE: Duration = Duration::from_millis(700);
+
 impl App {
-    /// Save the current window size and tile-split proportions to the config file
-    /// so the next launch reopens the same way. Called from the close-request path
-    /// (which bypasses eframe's own save). The screenshot run keeps a fixed canvas,
-    /// so it doesn't write its layout back over the operator's.
-    fn persist_window_layout(&self, ctx: &egui::Context) {
-        if self.shot_path.is_some() {
-            return;
-        }
-        let (sz, outer) = ctx.input(|i| (i.content_rect().size(), i.viewport().outer_rect));
-        let win = settings::WindowSize {
+    /// The current window geometry to persist. When fullscreen, the live rect is
+    /// the whole screen, so report the last *windowed* geometry instead (so leaving
+    /// fullscreen next launch returns to a sane window) with the flag flipped on;
+    /// fall back to the live rect if no windowed frame was seen this session.
+    ///
+    /// `pos` is the window's top-left in OS points — on macOS that's a global,
+    /// multi-monitor coordinate, so restoring it reopens on the same display
+    /// without a separate monitor id. `None` if the platform doesn't report it.
+    fn current_window(&self, ctx: &egui::Context) -> settings::WindowSize {
+        let (sz, outer, fullscreen) = ctx.input(|i| {
+            let v = i.viewport();
+            (i.content_rect().size(), v.outer_rect, v.fullscreen.unwrap_or(false))
+        });
+        let live = settings::WindowSize {
             width: sz.x,
             height: sz.y,
-            // The window's top-left in OS points; `None` if the platform doesn't
-            // report it, in which case the size is saved but the position isn't.
             pos: outer.map(|r| (r.min.x, r.min.y)),
+            fullscreen: false,
         };
-        let layout = settings::LayoutShares {
+        if fullscreen {
+            // Prefer this session's last windowed frame; else the geometry already
+            // saved (so a launch straight into restored fullscreen doesn't clobber
+            // the good windowed size with the screen rect); else the live rect.
+            settings::WindowSize {
+                fullscreen: true,
+                ..self.last_windowed.or(self.persisted_window).unwrap_or(live)
+            }
+        } else {
+            live
+        }
+    }
+
+    /// The current tile-split proportions to persist.
+    fn current_layout(&self) -> settings::LayoutShares {
+        settings::LayoutShares {
             waterfall: self.share_of(self.tree_ids.waterfall),
             right: self.share_of(self.tree_ids.right),
             log: self.share_of(self.tree_ids.log),
             band: self.share_of(self.tree_ids.band),
             contacts: self.share_of(self.tree_ids.contacts),
-        };
-        settings::save_window_layout(win, layout);
+        }
+    }
+
+    /// Save the window geometry + tile layout to the config so the next launch
+    /// reopens the same way. Used as a final flush on the close-request path; the
+    /// reactive [`Self::maybe_persist_window`] is what catches the common case
+    /// (Cmd+Q and other exits never deliver a `close_requested` frame).
+    fn persist_window_layout(&self, ctx: &egui::Context) {
+        if self.deterministic {
+            return;
+        }
+        settings::save_window_layout(self.current_window(ctx), self.current_layout());
+    }
+
+    /// Persist the window geometry whenever it settles after a change. Called every
+    /// frame: it debounces so a drag/resize/move (or entering fullscreen) writes
+    /// once, when it holds still — independent of the close path, which macOS skips
+    /// on Cmd+Q. `request_repaint_after` guarantees a frame fires to flush even if
+    /// the app would otherwise idle.
+    fn maybe_persist_window(&mut self, ctx: &egui::Context) {
+        if self.deterministic {
+            return;
+        }
+        let current = self.current_window(ctx);
+        // Never write a degenerate size (frame 0 before layout, etc.).
+        if !(current.width.is_finite() && current.height.is_finite())
+            || current.width <= 0.0
+            || current.height <= 0.0
+        {
+            return;
+        }
+        if self.persisted_window == Some(current) {
+            self.window_pending = None;
+            return;
+        }
+        let now = ctx.input(|i| i.time);
+        // Restart the debounce clock whenever the pending value changes.
+        if self.window_pending.map(|(w, _)| w) != Some(current) {
+            self.window_pending = Some((current, now));
+        }
+        let (pending, since) = self.window_pending.unwrap();
+        if now - since >= WINDOW_SAVE_DEBOUNCE.as_secs_f64() {
+            settings::save_window_layout(pending, self.current_layout());
+            self.persisted_window = Some(pending);
+            self.window_pending = None;
+        } else {
+            ctx.request_repaint_after(WINDOW_SAVE_DEBOUNCE);
+        }
     }
 
     /// The linear-container share currently assigned to `id` (its parent split's
@@ -413,6 +489,26 @@ impl eframe::App for App {
             self.persist_window_layout(&ctx);
             std::process::exit(0);
         }
+
+        // Remember the latest windowed geometry. In fullscreen the live rect is the
+        // whole screen, so a fullscreen close persists this instead — keeping the
+        // saved fallback size the real window. (Runs after the close check, so it
+        // reflects the last drawn-windowed frame.)
+        let (live_sz, live_outer, live_fs) = ctx.input(|i| {
+            let v = i.viewport();
+            (i.content_rect().size(), v.outer_rect, v.fullscreen.unwrap_or(false))
+        });
+        if !live_fs {
+            self.last_windowed = Some(settings::WindowSize {
+                width: live_sz.x,
+                height: live_sz.y,
+                pos: live_outer.map(|r| (r.min.x, r.min.y)),
+                fullscreen: false,
+            });
+        }
+        // Persist geometry as it settles, so size/position/fullscreen survive every
+        // exit path (the close-request flush below only fires on the red button).
+        self.maybe_persist_window(&ctx);
 
         // Seed the theme from the OS appearance on the first frame it's known
         // (can't be done in `App::new` — the system theme isn't populated until a
@@ -638,8 +734,10 @@ impl App {
         if disp_clicks[0] || disp_clicks[1] {
             self.dark = disp_clicks[0];
             // A manual choice wins from here on — stop the startup OS seed in case
-            // the OS theme hadn't been reported yet on this first frame.
+            // the OS theme hadn't been reported yet on this first frame, and
+            // persist it so the next launch reopens on the chosen palette.
             self.system_seeded = true;
+            settings::save_theme_dark(self.dark);
         }
 
         // ---- clocks (two LCD chips), centered in the header ----

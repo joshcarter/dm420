@@ -474,10 +474,37 @@ pub fn save_hardware_config(cfg: &HardwareConfig) {
             ("usb_pid", &usb_pid),
             ("baud", &baud),
             ("profile", cfg.serial.profile.label()),
-            ("autodetect", if cfg.serial.autodetect { "true" } else { "false" }),
+            ("autodetect", bool_str(cfg.serial.autodetect)),
         ],
     );
     write_config(&path, &text);
+}
+
+/// The saved display theme: the `[display] dark` key, `true` for the dark
+/// ("graphite") palette and `false` for light ("silver"). `None` when unset, so
+/// the caller falls back to seeding from the OS appearance. Set the first time
+/// the operator flips the DARK/LIGHT toggle ([`save_theme_dark`]).
+pub fn read_theme_dark() -> Option<bool> {
+    let text = std::fs::read_to_string(config_path()).ok()?;
+    parse_table_value(&text, "display", "dark").and_then(|s| s.parse().ok())
+}
+
+/// Persist the display theme to the `[display] dark` key, preserving every other
+/// table and comment. Best-effort (called when the operator flips the DARK/LIGHT
+/// toggle); errors are logged, not fatal.
+pub fn save_theme_dark(dark: bool) {
+    let path = config_path();
+    let existing = std::fs::read_to_string(&path).unwrap_or_else(|_| {
+        "# DM420 config — written from the UI; safe to hand-edit.\n".to_string()
+    });
+    let text = update_toml_table(&existing, "display", &[("dark", bool_str(dark))]);
+    write_config(&path, &text);
+}
+
+/// `"true"`/`"false"` for a config bool — the string form `[serial] autodetect`
+/// and `[display] dark` are written/read as.
+fn bool_str(b: bool) -> &'static str {
+    if b { "true" } else { "false" }
 }
 
 /// The persisted window inner size (logical points). Read at startup to seed the
@@ -490,6 +517,11 @@ pub struct WindowSize {
     /// window manager place the window (first run, or a file without `[window] x`).
     /// May be negative on a multi-monitor desktop, so it isn't sign-checked.
     pub pos: Option<(f32, f32)>,
+    /// Whether the window was left in (native) fullscreen. Restored on launch so
+    /// the app reopens the way it was closed. `width`/`height`/`pos` still carry
+    /// the last *windowed* geometry (not the fullscreen rect), so leaving
+    /// fullscreen returns to a sane size.
+    pub fullscreen: bool,
 }
 
 /// The resizable tile-split proportions, as the raw `egui_tiles` linear shares.
@@ -507,9 +539,10 @@ pub struct LayoutShares {
     pub contacts: f32,
 }
 
-/// Read the saved `[window]` inner size, or `None` if absent/incomplete (then the
-/// caller uses the design default). A non-positive or non-finite value is treated
-/// as unset so a corrupt file can't open a zero-size window.
+/// Read the saved `[window]` inner size (plus the optional `fullscreen` flag), or
+/// `None` if the size is absent/incomplete (then the caller uses the design
+/// default). A non-positive or non-finite value is treated as unset so a corrupt
+/// file can't open a zero-size window; `fullscreen` defaults off when not present.
 pub fn read_window_size() -> Option<WindowSize> {
     let text = std::fs::read_to_string(config_path()).ok()?;
     let w = parse_float(&text, "window", "width")?;
@@ -523,10 +556,15 @@ pub fn read_window_size() -> Option<WindowSize> {
         (Some(x), Some(y)) if x.is_finite() && y.is_finite() => Some((x, y)),
         _ => None,
     };
+    // Fullscreen is an independent flag; absent/garbled ⇒ windowed.
+    let fullscreen = parse_table_value(&text, "window", "fullscreen")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(false);
     (w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0).then_some(WindowSize {
         width: w,
         height: h,
         pos,
+        fullscreen,
     })
 }
 
@@ -545,9 +583,10 @@ pub fn read_layout_shares() -> Option<LayoutShares> {
     })
 }
 
-/// Persist the window size and tile layout to the `[window]` / `[layout]` tables,
-/// preserving every other table and comment. Best-effort: called on exit (the
-/// macOS close path bypasses eframe's own save hook), errors are logged.
+/// Persist the window size, fullscreen flag, and tile layout to the `[window]` /
+/// `[layout]` tables, preserving every other table and comment. Best-effort:
+/// called on exit (the macOS close path bypasses eframe's own save hook), errors
+/// are logged.
 pub fn save_window_layout(win: WindowSize, layout: LayoutShares) {
     let path = config_path();
     let existing = std::fs::read_to_string(&path).unwrap_or_else(|_| {
@@ -563,6 +602,8 @@ pub fn save_window_layout(win: WindowSize, layout: LayoutShares) {
         win_kvs.push(("x", format_f32(x)));
         win_kvs.push(("y", format_f32(y)));
     }
+    // Always recorded so a windowed close clears a previously-saved fullscreen.
+    win_kvs.push(("fullscreen", bool_str(win.fullscreen).to_string()));
     let win_kvs: Vec<(&str, &str)> = win_kvs.iter().map(|(k, v)| (*k, v.as_str())).collect();
     let text = update_toml_table(&existing, "window", &win_kvs);
     let text = update_toml_table(
@@ -793,6 +834,51 @@ mod tests {
         assert_eq!(s.baud, Some(19_200));
         assert_eq!(s.profile, Some(LineProfile::Default));
         assert_eq!(s.autodetect, Some(true));
+    }
+
+    #[test]
+    fn display_theme_round_trips_and_preserves_other_tables() {
+        // The writer adds [display] without disturbing [station]; the reader gets
+        // the bool back. (Mirrors what `save_theme_dark` writes via the same path.)
+        let text = update_toml_table("# top\n[station]\ncallsign = \"W4LL\"\n", "display", &[("dark", "false")]);
+        assert!(text.contains("# top"), "header comment kept: {text}");
+        assert_eq!(
+            parse_station_config(&text),
+            (Some("W4LL".to_string()), None),
+            "station table survives: {text}"
+        );
+        assert_eq!(parse_table_value(&text, "display", "dark").as_deref(), Some("false"));
+        // Flip it: the existing key is rewritten in place, not duplicated.
+        let flipped = update_toml_table(&text, "display", &[("dark", "true")]);
+        assert_eq!(flipped.matches("dark =").count(), 1, "key rewritten, not appended: {flipped}");
+        assert_eq!(
+            parse_table_value(&flipped, "display", "dark").and_then(|s| s.parse::<bool>().ok()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn window_fullscreen_flag_round_trips_with_size() {
+        // Mirror what `save_window_layout` writes for the [window] table, then read
+        // the pieces back the way `read_window_size` does.
+        let text = update_toml_table(
+            "",
+            "window",
+            &[("width", "1200"), ("height", "800"), ("fullscreen", "true")],
+        );
+        assert_eq!(parse_float(&text, "window", "width"), Some(1200.0));
+        assert_eq!(parse_float(&text, "window", "height"), Some(800.0));
+        assert_eq!(
+            parse_table_value(&text, "window", "fullscreen").and_then(|s| s.parse::<bool>().ok()),
+            Some(true)
+        );
+        // A windowed close flips it back to false in place (not duplicated).
+        let windowed = update_toml_table(&text, "window", &[("fullscreen", "false")]);
+        assert_eq!(windowed.matches("fullscreen =").count(), 1, "rewritten: {windowed}");
+        assert_eq!(
+            parse_table_value(&windowed, "window", "fullscreen").and_then(|s| s.parse::<bool>().ok()),
+            Some(false)
+        );
     }
 
     #[test]
