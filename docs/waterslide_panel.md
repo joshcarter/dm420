@@ -37,7 +37,7 @@ the next transmission will go. Generally this does not change the
 radio's center frequency, but rather is where transmitted audio will
 be tuned to.
 
-Cliking within the FFT graph will change the outgoing frequency based
+Clicking within the FFT graph will change the outgoing frequency based
 on the vertical position that the user clicked. Clicking on decoded
 traffic text, however, will snap the outgoing frequency to whatever
 the frequency was for that decoded traffic.
@@ -46,7 +46,7 @@ The radio's next FT4/FT8 transmission will take place at that outgoing
 frequency, either to answer a calling station or to do a new "calling
 all stations" transmission.
 
-An indicater should be shown for the current outgoing frequency. The
+An indicator should be shown for the current outgoing frequency. The
 outgoing frequency is held for the duration of a QSO (it does not
 chase the partner), and a completed CQ-initiated QSO resumes calling
 CQ on the same offset. The contact lifecycle that drives all of this —
@@ -54,7 +54,7 @@ including how clicking text vs. empty spectrum maps to answering vs.
 calling CQ, and how multiple answering stations are highlighted and
 selected — is specified in [`qso_flow.md`](qso_flow.md).
 
-During radio transmit, recieve data will not be present. However our
+During radio transmit, receive data will not be present. However our
 own transmission audo will be known. The graph should show our
 transmission FFT at the appropriate center point and our own
 transmitted data should show up in the decode panel. It should be
