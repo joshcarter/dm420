@@ -2,6 +2,41 @@
 
 Running notes, gotchas, and reminders. Newest at the top.
 
+## 2026-06-20
+
+- **Decoder FFT → realfft (DONE; A/B done and removed).** Migrated `modes`' STFT
+  front-end from our hand-rolled radix-2 + Bluestein FFT to the `realfft`/`rustfft`
+  crate (`crates/modes/src/fft.rs::Fft`). Implements `docs/fft_migration_proposal.md`.
+  - **Decision.** Ran a live A/B harness (both backends switchable per slot, BLST/RFFT
+    header toggle + DEBUG `fft a/b` telemetry) on real on-air traffic: **identical
+    decode yield, STFT ~10× faster** (~63 ms → ~6 ms per FT8 slot; build ~460→~160 µs).
+    Chose realfft. The A/B scaffolding (FftBackend/Fft enum, core::FftControl,
+    DM420_FFT, the toggle, the per-slot timing log) was then **removed** — realfft is
+    the only decoder FFT now. Committed as two steps (A/B harness, then removal).
+  - **Why it's a clean swap.** The `2/nfft` gain lives in the analysis window, not the
+    FFT, and the transform is unnormalized; the decoder reads only the `N/2+1`
+    real-transform bins (its used bins sit below Nyquist). Parity is locked by
+    `fixtures_decode.rs` (reference FT8/FT4 decode identically) + `fft::tests::
+    matches_naive_dft`.
+  - **Note.** The GUI **spectrum/waterfall display** still uses the separate hand-rolled
+    `dsp::fft` — untouched. Per-slot the realfft planner is rebuilt (cheap, ~160 µs);
+    cache it across slots later if we want.
+
+- **UI/config persistence (done).** Dark/light **and** window geometry (size, position,
+  **fullscreen**) now persist in `~/.dm420/config.toml`. Window save is **reactive +
+  debounced**, not close-only: the macOS close path only fires `ui` with
+  `close_requested` on the red button, so **Cmd+Q skipped it** and nothing saved — now
+  it writes ~700 ms after geometry settles, surviving any exit. On macOS the global
+  (x, y) already restores the right monitor, so no separate monitor id is stored.
+
+- **Config path cleanup (done).** Retired `dm420.toml`; `~/.dm420/config.toml` is the
+  only config path (code already used it). Deleted the stale repo-root `dm420.toml`,
+  dropped its `.gitignore` entry, fixed `dm420.example.toml` + `JOEL.md`. (These notes
+  still mention `dm420.toml` in the 2026-06-18 entry below — left as historical.)
+
+- **Shared builds (done).** Added a `group:staff` ACL on the repo + `target/` so any
+  local user (i.e. you as `joelodom`) can `cargo build` regardless of who built last.
+
 ## 2026-06-18
 
 - **Decode/TX timing — optimizations done + planned (the "answered a repeated CQ but

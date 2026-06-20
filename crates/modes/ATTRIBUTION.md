@@ -30,11 +30,14 @@ that consumes them is our own.
 
 ## What is and isn't ours
 
-- **Ours (written from scratch):** the FFT (radix-2 + Bluestein), the STFT
-  waterfall, Costas sync search, soft-symbol LLR extraction, the LDPC
-  belief-propagation decoder, CRC, GFSK synthesis, message pack/unpack, the slot
-  clock, and all kenctl integration. These are independent Rust ports of the
-  *algorithms*, not copies of the C source.
+- **Ours (written from scratch):** the STFT waterfall, Costas sync search,
+  soft-symbol LLR extraction, the LDPC belief-propagation decoder, CRC, GFSK
+  synthesis, message pack/unpack, the slot clock, and all kenctl integration.
+  These are independent Rust ports of the *algorithms*, not copies of the C source.
+- **Third-party (crates):** the forward FFT is the [`realfft`](https://crates.io/crates/realfft)
+  crate (MIT) on [`rustfft`](https://crates.io/crates/rustfft) (MIT OR Apache-2.0).
+  It replaced our original hand-rolled radix-2 + Bluestein FFT (~10x faster). Both
+  are permissively licensed; ship their notices with any distribution.
 - **Not ours:** the protocol constant tables (WSJT-X spec) and the algorithmic
   approach (ft8_lib, MIT). Credit and license preserved as above.
 
