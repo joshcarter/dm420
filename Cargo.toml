@@ -25,6 +25,7 @@ modes = { path = "crates/modes" }
 qso = { path = "crates/qso" }
 logbook = { path = "crates/logbook" }
 scanner = { path = "crates/scanner" }
+net = { path = "crates/net" }
 mocks = { path = "crates/mocks" }
 
 # --- GUI stack (pinned exactly per docs/FEASIBILITY.md; the spike validated these) ---
@@ -35,7 +36,10 @@ egui_extras = "0.34.3"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 
 # --- async / bus transport ---
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time", "net"] }
+
+# --- LAN gossip (the `net` crate; see docs/networking.md) ---
+mdns-sd = "0.11"      # mDNS/DNS-SD peer discovery on the LAN
 
 # --- serialization (message catalog payloads, recorder, ADIF/JSON) ---
 serde = { version = "1", features = ["derive"] }

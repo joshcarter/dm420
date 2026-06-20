@@ -531,13 +531,53 @@ pub struct BandActivity {
 }
 
 // =====================================================================
-// §9  Cross-station gossip  —  DEFERRED
+// §9  Cross-station gossip  —  station/{id}/snapshot  (State + gossiped)
 // =====================================================================
 //
-// `StationSnapshot`, `WorkingTarget`, `HeardStation` and the gossip G-set live
-// in the networking phase (Josh-owned). Neither the GUI wiring nor Joel's
-// rig/decode framework needs them yet, so they are intentionally not implemented
-// here. See `docs/message-catalog.md` §9 for the draft shapes.
+// The LAN-sharing vocabulary (Josh-owned networking phase). Carried over UDP by
+// the `net` crate and re-published onto the bus; see `docs/networking.md` for the
+// transport, merge semantics, and anti-entropy loop. The log G-set itself reuses
+// §7 `LogEntry`/`QsoId`; only the beacon types live here.
+
+/// One operator's current working intent — what peers consume to avoid competing
+/// for the same contact. Set the moment we arm to a station or commit to a caller;
+/// cleared to `None` when the engine drops to `Idle`. Carries an `OffsetHz` (`f32`)
+/// so it stays `PartialEq`-only, like the rest of the float-carrying payloads.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct WorkingTarget {
+    pub radio: RadioId,
+    pub band: Band,
+    pub offset: OffsetHz,
+    /// The target station, once known (unknown while merely armed to a frequency).
+    pub call: Option<Callsign>,
+}
+
+/// A station we've heard (decoded) but not necessarily worked. Shared so the map
+/// and band-scan aggregate everyone's ears, not just ours. `last_heard` is aged by
+/// the *receiver's* local clock on receipt, never the sender's — immune to skew.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct HeardStation {
+    pub call: Callsign,
+    pub grid: Option<GridSquare>,
+    pub band: Band,
+    pub snr: i8,
+    pub last_heard: Timestamp,
+}
+
+/// Periodic full-state beacon, latest-wins per station by `seq` (the State topic
+/// `station/{id}/snapshot`). Carries everything except the log G-set, which syncs
+/// separately via the `net` anti-entropy loop. `heard` is recency-bounded by the
+/// sender so a snapshot fits one datagram.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct StationSnapshot {
+    pub station: StationId,
+    /// Monotonic per station — supersedes any lower-`seq` snapshot. Never a
+    /// wall-clock, so clock skew between operators can't reorder beacons.
+    pub seq: u64,
+    pub working: Option<WorkingTarget>,
+    pub band_activity: Vec<BandActivity>,
+    pub heard: Vec<HeardStation>,
+}
 
 // =====================================================================
 // §10  Clock + interlock

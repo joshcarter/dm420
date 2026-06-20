@@ -1,0 +1,18 @@
+[package]
+name = "net"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "LAN gossip between operators: mDNS discovery, UDP transport, and the cross-station snapshot/log-sync protocol (docs/networking.md)."
+
+[dependencies]
+bus.workspace = true
+types.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+mdns-sd.workspace = true

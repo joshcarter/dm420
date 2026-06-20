@@ -271,5 +271,14 @@ pub fn spawn(bus: &BusHandle, cfg: CoreConfig) -> CoreControl {
         logbook::spawn(bus, path);
     }
 
+    // LAN gossip: discover other operators on the network and exchange station
+    // snapshots (shared logbook + working-intent ride this in later steps). Config
+    // is read from env for now (interim, like the rest); `DM420_NET=0` opts out.
+    // Best-effort — `net::spawn` degrades to a logged warning if the socket or
+    // mDNS can't come up, so a missing network never blocks the rest of the app.
+    if let Some(net_cfg) = net::NetConfig::from_env() {
+        net::spawn(bus, net_cfg);
+    }
+
     control
 }

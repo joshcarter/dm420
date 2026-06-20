@@ -45,6 +45,7 @@ bus_message!(QsoState, State);
 bus_message!(ScannerState, State);
 bus_message!(ClockStatus, State);
 bus_message!(BandActivity, State); // scanner/candidates (State, replace)
+bus_message!(StationSnapshot, State); // station/{id}/snapshot (State, gossiped — §9)
 bus_message!(SubsystemHealth, State); // health/{id} (State, latest-wins per subsystem)
 
 // --- Command (request payloads; reply types are chosen per call site) ---
