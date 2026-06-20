@@ -12,12 +12,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bus::types as t;
 use bus::{BusHandle, Topic};
-use modes::{Decode as ModeDecode, FftBackend, Protocol, decode, decode_streaming};
+use modes::{Decode as ModeDecode, Protocol, decode, decode_streaming};
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use crate::control::{AudioControl, FftControl, StopReason, sleep_or_changed};
+use crate::control::{AudioControl, StopReason, sleep_or_changed};
 use crate::health;
 use crate::parse::parse_message;
 
@@ -197,7 +197,6 @@ fn spawn_decode_pass(
     bus: BusHandle,
     radio: t::RadioId,
     proto: Protocol,
-    backend: FftBackend,
     audio: Vec<f32>,
     slot_start_ms: i64,
     published: Arc<Mutex<HashMap<i64, HashSet<String>>>>,
@@ -207,7 +206,7 @@ fn spawn_decode_pass(
     std::thread::spawn(move || {
         let secs = audio.len() / DECODE_RATE as usize;
         let mut n = 0usize;
-        decode_streaming(&audio, DECODE_RATE, proto, backend, |d| {
+        decode_streaming(&audio, DECODE_RATE, proto, |d| {
             // Insert under the lock, publish outside it (the guard drops at the `;`).
             let fresh = published
                 .lock()
@@ -223,10 +222,7 @@ fn spawn_decode_pass(
         if cleanup {
             published.lock().unwrap().remove(&slot_start_ms);
         }
-        tracing::debug!(
-            "live decode [{pass}] fft={}: {secs} s of audio -> {n} new decode(s)",
-            backend.tag()
-        );
+        tracing::debug!("live decode [{pass}]: {secs} s of audio -> {n} new decode(s)");
     });
 }
 
@@ -237,7 +233,6 @@ pub fn spawn_wav(
     path: PathBuf,
     proto: Protocol,
     looping: bool,
-    fft: Arc<FftControl>,
 ) {
     let bus = bus.clone();
     tokio::spawn(async move {
@@ -259,14 +254,10 @@ pub fn spawn_wav(
             for slot in &slots {
                 tick.tick().await;
                 let samples = slot.clone();
-                // Read the A/B backend fresh each slot so a live toggle applies to
-                // the next replayed slot (ideal for repeatable A/B on a loop).
-                let backend = fft.backend();
-                let decs = tokio::task::spawn_blocking(move || {
-                    decode(&samples, DECODE_RATE, proto, backend)
-                })
-                .await
-                .unwrap_or_default();
+                let decs =
+                    tokio::task::spawn_blocking(move || decode(&samples, DECODE_RATE, proto))
+                        .await
+                        .unwrap_or_default();
                 publish_slot(&bus, &radio, proto, now_ms(), decs);
             }
             if !looping {
@@ -282,12 +273,7 @@ pub fn spawn_wav(
 /// capture stream is rebuilt with backoff and the fault is reported on
 /// `health/audio`, so decoding resumes when the device returns without taking the
 /// app down. Each session starts from a clean spectrogram/slot state.
-pub fn spawn_live(
-    bus: &BusHandle,
-    radio: t::RadioId,
-    control: Arc<AudioControl>,
-    fft: Arc<FftControl>,
-) {
+pub fn spawn_live(bus: &BusHandle, radio: t::RadioId, control: Arc<AudioControl>) {
     let bus = bus.clone();
     std::thread::spawn(move || {
         let mut last_health: Option<t::HealthState> = None;
@@ -309,7 +295,6 @@ pub fn spawn_live(
                         &stream,
                         &mut last_health,
                         &control,
-                        &fft,
                         cfg_gen,
                     );
                     drop(stream);
@@ -365,7 +350,6 @@ fn set_audio_health(bus: &BusHandle, last: &mut Option<t::HealthState>, state: t
 /// or the config generation moves off `start_gen` (reconfigured). Returns whether
 /// the device was ever healthy and why it stopped. All per-session state is
 /// local, so a reconnect starts the spectrogram and slot alignment fresh.
-#[allow(clippy::too_many_arguments)]
 fn run_stream(
     bus: &BusHandle,
     radio: &t::RadioId,
@@ -373,7 +357,6 @@ fn run_stream(
     stream: &audio::CaptureStream,
     last_health: &mut Option<t::HealthState>,
     control: &AudioControl,
-    fft: &FftControl,
     start_gen: u64,
 ) -> SessionEnd {
     let rate = stream.sample_rate;
@@ -474,7 +457,6 @@ fn run_stream(
                 bus.clone(),
                 radio.clone(),
                 proto,
-                fft.backend(), // read fresh per slot — live A/B toggle
                 audio,
                 slot_start_ms,
                 published.clone(),
@@ -489,7 +471,6 @@ fn run_stream(
                 bus.clone(),
                 radio.clone(),
                 proto,
-                fft.backend(), // read fresh per slot — live A/B toggle
                 audio,
                 slot_start_ms,
                 published.clone(),
@@ -516,7 +497,7 @@ mod tests {
 
         let decs: Vec<_> = slots
             .iter()
-            .flat_map(|s| decode(s, DECODE_RATE, Protocol::Ft8, FftBackend::Bluestein))
+            .flat_map(|s| decode(s, DECODE_RATE, Protocol::Ft8))
             .collect();
         assert!(!decs.is_empty(), "decoder found nothing in fixture");
 

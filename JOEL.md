@@ -1,9 +1,6 @@
 # NEAR TERM
 
 
-Evaluate FFT algorithm--maybe move to rust crate before doing FT4?
-(see `docs/fft_migration_proposal.md`).
-
 FT4 encode needs to be done
 
 Evaluate porting some of WSJT-X's decoding algorithm to ours

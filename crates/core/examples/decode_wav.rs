@@ -5,13 +5,12 @@
 //! cargo run -p core --example decode_wav -- sample_data/ft8/rec_20260614_015943Z.wav
 //! ```
 //!
-//! Defaults to the bundled FT8 sample if no path is given. Add `ft4` to decode
-//! FT4, and `realfft` to use the realfft/rustfft backend instead of the default
-//! Bluestein FFT — decode the same file under each to compare yield offline.
+//! Defaults to the bundled FT8 sample if no path is given. Add `ft4` as a second
+//! arg to decode FT4.
 
 use std::path::PathBuf;
 
-use core::{FftBackend, Protocol, parse_message};
+use core::{Protocol, parse_message};
 
 const DECODE_RATE: u32 = 12_000;
 const DEFAULT_WAV: &str = "sample_data/ft8/rec_20260614_015943Z.wav";
@@ -31,17 +30,9 @@ fn main() {
     let path = args
         .next()
         .map_or_else(|| PathBuf::from(DEFAULT_WAV), PathBuf::from);
-    // Remaining args are order-independent flags: `ft4` and/or `realfft`.
-    let flags: Vec<String> = args.map(|a| a.to_lowercase()).collect();
-    let proto = if flags.iter().any(|a| a == "ft4") {
-        Protocol::Ft4
-    } else {
-        Protocol::Ft8
-    };
-    let backend = if flags.iter().any(|a| a == "realfft" || a == "rfft") {
-        FftBackend::RealFft
-    } else {
-        FftBackend::Bluestein
+    let proto = match args.next().as_deref() {
+        Some("ft4") => Protocol::Ft4,
+        _ => Protocol::Ft8,
     };
 
     let (samples, rate) = audio::load_wav_mono(&path).expect("load wav");
@@ -60,7 +51,7 @@ fn main() {
         if slot.len() <= per / 2 {
             continue;
         }
-        let decs = modes::decode(slot, DECODE_RATE, proto, backend);
+        let decs = modes::decode(slot, DECODE_RATE, proto);
         if decs.is_empty() {
             continue;
         }

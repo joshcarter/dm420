@@ -4,33 +4,23 @@ Running notes, gotchas, and reminders. Newest at the top.
 
 ## 2026-06-20
 
-- **FFT A/B: realfft vs. our Bluestein, switchable live (built, awaiting your eval).**
-  Implements `docs/fft_migration_proposal.md` as a runtime A/B instead of a one-way
-  swap, so we decide on real on-air evidence.
-  - **What.** `modes::fft` now has an `Fft` enum wrapping the original `Bluestein`
-    and a new `RealFftEngine` (`realfft` 3.x on `rustfft`). `Monitor`/`decode`/
-    `decode_streaming` take an `FftBackend`. Drop-in: the `2/nfft` gain lives in the
-    analysis window (not the FFT) and both transforms are unnormalized, so only the
-    transform differs; the decoder reads only the `N/2+1` bins realfft returns.
-  - **Switch it live.** BLST/RFFT toggle in the waterslide header (shown only in real
-    decode — live capture or `DM420_WAV`; hidden under mocks). Read **fresh per slot**
-    via `core::FftControl` — no capture restart, waterfall undisturbed (the scrolling
-    display uses a *separate* `dsp` FFT, so the toggle only changes decoding). Seed the
-    starting backend with `DM420_FFT=bluestein|realfft`.
-  - **Logs to compare (this is the eval).** Set `[logging] level = "debug"` (or
-    `RUST_LOG=modes=debug,info`). Per decoded slot, `modes` emits
-    `fft a/b: slot decoded  fft=… build_us=… stft_us=… candidates=… decodes=…` —
-    `stft_us` is the apples-to-apples front-end cost, `build_us` the per-slot setup
-    (both backends rebuild per slot today). `core` also tags each pass:
-    `live decode [full] fft=realfft: …`. Run a while on each, hand me the log, and
-    we'll compare yield + timing.
-  - **Validated.** Decode **parity** is a test now: `fixtures_decode.rs` decodes every
-    reference FT8/FT4 fixture under *both* backends and asserts identical messages;
-    plus `fft::tests::realfft_matches_naive_dft` (incl. N=3840/1152). Offline A/B:
-    `cargo run -p core --example decode_wav -- <wav> [ft4] [realfft]`.
-  - **Outstanding.** (1) Your live A/B + the call on which to keep. (2) Per-slot engine
-    rebuild — if realfft wins we can cache the planner across slots (watch `build_us`).
-    (3) Not committed yet — on branch `joel-20-june`, pending your eval.
+- **Decoder FFT → realfft (DONE; A/B done and removed).** Migrated `modes`' STFT
+  front-end from our hand-rolled radix-2 + Bluestein FFT to the `realfft`/`rustfft`
+  crate (`crates/modes/src/fft.rs::Fft`). Implements `docs/fft_migration_proposal.md`.
+  - **Decision.** Ran a live A/B harness (both backends switchable per slot, BLST/RFFT
+    header toggle + DEBUG `fft a/b` telemetry) on real on-air traffic: **identical
+    decode yield, STFT ~10× faster** (~63 ms → ~6 ms per FT8 slot; build ~460→~160 µs).
+    Chose realfft. The A/B scaffolding (FftBackend/Fft enum, core::FftControl,
+    DM420_FFT, the toggle, the per-slot timing log) was then **removed** — realfft is
+    the only decoder FFT now. Committed as two steps (A/B harness, then removal).
+  - **Why it's a clean swap.** The `2/nfft` gain lives in the analysis window, not the
+    FFT, and the transform is unnormalized; the decoder reads only the `N/2+1`
+    real-transform bins (its used bins sit below Nyquist). Parity is locked by
+    `fixtures_decode.rs` (reference FT8/FT4 decode identically) + `fft::tests::
+    matches_naive_dft`.
+  - **Note.** The GUI **spectrum/waterfall display** still uses the separate hand-rolled
+    `dsp::fft` — untouched. Per-slot the realfft planner is rebuilt (cheap, ~160 µs);
+    cache it across slots later if we want.
 
 - **UI/config persistence (done).** Dark/light **and** window geometry (size, position,
   **fullscreen**) now persist in `~/.dm420/config.toml`. Window save is **reactive +

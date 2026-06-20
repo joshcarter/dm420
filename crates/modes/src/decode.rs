@@ -4,12 +4,10 @@
 
 use crate::constants::{FT4_COSTAS, FT4_GRAY, FT4_XOR, FT8_COSTAS, FT8_GRAY};
 use crate::crc;
-use crate::fft::FftBackend;
 use crate::ldpc::{N, bp_decode};
 use crate::message::{self, CallHash, MessageType};
 use crate::waterfall::{Monitor, Protocol, Waterfall, mag_db};
 use std::collections::HashSet;
-use std::time::Instant;
 
 const MIN_SCORE: i32 = 10;
 const MAX_CANDIDATES: usize = 140;
@@ -420,18 +418,12 @@ fn decode_candidate(wf: &Waterfall, c: &Candidate) -> Option<[u8; 10]> {
 }
 
 /// Decode a slot of mono audio at `sample_rate` (12 kHz expected) and return the
-/// transmissions found, strongest first. `backend` selects the FFT front-end
-/// (A/B-switchable; see [`FftBackend`]).
-pub fn decode(
-    samples: &[f32],
-    sample_rate: u32,
-    protocol: Protocol,
-    backend: FftBackend,
-) -> Vec<Decode> {
+/// transmissions found, strongest first.
+pub fn decode(samples: &[f32], sample_rate: u32, protocol: Protocol) -> Vec<Decode> {
     // Collect the streamed decodes; order is strongest-first (candidate score).
     // The call site re-sorts low-to-high in frequency if it wants that.
     let mut out = Vec::new();
-    decode_streaming(samples, sample_rate, protocol, backend, |d| out.push(d));
+    decode_streaming(samples, sample_rate, protocol, |d| out.push(d));
     out
 }
 
@@ -444,25 +436,15 @@ pub fn decode_streaming(
     samples: &[f32],
     sample_rate: u32,
     protocol: Protocol,
-    backend: FftBackend,
     mut on_decode: impl FnMut(Decode),
 ) {
-    // Construction (Bluestein chirp/filter precompute vs. realfft planner+twiddles)
-    // and the STFT itself are the only parts the FFT backend touches — time them
-    // separately so the A/B log isolates the front-end cost from the (identical)
-    // sync/LDPC stages.
-    let t_build = Instant::now();
-    let mut mon = Monitor::new(sample_rate, protocol, TIME_OSR, FREQ_OSR, 200.0, 3000.0, backend);
-    let build_us = t_build.elapsed().as_micros() as u64;
-
+    let mut mon = Monitor::new(sample_rate, protocol, TIME_OSR, FREQ_OSR, 200.0, 3000.0);
     let bs = mon.block_size;
     let mut pos = 0;
-    let t_stft = Instant::now();
     while pos + bs <= samples.len() {
         mon.process(&samples[pos..pos + bs]);
         pos += bs;
     }
-    let stft_us = t_stft.elapsed().as_micros() as u64;
 
     let wf = &mon.wf;
     let noise = noise_floor(wf);
@@ -470,7 +452,6 @@ pub fn decode_streaming(
     let mut hash = CallHash::new();
     let mut seen: HashSet<[u8; 10]> = HashSet::new();
     let sp = wf.symbol_period;
-    let mut decoded = 0usize;
     for c in &cands {
         let Some(payload) = decode_candidate(wf, c) else {
             continue;
@@ -485,7 +466,6 @@ pub fn decode_streaming(
             (wf.min_bin as f32 + c.freq_offset as f32 + c.freq_sub as f32 / wf.freq_osr as f32)
                 / sp;
         let dt = (c.time_offset as f32 + c.time_sub as f32 / wf.time_osr as f32) * sp;
-        decoded += 1;
         on_decode(Decode {
             score: c.score,
             snr_db: estimate_snr(wf, c, noise),
@@ -495,20 +475,6 @@ pub fn decode_streaming(
             msg_type,
         });
     }
-
-    // A/B telemetry: one line per decoded slot tagged with the FFT backend, the
-    // STFT/build timing, and the yield. Enable with `[logging] level = "debug"`
-    // (or `RUST_LOG=modes=debug,info`) and compare backends across slots.
-    tracing::debug!(
-        fft = backend.tag(),
-        proto = ?protocol,
-        blocks = mon.wf.num_blocks,
-        candidates = cands.len(),
-        decodes = decoded,
-        build_us,
-        stft_us,
-        "fft a/b: slot decoded"
-    );
 }
 
 #[cfg(test)]
@@ -533,7 +499,7 @@ mod tests {
         let mut h = Ch::new();
         let payload = encode_std("CQ", "K1ABC", "FN42", &mut h).unwrap();
         let sig = synth_ft8(&payload, 1000.0, 12000);
-        let decodes = decode(&sig, 12000, Protocol::Ft8, FftBackend::Bluestein);
+        let decodes = decode(&sig, 12000, Protocol::Ft8);
         assert!(
             decodes.iter().any(|d| d.message == "CQ K1ABC FN42"),
             "got: {:?}",
@@ -552,7 +518,7 @@ mod tests {
             *a += *b;
         }
         add_noise(&mut sig, 0.05, 0x1234_5678_9abc_def0);
-        let decodes = decode(&sig, 12000, Protocol::Ft8, FftBackend::Bluestein);
+        let decodes = decode(&sig, 12000, Protocol::Ft8);
         let msgs: Vec<&String> = decodes.iter().map(|d| &d.message).collect();
         assert!(msgs.iter().any(|m| *m == "CQ K1ABC FN42"), "got {msgs:?}");
         assert!(msgs.iter().any(|m| *m == "W9XYZ K1ABC -09"), "got {msgs:?}");
@@ -563,7 +529,7 @@ mod tests {
         let mut h = Ch::new();
         let payload = encode_std("CQ", "K1ABC", "FN42", &mut h).unwrap();
         let sig = synth_ft8(&payload, 1000.0, 12000);
-        let d = decode(&sig, 12000, Protocol::Ft8, FftBackend::Bluestein)
+        let d = decode(&sig, 12000, Protocol::Ft8)
             .into_iter()
             .find(|d| d.message == "CQ K1ABC FN42")
             .expect("decodes");
@@ -583,7 +549,7 @@ mod tests {
         let snr_at = |scale: f32| -> f32 {
             let mut s: Vec<f32> = sig.iter().map(|x| x * scale).collect();
             add_noise(&mut s, 0.10, 0xA5A5_5A5A_0F0F_F0F0);
-            decode(&s, 12000, Protocol::Ft8, FftBackend::Bluestein)
+            decode(&s, 12000, Protocol::Ft8)
                 .into_iter()
                 .find(|d| d.message == "CQ K1ABC FN42")
                 .unwrap_or_else(|| panic!("decodes at scale {scale}"))

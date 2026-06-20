@@ -1,11 +1,11 @@
 //! Short-time Fourier transform "waterfall" (port of ft8_lib `monitor.c`).
 //!
 //! Slides a Hann-windowed analysis frame across the slot audio, FFTs each
-//! sub-block with our own [`crate::fft::Bluestein`], and stores per-bin
-//! magnitudes as `u8` (0.5 dB steps, like the reference) for the sync/demod
-//! stages. Layout of `mag`: `[block][time_sub][freq_sub][bin]`, flattened.
+//! sub-block with [`crate::fft::Fft`] (realfft), and stores per-bin magnitudes as
+//! `u8` (0.5 dB steps, like the reference) for the sync/demod stages. Layout of
+//! `mag`: `[block][time_sub][freq_sub][bin]`, flattened.
 
-use crate::fft::{Fft, FftBackend};
+use crate::fft::Fft;
 
 /// FT8 or FT4 — selects the symbol/slot timing throughout the pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,7 +83,6 @@ impl Monitor {
         freq_osr: usize,
         f_min: f32,
         f_max: f32,
-        backend: FftBackend,
     ) -> Monitor {
         let symbol_period = protocol.symbol_period();
         let block_size = (sample_rate as f32 * symbol_period) as usize;
@@ -106,7 +105,7 @@ impl Monitor {
             max_bin,
             window,
             last_frame: vec![0.0; nfft],
-            fft: Fft::new(backend, nfft),
+            fft: Fft::new(nfft),
             wf: Waterfall {
                 protocol,
                 time_osr,

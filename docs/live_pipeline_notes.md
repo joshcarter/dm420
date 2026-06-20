@@ -94,10 +94,12 @@ Severity: 🔴 correctness/blocker · 🟡 should-fix · 🟢 polish.
   level" control (à la WSJT-X) or an adaptive AGC.
 - 🟢 **Colormap rebuilt every frame.** `martian_cmap()` (256-entry LUT) is rebuilt
   per paint in `waterfall.rs`. Cache it (rebuild only on palette flip).
-- 🟢 **Hand-rolled FFT.** `dsp::fft` is a tested radix-2 Cooley–Tukey, power-of-two
-  only. Fine, but `rustfft`/`realfft` would be faster and handle arbitrary sizes if
-  performance matters. (The "no dependencies" comments in `dsp`/`modes` are
-  vendored-code ethos, not a project mandate — pulling a crate is fine.)
+- 🟢 **Hand-rolled FFT (`dsp` only).** `dsp::fft` (the GUI spectrum/waterfall
+  display) is still a tested radix-2 Cooley–Tukey, power-of-two only — fine, but
+  `realfft` would be faster if it matters. **The decoder FFT (`modes`) already
+  moved to `realfft`** (~10× faster; see `docs/fft_migration_proposal.md`); `dsp`
+  could follow the same way. (The old "no dependencies" comments were vendored-code
+  ethos, not a mandate — pulling a crate is fine.)
 
 ## Alignment refinements
 

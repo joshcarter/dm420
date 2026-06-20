@@ -1,6 +1,11 @@
 # Proposal: Migrate the spectrogram/decoder FFT to `realfft` / `rustfft`
 
-**Status:** Proposal — awaiting Joel's decision.
+**Status: DONE (2026-06-20).** Migrated to `realfft`. Validated by an A/B harness
+(both backends live-switchable) on real on-air traffic: identical decode yield,
+STFT ~10× faster (~63 ms → ~6 ms per FT8 slot). The A/B scaffolding was then
+removed; `realfft` is now the only decoder FFT. Decode parity is locked in by
+`crates/modes/tests/fixtures_decode.rs` (+ `fft::tests::matches_naive_dft`). The
+historical proposal is kept below for rationale.
 **Author:** (drafted with Claude)
 **Scope:** `crates/modes/src/fft.rs`, `crates/modes/src/waterfall.rs`
 

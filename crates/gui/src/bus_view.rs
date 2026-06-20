@@ -436,35 +436,6 @@ impl BusView {
         self.control.audio.is_some()
     }
 
-    /// Whether a real decode producer (live capture or WAV replay) is running, so
-    /// the decoder FFT A/B toggle is meaningful. `false` under mocks, where decodes
-    /// are faked and never touch the modes FFT.
-    pub fn has_fft_control(&self) -> bool {
-        self.control.fft.is_some()
-    }
-
-    /// The decoder FFT backend currently selected — for the header A/B toggle.
-    /// Defaults to Bluestein when there's no decode producer.
-    pub fn current_fft_backend(&self) -> app_core::FftBackend {
-        self.control
-            .fft
-            .as_ref()
-            .map(|f| f.backend())
-            .unwrap_or_default()
-    }
-
-    /// Switch the decoder FFT backend live (A/B): the next decoded slot uses it,
-    /// with no capture restart. A no-op under mocks/no-decode. Logs each switch so
-    /// it bookmarks the A/B logs.
-    pub fn set_fft_backend(&self, backend: app_core::FftBackend) {
-        if let Some(fft) = &self.control.fft
-            && fft.backend() != backend
-        {
-            fft.set(backend);
-            tracing::info!(fft = backend.tag(), "fft: switched decoder backend (A/B)");
-        }
-    }
-
     /// Input-capable audio device names, for the settings picker.
     pub fn audio_inputs(&self) -> Vec<String> {
         app_core::list_audio_inputs()
