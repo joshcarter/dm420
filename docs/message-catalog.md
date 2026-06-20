@@ -171,7 +171,14 @@ pub struct Selection {
 pub struct DecodeRef { pub radio: RadioId, pub slot: SlotId, pub call: Option<Callsign> }
 
 // qso/{id}/command (Command)  /  qso/{id}/state (State + short history)
-pub enum QsoCommand { Start { target: DecodeRef }, CallCq, Abort }
+pub enum QsoCommand {
+    Start { target: DecodeRef },                 // arm: wait for target's next CQ, then answer
+    Resume { target: DecodeRef, message: ParsedMessage, snr: i8, offset: OffsetHz }, // pick up
+                                                 //   a contact mid-stream from a line addressed
+                                                 //   to us (no CQ wait) — clicked `<me> <them> …`
+    CallCq,
+    Abort,
+}
 
 pub struct QsoState {
     pub radio: RadioId,

@@ -82,6 +82,10 @@ struct RealSel {
     /// The station to work (its base call + the slot its decode landed in, for the
     /// real `DecodeRef`) when a decoded line was clicked rather than bare spectrum.
     target: Option<(String, SlotId)>,
+    /// Set when the clicked line is addressed to *us* (`<my call> <their call> …`):
+    /// the parsed message + its SNR, so SEND picks the contact up mid-stream
+    /// ([`BusView::resume_qso`]) instead of arming and waiting for a CQ.
+    resume: Option<(ParsedMessage, i8)>,
 }
 
 pub struct Waterfall {
@@ -119,6 +123,7 @@ impl Waterfall {
             real_sel: RealSel {
                 offset: 1500.0,
                 target: None,
+                resume: None,
             },
             tx_hold: None,
             last_next_tx: None,
@@ -170,14 +175,19 @@ impl Waterfall {
         // live waterslide is draw-only); in mock mode the sim does. Resolve to a TX
         // offset, the station to work (if a decoded line was clicked), and that
         // decode's slot (threaded into the real `DecodeRef`).
-        let (sel_off, sel_call, sel_slot) = if ctx.bus.is_real() {
+        let (sel_off, sel_call, sel_slot, sel_resume) = if ctx.bus.is_real() {
             match &self.real_sel.target {
-                Some((call, slot)) => (self.real_sel.offset, Some(call.clone()), *slot),
-                None => (self.real_sel.offset, None, SlotId(0)),
+                Some((call, slot)) => (
+                    self.real_sel.offset,
+                    Some(call.clone()),
+                    *slot,
+                    self.real_sel.resume.clone(),
+                ),
+                None => (self.real_sel.offset, None, SlotId(0), None),
             }
         } else {
             let t = self.slide.outgoing();
-            (t.off() as f32, t.station().map(str::to_string), SlotId(0))
+            (t.off() as f32, t.station().map(str::to_string), SlotId(0), None)
         };
 
         // Keep the buffer mirroring the would-be next message as a preview (unless
@@ -339,7 +349,14 @@ impl Waterfall {
                     } else if active_qso {
                         ctx.bus.abort_qso();
                     } else if let Some(call) = &sel_call {
-                        ctx.bus.answer_station(sel_off, call.clone(), sel_slot);
+                        // A line addressed to us (resume) picks the contact up
+                        // mid-stream; otherwise arm the DM420 wait-for-CQ way.
+                        if let Some((message, snr)) = &sel_resume {
+                            ctx.bus
+                                .resume_qso(sel_off, call.clone(), sel_slot, message.clone(), *snr);
+                        } else {
+                            ctx.bus.answer_station(sel_off, call.clone(), sel_slot);
+                        }
                     } else {
                         ctx.bus.call_cq(sel_off);
                     }
@@ -883,6 +900,25 @@ fn decode_station(d: &Decode) -> Option<(String, SlotId)> {
     }
 }
 
+/// The parsed message + SNR to resume a contact from, when `d` is a slotted line
+/// directed *to us* (`<my call> <their call> …`). `None` for CQs, free text, or
+/// lines to someone else — those start no contact we can pick up. The engine does
+/// the final role/exchange inference; this only filters to lines addressed to us.
+fn resume_intent(d: &Decode, my_call: Option<&str>) -> Option<(ParsedMessage, i8)> {
+    let me = my_call?;
+    let DecodeContent::Slotted { message, .. } = &d.content else {
+        return None;
+    };
+    let to = match message {
+        ParsedMessage::Exchange { to, .. } | ParsedMessage::Signoff { to, .. } => to,
+        _ => return None,
+    };
+    if !to.0.eq_ignore_ascii_case(me) {
+        return None;
+    }
+    Some((message.clone(), d.snr_db.unwrap_or(0)))
+}
+
 /// The ham band a dial frequency falls in, for deciding which logged contacts
 /// count as "worked" on the band we're currently on. `None` outside the amateur
 /// allocations (e.g. while tuned to WWV). Edges are the full band limits, so any
@@ -1111,7 +1147,9 @@ fn draw_waterslide(
             msg_col,
         );
         // A click on this line selects the station to work (and snaps the TX offset
-        // to it); resolved after the loop. Unparsed lines can't be worked.
+        // to it); resolved after the loop. Unparsed lines can't be worked. If the
+        // line is directed *to us*, also capture it so SEND can pick the contact up
+        // mid-stream (resume) rather than arm-and-wait-for-CQ.
         if let Some(cp) = click
             && msg_rect.expand(4.0).contains(cp)
             && let Some((call, slot)) = &station
@@ -1119,6 +1157,7 @@ fn draw_waterslide(
             hit = Some(RealSel {
                 offset: d.offset.0,
                 target: Some((call.clone(), *slot)),
+                resume: resume_intent(d, my_call),
             });
         }
         // Signal report: right-aligned, half a space to the left of the slot rule.
@@ -1230,6 +1269,7 @@ fn draw_waterslide(
             RealSel {
                 offset: off,
                 target: None,
+                resume: None,
             }
         }));
     }

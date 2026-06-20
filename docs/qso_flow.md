@@ -27,6 +27,18 @@ waterslide panel:
    software *arms* to that station and answers it the next time it calls CQ —
    even if that station is currently mid-QSO with someone else.
 
+There is also a recovery gesture for one specific case:
+
+3. **Pick up a contact mid-stream (resume).** Click a decode that is *addressed
+   to you* (`<my call> <their call> …`) and press **Enter**. Use this when a
+   station answers a call you'd already disarmed from — e.g. you armed to them,
+   they didn't reply, you disarmed to look elsewhere, and *then* their answer
+   came in. Arming (action 2) wouldn't help here: it waits for the target's next
+   **CQ**, which a station answering *you* won't send. Resume instead commits the
+   contact at once, deriving your role and the next message from the clicked
+   line's content (the same content-driven logic as §3), and answers in the
+   opposite slot. A plain CQ is still action 2, not a resume.
+
 Everything after that — slot timing, message selection, advancing the exchange,
 logging — is automatic. The outgoing-message text box at the bottom of the panel
 is normally pre-filled with the next auto-generated message (the CQ string or
@@ -62,6 +74,7 @@ nudges are rarely needed; this may be revisited.
 |---|---|---|
 | Click empty spectrum + Enter | `outgoing = offset`, `target = None` | `CallCq` |
 | Click a station + Enter | `outgoing = <set on their CQ>`, `target = Some(DecodeRef)` | `Start { target }` |
+| Click a line addressed to us + Enter | `outgoing = their offset`, `target = Some(DecodeRef)` | `Resume { target, message, snr, offset }` |
 | Enter again while armed | — | `Abort` |
 
 The engine reflects progress on `qso/{id}/state` (`QsoState`); the panel renders

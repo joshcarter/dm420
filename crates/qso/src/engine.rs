@@ -169,7 +169,7 @@ impl Engine {
         let mut tx = None;
         let mut log = None;
         match event {
-            Event::Command(cmd) => self.on_command(cmd),
+            Event::Command(cmd) => log = self.on_command(cmd),
             Event::Select(sel) => self.outgoing = sel.outgoing,
             Event::Decode(d) => log = self.on_decode(d),
             Event::Tick { slot } => {
@@ -187,7 +187,10 @@ impl Engine {
 
     // ----------------------------------------------------------------- commands
 
-    fn on_command(&mut self, cmd: QsoCommand) {
+    /// Apply an operator command. Returns a completed-QSO log only for
+    /// [`QsoCommand::Resume`], whose clicked line may itself be a logging trigger
+    /// (their `RR73`); the other commands never log.
+    fn on_command(&mut self, cmd: QsoCommand) -> Option<CompletedQso> {
         match cmd {
             QsoCommand::CallCq => {
                 tracing::info!(offset = ?self.outgoing, "qso engine: calling CQ");
@@ -195,6 +198,7 @@ impl Engine {
                     offset: self.outgoing,
                     tx_parity: None,
                 };
+                None
             }
             QsoCommand::Start { target } => {
                 tracing::info!(
@@ -202,10 +206,18 @@ impl Engine {
                     "qso engine: armed — will answer when the target next calls CQ"
                 );
                 self.state = State::Armed { target };
+                None
             }
+            QsoCommand::Resume {
+                target,
+                message,
+                snr,
+                offset,
+            } => self.resume_from(target, message, snr, offset),
             QsoCommand::Abort => {
                 tracing::info!("qso engine: abort → idle");
                 self.state = State::Idle;
+                None
             }
         }
     }
@@ -344,6 +356,138 @@ impl Engine {
                 None
             }
             _ => None,
+        }
+    }
+
+    /// Pick up a contact mid-stream from a decode the operator clicked, when the
+    /// engine wasn't armed for it — e.g. we armed, the target didn't answer, we
+    /// disarmed to look elsewhere, and *then* it answered our earlier call. Unlike
+    /// [`Self::commit_from_armed`] (which waits for the target's next CQ), this
+    /// commits at once, deriving our role and reply from the clicked line's
+    /// content. Returns a log if that line is itself a logging trigger (their
+    /// `RR73`).
+    ///
+    /// Only a line addressed *to us* resumes a contact: a `Cq` is the armed path
+    /// ([`QsoCommand::Start`]), and free/unaddressed text carries no contact. A
+    /// payload that doesn't fit the current contest mode, or a bare `73` (nothing
+    /// left to send), is ignored.
+    fn resume_from(
+        &mut self,
+        target: DecodeRef,
+        msg: ParsedMessage,
+        snr: i8,
+        offset: OffsetHz,
+    ) -> Option<CompletedQso> {
+        let Some((to, from)) = addressed(&msg) else {
+            tracing::info!("qso engine: resume ignored — not a directed message");
+            return None;
+        };
+        if to != &self.me.call {
+            tracing::info!(?to, "qso engine: resume ignored — not addressed to us");
+            return None;
+        }
+        let from = from.clone();
+        let me_fd = self.me.is_field_day();
+
+        // Infer our role from who is answering whom — the same content→role mapping
+        // the live commit paths use. Standard and Field Day reverse the side that
+        // receives `RR73` (CQ side in FD, answering side in Standard).
+        let role = match (&msg, me_fd) {
+            (
+                ParsedMessage::Exchange {
+                    payload: ExchangePayload::Grid(_) | ExchangePayload::RogerReport(_),
+                    ..
+                },
+                false,
+            )
+            | (
+                ParsedMessage::Exchange {
+                    payload: ExchangePayload::FieldDay { rogered: false, .. },
+                    ..
+                },
+                true,
+            ) => Role::CallingCq,
+            (
+                ParsedMessage::Exchange {
+                    payload: ExchangePayload::Report(_),
+                    ..
+                },
+                false,
+            )
+            | (
+                ParsedMessage::Exchange {
+                    payload: ExchangePayload::FieldDay { rogered: true, .. },
+                    ..
+                },
+                true,
+            ) => Role::Answering,
+            (ParsedMessage::Signoff { kind, .. }, false) if is_roger(*kind) => Role::Answering,
+            (ParsedMessage::Signoff { kind, .. }, true) if is_roger(*kind) => Role::CallingCq,
+            _ => {
+                tracing::info!("qso engine: resume ignored — nothing to send from this line");
+                return None;
+            }
+        };
+
+        tracing::info!(partner = ?from, ?role, "qso engine: resume — picking up mid-contact");
+
+        // A provisional contact; `next`, the logging trigger, and the captured
+        // exchange facts are filled by the same content-driven transitions the live
+        // paths use (the openers inline below, everything else via `advance_active`).
+        // We never saw the earlier overs, so the log can only carry what's on this
+        // line plus our own report — partial, but truthful for a late pick-up.
+        self.state = State::Active(Box::new(Active {
+            role,
+            partner: from.clone(),
+            target: Some(target.clone()),
+            offset,
+            tx_parity: parity_after(target.slot),
+            next: None,
+            finish_after_tx: None,
+            log_on_tx: false,
+            logged: false,
+            step: 0,
+            partner_grid: None,
+            partner_snr: snr,
+            rcvd_report: None,
+            rcvd_fd: None,
+        }));
+
+        match &msg {
+            // Openers — a station answering our CQ. `advance_active` only handles
+            // mid/late exchanges, so seed the reply (and captured fact) here.
+            ParsedMessage::Exchange {
+                payload: ExchangePayload::Grid(grid),
+                ..
+            } => {
+                let reply = message::report(&self.me, &from, snr);
+                if let State::Active(a) = &mut self.state {
+                    a.partner_grid = Some(grid.clone());
+                    a.next = Some(reply);
+                    a.step = 1;
+                }
+                None
+            }
+            ParsedMessage::Exchange {
+                payload:
+                    ExchangePayload::FieldDay {
+                        class,
+                        section,
+                        rogered: false,
+                    },
+                ..
+            } => {
+                let reply = message::fd_roger_exchange(&self.me, &from);
+                if let State::Active(a) = &mut self.state {
+                    a.rcvd_fd = Some((class.clone(), section.clone()));
+                    a.next = Some(reply);
+                    a.step = 1;
+                }
+                None
+            }
+            // Report / R-report / sign-off: reuse the in-QSO transition, which sets
+            // `next`, the logging trigger, and returns any log (their `RR73`).
+            _ => self.advance_active(&msg, snr),
         }
     }
 
@@ -944,5 +1088,97 @@ mod tests {
         e.step(Event::Decode(decode(cq_from(HIM, false), 4, -5))); // TX parity = odd
         assert_eq!(tx_text(&mut e, 6), None, "even slot is not ours");
         assert!(tx_text(&mut e, 7).is_some(), "odd slot is ours");
+    }
+
+    /// A `Resume` command carrying the line the operator clicked, heard in `slot`
+    /// at `snr` dB (our report of them).
+    fn resume_cmd(msg: ParsedMessage, slot: u64, snr: i8) -> QsoCommand {
+        QsoCommand::Resume {
+            target: DecodeRef {
+                radio: RadioId("rig0".into()),
+                slot: SlotId(slot),
+                call: Some(call(HIM)),
+            },
+            message: msg,
+            snr,
+            offset: OffsetHz(1200.0),
+        }
+    }
+
+    #[test]
+    fn resume_standard_from_report_to_us() {
+        // The reported scenario: we armed, disarmed, and *then* the station
+        // answered our earlier grid. Clicking its report picks the contact up.
+        let mut e = engine(ContestProfile::Standard);
+        let s = e.step(Event::Command(resume_cmd(
+            exch(ME, HIM, ExchangePayload::Report(-12)),
+            6,
+            -5,
+        )));
+        assert!(matches!(s.state.phase, QsoPhase::InExchange { .. }));
+        assert_eq!(s.state.partner, Some(call(HIM)));
+        // Report heard in slot 6 (even) → we roger in the odd slot.
+        assert_eq!(tx_text(&mut e, 7).as_deref(), Some("K1ABC W9XYZ R-05"));
+        // From here the normal answering flow takes over (their RR73 logs).
+        let s = e.step(Event::Decode(decode(signoff(ME, HIM, Signoff::Rr73), 8, -5)));
+        let log = s.log.expect("log on RR73 received");
+        assert_eq!(log.call, call(HIM));
+        assert_eq!(log.exchange_sent, "-05");
+        assert_eq!(log.exchange_rcvd, "-12");
+        assert_eq!(tx_text(&mut e, 9).as_deref(), Some("K1ABC W9XYZ 73"));
+        assert_eq!(e.state().phase, QsoPhase::Idle);
+    }
+
+    #[test]
+    fn resume_standard_from_grid_to_us() {
+        // They answered our (earlier) CQ with a grid while we sat idle.
+        let mut e = engine(ContestProfile::Standard);
+        e.step(Event::Command(resume_cmd(
+            exch(ME, HIM, ExchangePayload::Grid(GridSquare("FN42".into()))),
+            3,
+            -8,
+        )));
+        // Grid in slot 3 (odd) → we report in the even slot.
+        assert_eq!(tx_text(&mut e, 4).as_deref(), Some("K1ABC W9XYZ -08"));
+    }
+
+    #[test]
+    fn resume_field_day_from_roger_exchange() {
+        let mut e = engine(ContestProfile::ArrlFieldDay);
+        e.step(Event::Command(resume_cmd(
+            exch(
+                ME,
+                HIM,
+                ExchangePayload::FieldDay {
+                    class: "2B".into(),
+                    section: Section("IL".into()),
+                    rogered: true,
+                },
+            ),
+            6,
+            -5,
+        )));
+        // Their R+exchange → we send RR73, logging on send (FD answering side).
+        let s = e.step(Event::Tick { slot: SlotId(7) });
+        assert_eq!(s.tx.unwrap().message.text, "K1ABC W9XYZ RR73");
+        let log = s.log.expect("FD answering logs on RR73 sent");
+        assert_eq!(log.exchange_sent, "3A WI");
+        assert_eq!(log.exchange_rcvd, "2B IL");
+        assert_eq!(e.state().phase, QsoPhase::Idle);
+    }
+
+    #[test]
+    fn resume_ignores_cq_and_lines_to_others() {
+        let mut e = engine(ContestProfile::Standard);
+        // A CQ is the armed path, not a resume.
+        let s = e.step(Event::Command(resume_cmd(cq_from(HIM, false), 4, -5)));
+        assert_eq!(s.state.phase, QsoPhase::Idle);
+        // A line answering someone else isn't ours to pick up.
+        let s = e.step(Event::Command(resume_cmd(
+            exch("N0ONE", HIM, ExchangePayload::Report(-3)),
+            4,
+            -5,
+        )));
+        assert_eq!(s.state.phase, QsoPhase::Idle);
     }
 }

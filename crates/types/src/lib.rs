@@ -355,7 +355,21 @@ pub struct DecodeRef {
 /// `qso/{id}/command` (Command) — to the QSO engine.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum QsoCommand {
+    /// Arm to a target the DM420 way: receive-only until it next calls CQ, then
+    /// answer (`docs/qso_flow.md` §4).
     Start { target: DecodeRef },
+    /// Pick up a contact *mid-stream* from a decode addressed to us
+    /// (`<my call> <their call> …`) — the operator clicked a line that answers a
+    /// call we'd already disarmed from. Unlike [`QsoCommand::Start`], the engine
+    /// commits at once, deriving our role and the reply from `message` rather than
+    /// waiting for a CQ that won't come. `snr` is our report of them and `offset`
+    /// the audio offset to answer on; both come from the clicked decode.
+    Resume {
+        target: DecodeRef,
+        message: ParsedMessage,
+        snr: i8,
+        offset: OffsetHz,
+    },
     CallCq,
     Abort,
 }
@@ -894,6 +908,20 @@ mod tests {
                 slot: SlotId(42),
                 call: None,
             },
+        });
+        round_trip(QsoCommand::Resume {
+            target: DecodeRef {
+                radio: RadioId("k1".into()),
+                slot: SlotId(7),
+                call: Some(Callsign("K1ABC".into())),
+            },
+            message: ParsedMessage::Exchange {
+                to: Callsign("N0JDC".into()),
+                from: Callsign("K1ABC".into()),
+                payload: ExchangePayload::Report(-12),
+            },
+            snr: -5,
+            offset: OffsetHz(1200.0),
         });
         round_trip(QsoCommand::CallCq);
         round_trip(QsoCommand::Abort);

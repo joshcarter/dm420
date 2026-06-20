@@ -514,6 +514,33 @@ impl BusView {
         self.send_qso_command(QsoCommand::Start { target });
     }
 
+    /// Pick up a contact mid-stream from a decode addressed to us: the operator
+    /// clicked a `<my call> <their call> …` line answering a call we'd already
+    /// disarmed from. Commits the engine at once (vs [`Self::answer_station`],
+    /// which arms and waits for a CQ). `message`/`snr` come from the clicked
+    /// decode; `slot` is the slot it landed in (for TX parity).
+    pub fn resume_qso(
+        &self,
+        offset_hz: f32,
+        call: String,
+        slot: SlotId,
+        message: ParsedMessage,
+        snr: i8,
+    ) {
+        let target = DecodeRef {
+            radio: mocks::radio_id(),
+            slot,
+            call: Some(Callsign(call)),
+        };
+        self.publish_selection(offset_hz, Some(target.clone()));
+        self.send_qso_command(QsoCommand::Resume {
+            target,
+            message,
+            snr,
+            offset: OffsetHz(offset_hz),
+        });
+    }
+
     /// Disarm / stop the engine (the single Stop control).
     pub fn abort_qso(&self) {
         self.send_qso_command(QsoCommand::Abort);
