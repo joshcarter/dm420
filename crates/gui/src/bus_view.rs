@@ -76,6 +76,14 @@ pub struct MapSpot {
     /// `true` if the most recent sighting was a CQ call (heard spots only) — the
     /// map marks these with a triangle so the operator can spot answerable callers.
     pub cq: bool,
+    /// Absolute frequency (dial + audio offset, Hz) we last saw this station at —
+    /// captured at hearing time so the operator can click the map marker to tune to
+    /// it, compensating for any dial change since. `None` for worked-only spots (the
+    /// log stores no offset) or heard spots caught before the rig state was known.
+    pub abs: Option<AbsHz>,
+    /// The slot the last sighting landed in, for building a `DecodeRef` when the
+    /// marker is clicked. `None` when unknown (worked-only spots).
+    pub slot: Option<SlotId>,
 }
 
 /// A station heard with a placeable grid: the grid we placed it from, the
@@ -86,6 +94,11 @@ struct HeardEntry {
     last_ms: i64,
     band: Option<Band>,
     cq: bool,
+    /// Absolute frequency (dial + audio offset, Hz) at hearing time, if the rig
+    /// state was known. Lets the Contacts map tune to this station on a click.
+    abs: Option<AbsHz>,
+    /// The slot this sighting landed in, for the `DecodeRef` built on a map click.
+    slot: SlotId,
 }
 
 /// The GUI-facing view of live bus state. Cheap to construct once at startup and
@@ -341,6 +354,8 @@ impl BusView {
                     worked: true,
                     band: Some(e.band),
                     cq: false,
+                    abs: None,
+                    slot: None,
                 });
             }
         }
@@ -378,6 +393,8 @@ impl BusView {
                 worked: false,
                 band: e.band,
                 cq: e.cq,
+                abs: e.abs,
+                slot: Some(e.slot),
             })
             .collect()
     }
@@ -723,13 +740,17 @@ fn pump_heard(
                 Ok(d) => {
                     if let Some((call, grid, cq)) = station_grid(&d) {
                         let t = d.t.0;
-                        // The band the rig is parked on now — the band this station
-                        // was heard on. `None` if the rig state isn't known yet.
-                        let band = rig
-                            .lock()
-                            .unwrap()
-                            .as_ref()
-                            .and_then(|r| crate::panels::waterfall::band_for_hz(r.vfo.0));
+                        // The rig's current dial — gives both the band this station
+                        // was heard on and the absolute frequency we saw it at
+                        // (dial + audio offset). `None` if the rig state isn't known.
+                        let vfo = rig.lock().unwrap().as_ref().map(|r| r.vfo.0);
+                        let band = vfo.and_then(crate::panels::waterfall::band_for_hz);
+                        let abs = vfo.map(|v| AbsHz(v + d.offset.0.round().max(0.0) as u64));
+                        // The slot this decode landed in (for a click-built DecodeRef).
+                        let slot = match &d.content {
+                            DecodeContent::Slotted { slot, .. } => *slot,
+                            _ => SlotId(0),
+                        };
                         let mut m = heard.lock().unwrap();
                         // Keep the newest sighting per call.
                         let newer = m.get(&call).is_none_or(|e| t >= e.last_ms);
@@ -741,6 +762,8 @@ fn pump_heard(
                                     last_ms: t,
                                     band,
                                     cq,
+                                    abs,
+                                    slot,
                                 },
                             );
                             drop(m);

@@ -10,6 +10,21 @@ use egui::{Rect, TextureHandle};
 use crate::bus_view::BusView;
 use crate::theme::Palette;
 
+/// A station picked on the Contacts map, handed back to the Waterfall panel so it
+/// mirrors the selection (highlight the lane, prime the send row, drive the map
+/// crosshair). The map performs the offset move / retune itself via the bus; this
+/// only carries the *display* selection so the Digital panel reflects the pick.
+pub struct MapPick {
+    /// The clicked station's callsign.
+    pub call: String,
+    /// The slot its last sighting landed in (`SlotId(0)` when unknown), for the
+    /// `DecodeRef` the Waterfall builds when the operator arms with Enter.
+    pub slot: types::SlotId,
+    /// The TX audio offset to snap to, when the map resolved one. `None` leaves the
+    /// Waterfall's current offset untouched (a select-only pick with no known freq).
+    pub offset: Option<f32>,
+}
+
 mod band_scan;
 mod contacts;
 mod log_book;
@@ -51,6 +66,10 @@ pub struct PanelCtx<'a> {
     /// selection; the Contacts map reads it to crosshair that station's location.
     /// `None` when nothing (or a bare spectrum offset) is selected.
     pub selected_station: &'a mut Option<String>,
+    /// Reverse selection channel: the Contacts map writes a [`MapPick`] when a
+    /// station marker is clicked; the Waterfall panel consumes it next frame to
+    /// mirror the selection into its own state. `None` most frames.
+    pub map_pick: &'a mut Option<MapPick>,
 }
 
 /// A drawable instrument. Implementers own their view state and render into the

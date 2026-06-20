@@ -16,11 +16,11 @@ use egui::{
     Align2, Color32, CornerRadius, Mesh, Pos2, Rect, Shape, Stroke, StrokeKind, TextureHandle, Vec2,
 };
 
-use types::Band;
+use types::{Band, SlotId};
 
-use super::{Panel, PanelCtx};
+use super::{MapPick, Panel, PanelCtx};
 use crate::bus_view::MapSpot;
-use crate::chrome::{measure, panel_header, segmented_select};
+use crate::chrome::{key_cell_accent, lcd_panel, measure, panel_header, segmented_select};
 use crate::geo_data;
 use crate::panel_data as pd;
 use crate::theme::*;
@@ -30,6 +30,17 @@ use crate::theme::*;
 const MAP_BANDS: [Band; 4] = [Band::B40m, Band::B20m, Band::B15m, Band::B10m];
 const MAP_BAND_LABELS: [&str; 4] = ["40", "20", "15", "10"];
 
+/// Show station call-sign labels only when the visible span is at most this many
+/// degrees of longitude; at wider zoom only markers draw, to avoid a label mat.
+/// Aligned with the auto-fit minimum span (~80° lon) so the default regional view
+/// keeps labels and only a zoomed-out / DX view drops them.
+const LABEL_DEG: f32 = 80.0;
+/// Scroll/touchpad zoom sensitivity: the scroll delta is divided by this in the
+/// `2^x` zoom factor (larger = gentler).
+const ZOOM_SCROLL_DIV: f32 = 300.0;
+/// Click tolerance (px) for landing on a station marker.
+const HIT_RADIUS: f32 = 10.0;
+
 pub struct Contacts {
     /// Footer toggles: `[0]` recent-only (last 24 h) vs. all logged entries;
     /// `[1]` include heard-but-unworked stations. Per `docs/map_panel.md`.
@@ -38,6 +49,13 @@ pub struct Contacts {
     /// per-band "worked" rule holds (a call worked on another band still reads as
     /// unworked here). Chosen via the header band switcher.
     band: Band,
+    /// Manual pan/zoom override. `None` = auto-fit the plotted spots (the default,
+    /// `docs/map_panel.md`); `Some` = the operator has dragged/zoomed and now drives
+    /// the view. The footer RESET button clears it back to `None`.
+    view: Option<MapView>,
+    /// The waterslide selection seen last frame, so a *change* of selection can snap
+    /// the view back to auto-fit when the newly-selected station is off-screen.
+    last_selected: Option<String>,
 }
 
 impl Contacts {
@@ -45,8 +63,158 @@ impl Contacts {
         Self {
             toggles: [true, true], // recent-only + show unworked
             band: Band::B20m,
+            view: None,
+            last_selected: None,
         }
     }
+}
+
+/// A manual pan/zoom override of the map view. Held by [`Contacts`]; absence means
+/// auto-fit. `center` is in world (SVG) units, `scale` is pixels per world unit.
+#[derive(Clone, Copy)]
+struct MapView {
+    center: Vec2,
+    scale: f32,
+}
+
+/// A resolved projection for one frame: the content rect plus the world-unit centre
+/// and pixels-per-world-unit currently on screen. Converts world↔screen for drawing
+/// and click hit-testing. Built by [`resolve_projection`] from the auto-fit bounds
+/// or a [`MapView`] override.
+struct Projection {
+    content: Rect,
+    cx: f32,
+    cy: f32,
+    scale: f32,
+}
+
+impl Projection {
+    /// World (SVG) units → screen pixels.
+    fn world(&self, w: Vec2) -> Pos2 {
+        Pos2::new(
+            self.content.center().x + (w.x - self.cx) * self.scale,
+            self.content.center().y + (w.y - self.cy) * self.scale,
+        )
+    }
+    /// Lon/lat → screen pixels (through the plate-carrée world projection).
+    fn lonlat(&self, lon: f32, lat: f32) -> Pos2 {
+        self.world(Vec2::new(pd::map_x(lon), pd::map_y(lat)))
+    }
+    /// Screen pixels → world (SVG) units — the inverse of [`Self::world`].
+    fn to_world(&self, p: Pos2) -> Vec2 {
+        Vec2::new(
+            self.cx + (p.x - self.content.center().x) / self.scale,
+            self.cy + (p.y - self.content.center().y) / self.scale,
+        )
+    }
+    /// Visible longitude span in degrees — drives the label-visibility threshold.
+    fn visible_lon_deg(&self) -> f32 {
+        self.content.width() / self.scale / pd::S
+    }
+}
+
+/// The map's content area inside its recessed screen (SVG padding t6 r8 b4 l8).
+fn map_content(screen: Rect) -> Rect {
+    Rect::from_min_max(
+        Pos2::new(screen.left() + 8.0, screen.top() + 6.0),
+        Pos2::new(screen.right() - 8.0, screen.bottom() - 4.0),
+    )
+}
+
+/// Resolve the projection for this frame: a [`MapView`] override when the operator
+/// has panned/zoomed, otherwise the auto-fit box over every plotted spot plus home
+/// (with a minimum span so a sparse map settles on a regional view instead of
+/// collapsing onto a point — see the inline note).
+fn resolve_projection(
+    screen: Rect,
+    spots: &[MapSpot],
+    home_ll: (f32, f32),
+    view: Option<MapView>,
+) -> Projection {
+    let content = map_content(screen);
+    if let Some(v) = view {
+        return Projection {
+            content,
+            cx: v.center.x,
+            cy: v.center.y,
+            scale: v.scale,
+        };
+    }
+    let mut pts: Vec<Vec2> = spots
+        .iter()
+        .filter_map(|s| pd::station_lonlat(&s.call, &s.grid))
+        .map(|(lon, lat)| Vec2::new(pd::map_x(lon), pd::map_y(lat)))
+        .collect();
+    pts.push(Vec2::new(pd::map_x(home_ll.0), pd::map_y(home_ll.1)));
+    let (mut minx, mut miny, mut maxx, mut maxy) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for v in &pts {
+        minx = minx.min(v.x);
+        miny = miny.min(v.y);
+        maxx = maxx.max(v.x);
+        maxy = maxy.max(v.y);
+    }
+    // Pad ~8%, then enforce a minimum span so a sparse map — e.g. just the home
+    // marker before any spots arrive — settles on a regional view instead of
+    // collapsing onto a single point. Without this floor `scale` runs away and the
+    // scale-derived graticule font requests a multi-thousand-pixel glyph that
+    // overflows the font atlas and aborts the app.
+    const MIN_SPAN_X: f32 = 400.0; // ~80° lon (the projection is 5 world units/°)
+    const MIN_SPAN_Y: f32 = 240.0; // ~48° lat
+    let (bcx, bcy) = ((minx + maxx) * 0.5, (miny + maxy) * 0.5);
+    let half_x = ((maxx - minx) * 0.54).max(MIN_SPAN_X * 0.5); // 0.54 = ½ span + 8% pad
+    let half_y = ((maxy - miny) * 0.54).max(MIN_SPAN_Y * 0.5);
+    let scale = (content.width() / (2.0 * half_x)).min(content.height() / (2.0 * half_y));
+    Projection {
+        content,
+        cx: bcx,
+        cy: bcy,
+        scale,
+    }
+}
+
+/// Keep the panned centre inside the world bounds so the map can't drift into empty
+/// space.
+fn clamp_center(mut v: MapView) -> MapView {
+    v.center.x = v.center.x.clamp(0.0, pd::MAP_W);
+    v.center.y = v.center.y.clamp(0.0, pd::MAP_H);
+    v
+}
+
+/// Resolve a click on a station marker into a tune + prime action: snap our TX
+/// offset onto the station when it sits in the usable passband, otherwise retune the
+/// dial to centre it at 1500 Hz; either way prime the selection so Enter answers it.
+fn pick_station(ctx: &mut PanelCtx, spot: &MapSpot) {
+    let slot = spot.slot.unwrap_or(SlotId(0));
+    let cur_vfo = ctx.bus.rig_state().map(|r| r.vfo.0);
+    // Audio-offset window we'll snap onto rather than retune. Conservative: keep the
+    // station comfortably mid-passband (away from the filter edges) for best decode.
+    const SNAP_LO: i64 = 300;
+    const SNAP_HI: i64 = 2500;
+    let offset = match (spot.abs, cur_vfo) {
+        (Some(abs), Some(vfo)) => {
+            let candidate = abs.0 as i64 - vfo as i64;
+            if (SNAP_LO..=SNAP_HI).contains(&candidate) {
+                Some(candidate as f32)
+            } else {
+                // Too far from our dial to reach in the passband — retune so the
+                // station lands at 1500 Hz audio and transmit there.
+                let new_dial = (abs.0 as i64 - 1500).max(0) as u64;
+                ctx.bus.set_freq(new_dial);
+                Some(1500.0)
+            }
+        }
+        // No known frequency (worked-only spot) — select by call without moving the
+        // offset; Enter still arms to it (the engine matches on call).
+        _ => None,
+    };
+    *ctx.map_pick = Some(MapPick {
+        call: spot.call.clone(),
+        slot,
+        offset,
+    });
+    // Crosshair it this frame; the Waterfall mirrors the pick into its own selection
+    // next frame (and re-publishes the same callsign here).
+    *ctx.selected_station = Some(spot.call.clone());
 }
 
 impl Panel for Contacts {
@@ -142,15 +310,99 @@ impl Panel for Contacts {
             Pos2::new(block.right(), footer.top() - pd::GAP),
         );
         recessed_screen(painter, screen, pal);
+
+        // Resolve the projection currently on screen (auto-fit, or the manual view
+        // if the operator has panned/zoomed), for hit-testing this frame's input.
+        let proj = resolve_projection(screen, &spots, home, self.view);
+
+        // Digital → map: when the waterslide selection *changes* to a station off the
+        // current panned/zoomed view, snap back to auto-fit so its crosshair shows
+        // (`docs/map_panel.md` — the selection always reads on the map). Gated on the
+        // change so a later pan-away doesn't fight the operator.
+        let selected_now = ctx.selected_station.clone();
+        if selected_now != self.last_selected
+            && let Some(call) = &selected_now
+        {
+            let on_view = spots
+                .iter()
+                .find(|s| s.call.eq_ignore_ascii_case(call))
+                .and_then(|s| pd::station_lonlat(&s.call, &s.grid))
+                .map(|(lon, lat)| proj.content.contains(proj.lonlat(lon, lat)));
+            if on_view == Some(false) {
+                self.view = None;
+            }
+        }
+        self.last_selected = selected_now;
+
+        // Map interaction: drag to pan, scroll/pinch to zoom about the cursor, click
+        // a marker to tune to that station.
+        let resp = ctx.ui.interact(
+            screen,
+            ctx.ui.id().with("map_interact"),
+            egui::Sense::click_and_drag(),
+        );
+        if resp.dragged() {
+            let d = resp.drag_delta();
+            if d != Vec2::ZERO {
+                let mut v = self.view.unwrap_or(MapView {
+                    center: Vec2::new(proj.cx, proj.cy),
+                    scale: proj.scale,
+                });
+                v.center -= d / v.scale; // drag follows the map under the cursor
+                self.view = Some(clamp_center(v));
+            }
+        }
+        if resp.hovered() {
+            let (scroll_y, pinch) = ctx.ui.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta()));
+            let factor = pinch * 2f32.powf(scroll_y / ZOOM_SCROLL_DIV);
+            if (factor - 1.0).abs() > 1e-3 {
+                let min_scale = proj.content.width() / pd::MAP_W; // whole world fits
+                let max_scale = proj.content.width() / 10.0; // ~2° lon span
+                let cursor = resp.hover_pos().unwrap_or(proj.content.center());
+                let w = proj.to_world(cursor);
+                let mut v = self.view.unwrap_or(MapView {
+                    center: Vec2::new(proj.cx, proj.cy),
+                    scale: proj.scale,
+                });
+                let new_scale = (v.scale * factor).clamp(min_scale, max_scale);
+                let applied = new_scale / v.scale;
+                // Hold the world point under the cursor fixed while zooming.
+                v.center = w - (w - v.center) / applied;
+                v.scale = new_scale;
+                self.view = Some(clamp_center(v));
+            }
+        }
+        if resp.clicked()
+            && let Some(pos) = resp.interact_pointer_pos()
+        {
+            let hit = spots
+                .iter()
+                .filter_map(|s| {
+                    pd::station_lonlat(&s.call, &s.grid)
+                        .map(|(lon, lat)| (s, proj.lonlat(lon, lat).distance(pos)))
+                })
+                .filter(|(_, d)| *d <= HIT_RADIUS)
+                .min_by(|a, b| a.1.total_cmp(&b.1));
+            if let Some((spot, _)) = hit {
+                pick_station(ctx, spot);
+            }
+        }
+
+        // Re-resolve after any pan/zoom/reset, then draw. Call-sign labels appear
+        // only when zoomed in enough to be legible (markers always draw).
+        let proj = resolve_projection(screen, &spots, home, self.view);
+        let show_labels = proj.visible_lon_deg() <= LABEL_DEG;
         draw_map(
             painter,
             screen,
             pal,
             ctx.relief,
+            &proj,
             &spots,
             now,
             home,
             ctx.selected_station.as_deref(),
+            show_labels,
         );
         self.draw_footer(ctx.ui, painter, footer, pal);
     }
@@ -202,28 +454,34 @@ impl Contacts {
             x = tx + measure(painter, &label, heading(8.5)) + 18.0;
         }
 
-        // SNR bar-graph (right).
-        let heights = [5.0, 8.0, 11.0, 14.0, 9.0, 5.0];
-        let mut bx = rect.right() - 70.0;
-        let base = cy + 7.0;
-        for (j, h) in heights.iter().enumerate() {
-            let on = j < 4;
-            let bar = Rect::from_min_max(Pos2::new(bx, base - h), Pos2::new(bx + 3.0, base));
-            let col = if on {
-                pal.accent
-            } else {
-                pal.sub.gamma_multiply(0.45)
-            };
-            painter.rect_filled(bar, CornerRadius::ZERO, col);
-            bx += 5.0;
-        }
-        painter.text(
-            Pos2::new(bx + 4.0, cy),
-            Align2::LEFT_CENTER,
-            "SNR",
-            mono(7.5),
-            pal.sub,
+        // RESET button (bottom-right): clear any manual pan/zoom back to auto-fit
+        // bounds. Styled as a lit key (lcd track + key cell) to match the Send key
+        // and band switcher; lit in the accent while a manual view is active.
+        let _ = x; // toggles set the left cluster; the button is right-anchored.
+        let reset_on = self.view.is_some();
+        let cell_w = measure(painter, &tracked("RESET"), heading_bold(9.0)) + 22.0;
+        let track = Rect::from_min_max(
+            Pos2::new(rect.right() - 8.0 - (cell_w + 4.0), cy - 11.0),
+            Pos2::new(rect.right() - 8.0, cy + 11.0),
         );
+        lcd_panel(painter, track, pal, 4);
+        let cell = Rect::from_min_max(
+            Pos2::new(track.left() + 2.0, track.top() + 2.0),
+            Pos2::new(track.right() - 2.0, track.bottom() - 2.0),
+        );
+        let reset = key_cell_accent(
+            ui,
+            painter,
+            pal,
+            cell,
+            "RESET",
+            reset_on,
+            pal.accent,
+            ui.id().with("map_reset"),
+        );
+        if reset.clicked() {
+            self.view = None;
+        }
     }
 }
 
@@ -296,69 +554,38 @@ fn draw_map(
     screen: Rect,
     pal: &Palette,
     relief: &TextureHandle,
+    // The resolved view for this frame (auto-fit or the manual pan/zoom override),
+    // built by `resolve_projection`. Owns the world↔screen mapping.
+    projection: &Projection,
     // Worked (plus) and heard-but-unworked (hollow circle / filled CQ disc) stations
     // in one list; the `worked`/`cq` flags pick the marker shape. Worked markers are
     // drawn last so they paint over the heard ones.
     spots: &[MapSpot],
     // Wall-clock now (ms since epoch) — the reference for dimming heard markers.
     now_ms: i64,
-    // The operator's home location as `(lon, lat)` — a plotted bounds point and
-    // the centre of the range rings.
+    // The operator's home location as `(lon, lat)` — the centre of the range rings
+    // and the QTH marker.
     home_ll: (f32, f32),
     // The callsign selected in the waterslide, if any. When it matches a plotted
     // spot, a full-screen crosshair marks that station's location on the map.
     selected: Option<&str>,
+    // Whether to draw station call-sign labels (hidden at wide zoom for legibility).
+    show_labels: bool,
 ) {
     if screen.width() < 24.0 || screen.height() < 24.0 {
         return;
     }
-    // SVG content area: padding t6 r8 b4 l8.
-    let content = Rect::from_min_max(
-        Pos2::new(screen.left() + 8.0, screen.top() + 6.0),
-        Pos2::new(screen.right() - 8.0, screen.bottom() - 4.0),
-    );
-
-    // Dynamic bounds: fit the box (in world/SVG units) spanning every plotted
-    // station plus home. Home is included but not centered, so it lands wherever
-    // the worked cluster puts it (e.g. contacts to the west → home biased right).
-    let mut pts: Vec<Vec2> = spots
-        .iter()
-        .filter_map(|s| pd::station_lonlat(&s.call, &s.grid))
-        .map(|(lon, lat)| Vec2::new(pd::map_x(lon), pd::map_y(lat)))
-        .collect();
-    pts.push(Vec2::new(pd::map_x(home_ll.0), pd::map_y(home_ll.1)));
-    let (mut minx, mut miny, mut maxx, mut maxy) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
-    for v in &pts {
-        minx = minx.min(v.x);
-        miny = miny.min(v.y);
-        maxx = maxx.max(v.x);
-        maxy = maxy.max(v.y);
-    }
-    // Pad ~8%, then enforce a minimum span so a sparse map — e.g. just the home
-    // marker before any spots arrive (real mode starts with an empty log + heard
-    // set) — settles on a regional view instead of collapsing onto a single point.
-    // Without this floor `scale` runs away and the scale-derived graticule font
-    // (`font(4.6)` below) requests a multi-thousand-pixel glyph that overflows the
-    // font atlas and aborts the app.
-    const MIN_SPAN_X: f32 = 400.0; // ~80° lon (the projection is 5 world units/°)
-    const MIN_SPAN_Y: f32 = 240.0; // ~48° lat
-    let (bcx, bcy) = ((minx + maxx) * 0.5, (miny + maxy) * 0.5);
-    let half_x = ((maxx - minx) * 0.54).max(MIN_SPAN_X * 0.5); // 0.54 = ½ span + 8% pad
-    let half_y = ((maxy - miny) * 0.54).max(MIN_SPAN_Y * 0.5);
-    minx = bcx - half_x;
-    maxx = bcx + half_x;
-    miny = bcy - half_y;
-    maxy = bcy + half_y;
-    let scale = (content.width() / (maxx - minx)).min(content.height() / (maxy - miny));
-    let p = |sx: f32, sy: f32| {
-        Pos2::new(
-            content.center().x + (sx - bcx) * scale,
-            content.center().y + (sy - bcy) * scale,
-        )
-    };
-    let proj = |lon: f32, lat: f32| p(pd::map_x(lon), pd::map_y(lat));
+    let content = projection.content;
+    let scale = projection.scale;
+    // Local projection closures so the drawing body below reads unchanged: `p` maps
+    // world (SVG) units → px, `proj` maps lon/lat → px.
+    let p = |sx: f32, sy: f32| projection.world(Vec2::new(sx, sy));
+    let proj = |lon: f32, lat: f32| projection.lonlat(lon, lat);
     let sl = |v: f32| v * scale; // svg length -> px
-    let font = |sz: f32| mono(sz * scale);
+    // Clamp the scale-derived font px so a deep manual zoom can't request a giant
+    // glyph that overflows the font atlas and aborts the app (manual zoom bypasses
+    // the auto-fit span floor that otherwise bounds `scale`).
+    let font = |sz: f32| mono((sz * scale).clamp(5.0, 15.0));
 
     let map_painter = painter.with_clip_rect(screen.shrink(2.0));
     let painter = &map_painter;
@@ -414,7 +641,7 @@ fn draw_map(
     stroke_rings(
         &land_pos,
         geo_data::LAND_RINGS,
-        Stroke::new(sl(0.5).max(0.6), pal.map_coast),
+        Stroke::new(sl(0.5).clamp(0.6, 1.4), pal.map_coast),
     );
 
     // Lakes: translucent dark fill punches the land back down to water tone.
@@ -436,7 +663,7 @@ fn draw_map(
     stroke_rings(
         &lake_pos,
         geo_data::LAKES_RINGS,
-        Stroke::new(sl(0.4).max(0.5), pal.map_coast.gamma_multiply(0.7)),
+        Stroke::new(sl(0.4).clamp(0.5, 1.2), pal.map_coast.gamma_multiply(0.7)),
     );
 
     // 2) graticule
@@ -468,9 +695,9 @@ fn draw_map(
         dashed_polyline(
             painter,
             &pts,
-            Stroke::new(sl(0.45).max(0.6), pal.accent.gamma_multiply(0.32)),
-            sl(2.0),
-            sl(2.5),
+            Stroke::new(sl(0.45).clamp(0.6, 1.4), pal.accent.gamma_multiply(0.32)),
+            sl(2.0).clamp(3.0, 9.0),
+            sl(2.5).clamp(3.5, 11.0),
         );
     }
 
@@ -507,7 +734,7 @@ fn draw_map(
     //   • worked (in the log)  → plus sign
     let spot_r = sl(3.4).clamp(3.2, 5.4);
     let stroke_w = (spot_r * 0.42).clamp(1.3, 2.0);
-    let label_font = mono(sl(4.8).clamp(5.0, 8.0));
+    let label_font = mono(sl(6.4).clamp(7.0, 10.0));
     let plot = |call: &str, lon: f32, lat: f32, kind: Marker, color: Color32, label: Color32| {
         let pos = proj(lon, lat);
         let stroke = Stroke::new(stroke_w, color);
@@ -545,7 +772,10 @@ fn draw_map(
         } else {
             Align2::LEFT_BOTTOM
         };
-        painter.text(pos + off, align, call, label_font.clone(), label);
+        // Labels only when zoomed in enough to read them; markers always draw.
+        if show_labels {
+            painter.text(pos + off, align, call, label_font.clone(), label);
+        }
     };
 
     // Heard-but-unworked first, then worked, so worked markers paint on top. Heard

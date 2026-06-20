@@ -382,6 +382,17 @@ impl Panel for Waterfall {
     }
 
     fn ui(&mut self, ctx: &mut PanelCtx, block: Rect) {
+        // A station clicked on the Contacts map last frame: mirror it into our own
+        // selection so the lane highlights, the send row primes, and the map
+        // crosshair follows. The map already moved the offset / retuned via the bus;
+        // we only adopt the display selection here (no re-arm — Enter still arms).
+        if let Some(pick) = ctx.map_pick.take() {
+            self.real_sel.target = Some((pick.call, pick.slot));
+            if let Some(off) = pick.offset {
+                self.real_sel.offset = off;
+            }
+        }
+
         let painter = ctx.painter;
         let pal = ctx.pal;
 
