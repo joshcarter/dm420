@@ -522,6 +522,31 @@ pub fn save_theme_dark(dark: bool) {
     write_config(&path, &text);
 }
 
+/// The saved waterslide split: the `[display] waterslide_wide` key. `true` gives
+/// the decode (text) side 2/3 of the panel and the spectrogram 1/3; `false` (the
+/// default) keeps the centered 1:1 split. Both sides span the same amount of time
+/// either way — see `draw_waterslide`. Defaults to `false` when unset/garbled, so
+/// a fresh config opens centered. Toggled from the unlocked EDIT surface.
+pub fn read_waterslide_wide() -> bool {
+    std::fs::read_to_string(config_path())
+        .ok()
+        .and_then(|t| parse_table_value(&t, "display", "waterslide_wide"))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(false)
+}
+
+/// Persist the waterslide split to `[display] waterslide_wide`, preserving every
+/// other table and comment. Best-effort (called when the operator flips it in the
+/// EDIT surface); errors are logged, not fatal.
+pub fn save_waterslide_wide(wide: bool) {
+    let path = config_path();
+    let existing = std::fs::read_to_string(&path).unwrap_or_else(|_| {
+        "# DM420 config — written from the UI; safe to hand-edit.\n".to_string()
+    });
+    let text = update_toml_table(&existing, "display", &[("waterslide_wide", bool_str(wide))]);
+    write_config(&path, &text);
+}
+
 /// `"true"`/`"false"` for a config bool — the string form `[serial] autodetect`
 /// and `[display] dark` are written/read as.
 fn bool_str(b: bool) -> &'static str {
