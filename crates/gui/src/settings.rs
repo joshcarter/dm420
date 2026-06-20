@@ -31,7 +31,7 @@
 
 use std::path::{Path, PathBuf};
 
-use app_core::{CoreConfig, DecodeSource, LineProfile, Protocol, SerialConfig};
+use app_core::{CoreConfig, DecodeSource, LineProfile, Protocol, SerialConfig, DEFAULT_TX_GAIN};
 
 /// Default rig baud when `DM420_SERIAL_BAUD` is unset or invalid.
 pub(crate) const DEFAULT_BAUD: u32 = 19_200;
@@ -47,7 +47,9 @@ pub(crate) const DEFAULT_LOG_LEVEL: &str = "info";
 
 /// Where DM420's TOML config lives: `$HOME/.dm420/config.toml`, falling back to
 /// `config.toml` in the current directory when there's no home. Holds the
-/// `[station]` and `[audio]` tables and the `[logging] level`. The writers
+/// `[station]` and `[audio]` tables (the latter also carries `tx_gain`, the
+/// linear TX drive level — hand-edited, no env var) and the `[logging] level`.
+/// The writers
 /// (`Station::save`, [`save_audio_config`]) create the parent directory on first
 /// save. The format/persistence is interim and TBD — see `joels-notes.md`.
 pub(crate) fn config_path() -> PathBuf {
@@ -169,6 +171,10 @@ pub struct Settings {
     /// TX audio output device (the rig's data-in); `None` = system default.
     /// Persisted in the config file's `[audio]` table (no env var).
     pub audio_output: Option<String>,
+    /// Linear TX audio gain (`[audio] tx_gain` in the config file; no env var).
+    /// The synth emits at 0 dBFS, so this backs the drive off before the rig —
+    /// see [`DEFAULT_TX_GAIN`]. Clamped to `[0.0, 1.0]` by `core`.
+    pub tx_gain: f32,
 }
 
 impl Settings {
@@ -186,6 +192,7 @@ impl Settings {
             protocol: protocol_from_env(),
             wav: wav_from_env(),
             audio_output: toml_out,
+            tx_gain: read_tx_gain(&config_path()),
         }
     }
 
@@ -227,6 +234,7 @@ impl Settings {
             serial: Some(self.serial.clone()),
             logbook: Some(logbook_path()),
             tx_output: self.audio_output.clone(),
+            tx_gain: self.tx_gain,
         }
     }
 }
@@ -270,6 +278,19 @@ fn read_audio_config(path: &Path) -> (Option<String>, Option<String>) {
         Ok(text) => parse_audio_config(&text),
         Err(_) => (None, None),
     }
+}
+
+/// Read the TX audio gain from the config file's `[audio] tx_gain` key, clamped to
+/// `[0.0, 1.0]`. Falls back to [`DEFAULT_TX_GAIN`] when the file/key is absent or
+/// the value doesn't parse — so a missing or fat-fingered entry can never key the
+/// rig hotter than the safe default.
+fn read_tx_gain(path: &Path) -> f32 {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| parse_float(&text, "audio", "tx_gain"))
+        .filter(|g| g.is_finite())
+        .map(|g| g.clamp(0.0, 1.0))
+        .unwrap_or(DEFAULT_TX_GAIN)
 }
 
 /// Read a single string value from `table`'s `key`. **Not** a full TOML parser —

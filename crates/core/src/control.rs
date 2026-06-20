@@ -89,12 +89,15 @@ impl AudioControl {
 /// it gets its own control).
 pub struct TxControl {
     output: Mutex<Option<String>>,
+    /// Linear TX audio gain, always held in `[0.0, 1.0]` (clamped on write).
+    gain: Mutex<f32>,
 }
 
 impl TxControl {
-    pub(crate) fn new(output: Option<String>) -> Self {
+    pub(crate) fn new(output: Option<String>, gain: f32) -> Self {
         Self {
             output: Mutex::new(output),
+            gain: Mutex::new(gain.clamp(0.0, 1.0)),
         }
     }
 
@@ -103,8 +106,19 @@ impl TxControl {
         *self.output.lock().unwrap() = output;
     }
 
+    /// Replace the TX audio gain (clamped to `[0.0, 1.0]`); picked up on the next
+    /// over. Mirrors [`set`](Self::set) so a future settings UI can trim it live.
+    pub fn set_gain(&self, gain: f32) {
+        *self.gain.lock().unwrap() = gain.clamp(0.0, 1.0);
+    }
+
     pub(crate) fn snapshot(&self) -> Option<String> {
         self.output.lock().unwrap().clone()
+    }
+
+    /// The current TX audio gain (already clamped to `[0.0, 1.0]`).
+    pub(crate) fn gain(&self) -> f32 {
+        *self.gain.lock().unwrap()
     }
 }
 

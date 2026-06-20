@@ -85,7 +85,8 @@ pub fn spawn(bus: &BusHandle, radio: t::RadioId, tx: Arc<crate::control::TxContr
                     }
                 };
             }
-            let (slot, outcome) = transmit(&bus, &radio, out.as_ref(), req, &abort_gen).await;
+                    let gain = tx.gain(); // live-editable TX audio gain, snapshot per over
+            let (slot, outcome) = transmit(&bus, &radio, out.as_ref(), req, gain, &abort_gen).await;
             match &outcome {
                 t::TxOutcome::Sent => tracing::info!(?slot, "audio-tx: over sent"),
                 t::TxOutcome::Failed(e) => tracing::warn!(?slot, error = %e, "audio-tx: over failed"),
@@ -146,6 +147,7 @@ async fn transmit(
     radio: &t::RadioId,
     out: Option<&audio::OutputStream>,
     req: t::TxRequest,
+    gain: f32,
     abort_gen: &AtomicU64,
 ) -> (Option<t::SlotId>, t::TxOutcome) {
     let t::TxRequest::SlottedMessage {
@@ -212,6 +214,16 @@ async fn transmit(
         samples.drain(..lead - TX_LEAD_SAMPLES);
     }
     let synth_ms = t_synth.elapsed().as_millis();
+
+    // Apply the TX audio gain. The synth emits at 0 dBFS; scaling here (after the
+    // silence trim, which keys off the full-scale envelope) backs the level off so
+    // the rig's ALC stays at/under threshold instead of splattering. `gain` is
+    // pre-clamped to [0.0, 1.0] by `TxControl`, so this can only attenuate.
+    if gain != 1.0 {
+        for s in &mut samples {
+            *s *= gain;
+        }
+    }
 
     // Baseline the abort counter before keying up, so only a Stop that lands
     // during *this* over aborts it.

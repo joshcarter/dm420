@@ -143,6 +143,12 @@ impl Default for SerialConfig {
     }
 }
 
+/// Default TX audio gain (linear, applied to the full-scale synth output). The
+/// synth emits at 0 dBFS; `0.5` (−6 dBFS) backs off enough to keep a typical
+/// rig's ALC at/under threshold while leaving plenty of drive. Operators trim
+/// from here with their rig's input-gain control (or the `[audio] tx_gain` key).
+pub const DEFAULT_TX_GAIN: f32 = 0.5;
+
 /// Configuration for [`spawn`].
 pub struct CoreConfig {
     pub radio: RadioId,
@@ -158,6 +164,10 @@ pub struct CoreConfig {
     /// Initial TX audio output device; `None` = system default. Live-editable
     /// afterward via [`CoreControl::tx`].
     pub tx_output: Option<String>,
+    /// Linear gain applied to the synth's full-scale (0 dBFS) output before it
+    /// reaches the rig. Clamped to `[0.0, 1.0]`; see [`DEFAULT_TX_GAIN`].
+    /// Live-editable afterward via [`CoreControl::tx`].
+    pub tx_gain: f32,
 }
 
 impl Default for CoreConfig {
@@ -169,6 +179,7 @@ impl Default for CoreConfig {
             serial: None,
             logbook: None,
             tx_output: None,
+            tx_gain: DEFAULT_TX_GAIN,
         }
     }
 }
@@ -189,6 +200,7 @@ pub fn spawn(bus: &BusHandle, cfg: CoreConfig) -> CoreControl {
         serial,
         logbook,
         tx_output,
+        tx_gain,
     } = cfg;
 
     tracing::info!(
@@ -210,7 +222,7 @@ pub fn spawn(bus: &BusHandle, cfg: CoreConfig) -> CoreControl {
     // TX path: the audio-TX service that synthesizes, keys, and plays. Its output
     // device is live-editable from the UI via `control.tx`. Spawned whenever
     // transmit is permitted (the operator still keys it explicitly, per over).
-    let tx_control = Arc::new(control::TxControl::new(tx_output));
+    let tx_control = Arc::new(control::TxControl::new(tx_output, tx_gain));
     if allow_transmit {
         tx::spawn(bus, radio.clone(), tx_control.clone());
     }
