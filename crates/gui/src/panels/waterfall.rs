@@ -1096,6 +1096,14 @@ fn draw_waterslide(
     // offset (the second pass snaps to `d.offset`), not this visual centre.
     let half_bw = bandwidth_hz * 0.5;
 
+    // Message font + the half-cell gap, computed up here (not just in the draw
+    // pass) so the cull below can measure each line and keep it on screen until
+    // its *text* has fully scrolled off — a decode reads rightward from `x`, so
+    // it stays legible long after its slot anchor passes the left edge.
+    let msg_font = mono(msg_pt);
+    // Half a monospace cell — the breathing room either side of the slot rule.
+    let half_space = 0.5 * measure(&painter, "0", msg_font.clone());
+
     // First pass: gather every on-screen decode with its *true* y (the signal's
     // vertical centre). `final_y` starts equal and is nudged below for legibility;
     // the true y is kept so we can draw a leader back to it when the text bumps.
@@ -1106,8 +1114,13 @@ fn draw_waterslide(
             continue; // a clock skew put it in the (blank) future half
         }
         let x = now_x - age * pps;
-        if x < rect.left() {
-            continue; // scrolled off the left edge
+        // Keep it until the message itself (left-aligned at `x + half_space`,
+        // reading rightward) is wholly past the left edge — not the moment its
+        // slot anchor `x` is, which would blank still-readable text early. The
+        // painter clips the partial line at `rect.left()` as it slides off.
+        let msg_w = measure(&painter, &decode_text(d), msg_font.clone());
+        if x + half_space + msg_w < rect.left() {
+            continue; // fully scrolled off the left edge
         }
         let ty = y_of(d.offset.0 + half_bw);
         placed.push(Placed {
@@ -1151,11 +1164,9 @@ fn draw_waterslide(
     // Second pass: draw. Each message is left-aligned and bumped half a space
     // right of its slot rule so it doesn't crowd it, reading rightward; the
     // signal report sits half a space to the *left* of the rule (its status icon
-    // further left still). Both ride `final_y`.
-    let msg_font = mono(msg_pt);
+    // further left still). Both ride `final_y`. `msg_font`/`half_space` are
+    // computed above (the cull needs them).
     let snr_font = mono(snr_pt);
-    // Half a monospace cell — the breathing room either side of the slot rule.
-    let half_space = 0.5 * measure(&painter, "0", msg_font.clone());
     // Reserved width of the (always 3-char) signal report, so the status icon
     // lands at a fixed column whether or not the decode carries an SNR.
     let snr_field_w = 3.0 * measure(&painter, "0", snr_font.clone());
