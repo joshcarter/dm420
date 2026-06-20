@@ -185,6 +185,7 @@ impl<'a> Behavior<Box<dyn Panel>> for Tactical<'a> {
         });
         if let Some(pos) = press
             && ui.max_rect().contains(pos)
+            && pane.takes_keyboard_focus()
         {
             *self.clicked = Some(id);
         }

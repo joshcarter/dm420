@@ -77,4 +77,12 @@ pub struct PanelCtx<'a> {
 pub trait Panel {
     fn title(&self) -> &str;
     fn ui(&mut self, ctx: &mut PanelCtx, block: Rect);
+
+    /// Whether clicking this pane should make it the keyboard-focused panel.
+    /// Defaults to `true`. Panels that consume only mouse input (e.g. the map,
+    /// which pans/zooms on drag) return `false` so they keep receiving pointer
+    /// events without stealing keyboard focus from the panel that wants it.
+    fn takes_keyboard_focus(&self) -> bool {
+        true
+    }
 }

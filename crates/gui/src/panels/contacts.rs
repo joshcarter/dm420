@@ -222,6 +222,13 @@ impl Panel for Contacts {
         "Contacts"
     }
 
+    /// The map is mouse-only: pan/zoom/click-to-tune all use the pointer, but it
+    /// has nothing to do with typed input. Don't steal keyboard focus from the
+    /// panel that does (the Waterfall/Digital panel).
+    fn takes_keyboard_focus(&self) -> bool {
+        false
+    }
+
     fn ui(&mut self, ctx: &mut PanelCtx, block: Rect) {
         let painter = ctx.painter;
         let pal = ctx.pal;
