@@ -12,3 +12,6 @@ tracing = { workspace = true }
 # Real-input FFT (on rustfft) — the decoder's STFT front-end (see `fft.rs`).
 # SIMD, arbitrary-N, ~10x faster than the hand-rolled FFT it replaced.
 realfft = "3"
+# Complex forward+inverse FFT — the coherent demod path (see `cohere.rs`):
+# baseband downconversion and per-symbol transforms. `realfft` re-exports this.
+rustfft = "6"

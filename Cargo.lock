@@ -2245,6 +2245,7 @@ name = "modes"
 version = "0.1.0"
 dependencies = [
  "realfft",
+ "rustfft",
  "serde",
  "tracing",
 ]
