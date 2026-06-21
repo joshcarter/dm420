@@ -1,6 +1,11 @@
 # Closing the FT8 decode-sensitivity gap
 
-**Status:** plan / not started. **Owner:** TBD. **Metric:** the `ab_jt9` example.
+**Status:** Phase 1 (OSD) done. **Owner:** TBD. **Metric:** the `ab_jt9` example.
+
+> **Progress.** Phase 1 OSD landed (commit `3f14b7d`). Controlled A/B on 24 real
+> busy-band FT8 slots (`DM420_OSD=0` vs default): matched decodes **450 → 471**,
+> gap **52% → 50%**, no rise in false decodes. Modest as expected — OSD is the
+> weak-signal lever; the larger masking bucket is Phase 2.
 
 ## The problem, measured
 
@@ -72,7 +77,13 @@ Two facts shape the work:
 Sequenced for incremental, independently-measurable delivery. **Re-run `ab_jt9`
 after each phase** — the aggregate gap % is the gate.
 
-### Phase 1 — OSD backstop (do first)
+### Phase 1 — OSD backstop ✅ done (commit `3f14b7d`)
+
+Implemented in `modes/src/osd.rs`, wired at `decode_candidate`. Order-1 + order-2
+(pairs among the 20 least-reliable basis bits); best few candidates handed to the
+CRC gate. `DM420_OSD=0` disables it. Result: +21 matched on the 24-slot FT8 set,
+no false-decode increase. Possible later tuning: `OSD_MAX_ERRORS` gate, `LAMBDA`,
+`CRC_TRIES`.
 
 **Why first:** self-contained, ~400–600 lines, *no pipeline refactor*. It bolts
 onto the LLRs `bp_decode` already consumes and the systematic generator we
