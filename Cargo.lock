@@ -784,6 +784,7 @@ dependencies = [
  "rig",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "types",

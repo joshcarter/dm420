@@ -506,6 +506,26 @@ mod tests {
         assert_eq!(over_air(Protocol::Ft4), t::OverAirMode::Ft4);
     }
 
+    /// The `encode_wav` → `decode_wav` CLI loop: synthesize a message to a WAV,
+    /// load it back, and decode it — exercising modes::synth_message + audio WAV
+    /// I/O + the decoder together (FT4 here; the in-memory FT8/FT4 round-trips live
+    /// in the modes crate).
+    #[test]
+    fn encode_to_wav_then_decode_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cq.wav");
+        let samples = modes::synth_message("CQ K1ABC FN42", Protocol::Ft4, 1200.0, DECODE_RATE)
+            .expect("encode");
+        audio::save_wav_mono(&path, &samples, DECODE_RATE).expect("write wav");
+        let (loaded, rate) = audio::load_wav_mono(&path).expect("load wav");
+        let decs = decode(&loaded, rate, Protocol::Ft4);
+        assert!(
+            decs.iter().any(|d| d.message == "CQ K1ABC FN42"),
+            "got {:?}",
+            decs.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
     /// End-to-end over the bundled decoder fixture: load → resample → slot →
     /// decode → build a `Decode`, and confirm the parse seam yields structure.
     #[test]
