@@ -4,3 +4,9 @@
 
 # Runtime log — appended each run (see gui/src/logging.rs).
 /dm420.log
+
+# jt9 byproducts — WSJT-X's jt9 writes these to the cwd when the `ab_jt9`
+# decoder benchmark (crates/modes/examples/ab_jt9.rs) shells out to it.
+/decoded.txt
+/jt9_wisdom.dat
+/timer.out

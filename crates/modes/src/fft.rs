@@ -14,8 +14,40 @@
 
 use std::sync::Arc;
 
-use realfft::num_complex::Complex;
+pub use realfft::num_complex::Complex;
 use realfft::{RealFftPlanner, RealToComplex};
+use rustfft::{Fft as RustFft, FftPlanner};
+
+/// In-place complex forward+inverse FFT (rustfft) for the coherent demod path —
+/// baseband downconversion (one big inverse transform per candidate) and the
+/// 32-point per-symbol transforms. Like [`Fft`], it caches its plan and scratch
+/// so steady-state has no per-call allocation, and the transform is *unnormalized*
+/// (rustfft convention: a forward+inverse round-trip scales by `n`).
+pub struct Cfft {
+    fwd: std::sync::Arc<dyn RustFft<f32>>,
+    inv: std::sync::Arc<dyn RustFft<f32>>,
+    scratch: Vec<Complex<f32>>,
+}
+
+impl Cfft {
+    pub fn new(n: usize) -> Cfft {
+        let mut planner = FftPlanner::<f32>::new();
+        let fwd = planner.plan_fft_forward(n);
+        let inv = planner.plan_fft_inverse(n);
+        let scratch = vec![Complex::default(); fwd.get_inplace_scratch_len().max(inv.get_inplace_scratch_len())];
+        Cfft { fwd, inv, scratch }
+    }
+
+    /// Forward DFT (sign −1), in place.
+    pub fn forward(&mut self, buf: &mut [Complex<f32>]) {
+        self.fwd.process_with_scratch(buf, &mut self.scratch);
+    }
+
+    /// Inverse DFT (sign +1), in place, unnormalized.
+    pub fn inverse(&mut self, buf: &mut [Complex<f32>]) {
+        self.inv.process_with_scratch(buf, &mut self.scratch);
+    }
+}
 
 /// Forward real FFT. Holds the plan plus reusable input/output/scratch buffers, so
 /// steady-state has no per-call allocation. Built once per
@@ -113,5 +145,32 @@ mod tests {
         check(96);
         check(1152); // FT4 nfft at 12 kHz
         check(3840); // FT8 nfft at 12 kHz, freq_osr=2
+    }
+
+    /// A forward then inverse complex transform must reproduce the input scaled by
+    /// `n` (rustfft's unnormalized convention), and a pure complex exponential must
+    /// land all its energy in the expected bin.
+    #[test]
+    fn cfft_roundtrip_and_bin() {
+        let n = 32;
+        let mut c = Cfft::new(n);
+        // Tone at bin 5 (a 4-GFSK-ish complex exponential).
+        let orig: Vec<Complex<f32>> = (0..n)
+            .map(|i| {
+                let ph = 2.0 * std::f32::consts::PI * 5.0 * i as f32 / n as f32;
+                Complex::new(ph.cos(), ph.sin())
+            })
+            .collect();
+        let mut buf = orig.clone();
+        c.forward(&mut buf);
+        // All energy in bin 5.
+        let peak = buf.iter().map(|z| z.norm()).enumerate().max_by(|a, b| a.1.total_cmp(&b.1)).unwrap();
+        assert_eq!(peak.0, 5, "tone should land in bin 5");
+        assert!((peak.1 - n as f32).abs() < 1e-3, "bin-5 magnitude ≈ n");
+        // Inverse recovers the input × n.
+        c.inverse(&mut buf);
+        for (a, b) in buf.iter().zip(orig.iter()) {
+            assert!((a - b * n as f32).norm() < 1e-2, "roundtrip scaled by n");
+        }
     }
 }

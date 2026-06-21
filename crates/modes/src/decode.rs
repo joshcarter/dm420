@@ -2,6 +2,7 @@
 //! (port of ft8_lib `decode.c` + the `decode_ft8.c` driver loop). Handles FT8
 //! and FT4. Output is a list of [`Decode`]s per slot.
 
+use crate::cohere;
 use crate::constants::{FT4_COSTAS, FT4_GRAY, FT4_XOR, FT8_COSTAS, FT8_GRAY};
 use crate::crc;
 use crate::ldpc::{N, bp_decode};
@@ -371,7 +372,7 @@ fn extract_llr(wf: &Waterfall, c: &Candidate) -> [f32; N] {
     log174
 }
 
-fn normalize_llr(log174: &mut [f32; N]) {
+pub(crate) fn normalize_llr(log174: &mut [f32; N]) {
     let mut sum = 0.0f32;
     let mut sum2 = 0.0f32;
     for &v in log174.iter() {
@@ -449,7 +450,7 @@ fn subtract_passes() -> usize {
 
 /// Validate a hard-decision codeword: check the CRC-14 and, on success, return
 /// the 10-byte payload (un-whitening FT4). Returns `None` on CRC mismatch.
-fn verify_codeword(protocol: Protocol, plain: &[u8; N]) -> Option<[u8; 10]> {
+pub(crate) fn verify_codeword(protocol: Protocol, plain: &[u8; N]) -> Option<[u8; 10]> {
     let a91 = pack_bits(plain);
     let crc_extracted = crc::extract_crc(&a91);
     let mut chk = a91;
@@ -503,7 +504,6 @@ pub fn decode_streaming(
     let mut residual = samples.to_vec();
     let mut hash = CallHash::new();
     let mut seen: HashSet<[u8; 10]> = HashSet::new();
-
     for pass in 0..passes {
         let mut mon = Monitor::new(sample_rate, protocol, TIME_OSR, FREQ_OSR, 200.0, 3000.0);
         let bs = mon.block_size;
@@ -518,20 +518,42 @@ pub fn decode_streaming(
         let cands = find_candidates(wf); // already sorted strongest-first by score
         let sp = wf.symbol_period;
 
+        // FT8 gets the coherent front-end (Phase 2): per-candidate complex baseband +
+        // fine sync + multi-symbol coherent demod, rebuilt on each pass's residual so
+        // coherent demod and subtraction (Phase 3) compose — every pass decodes a
+        // cleaner residual coherently, and the refined freq/dt feed the next subtract.
+        // FT4 stays on the magnitude path. Coherent is tried first with the magnitude
+        // path as a fallback, so it can only add decodes, never regress.
+        let mut demod = if protocol == Protocol::Ft8 {
+            let mut d = cohere::Demod::new();
+            d.set_slot(&residual);
+            Some(d)
+        } else {
+            None
+        };
+
         // (payload, freq, dt) for each signal newly decoded this pass — used to
         // subtract them before the next pass.
         let mut decoded: Vec<([u8; 10], f32, f32)> = Vec::new();
         for c in &cands {
-            let Some(payload) = decode_candidate(wf, c) else {
+            let coarse_freq = (wf.min_bin as f32
+                + c.freq_offset as f32
+                + c.freq_sub as f32 / wf.freq_osr as f32)
+                / sp;
+            let coarse_dt = (c.time_offset as f32 + c.time_sub as f32 / wf.time_osr as f32) * sp;
+
+            // Coherent path first (FT8); magnitude path as a safety fallback so the
+            // coherent front-end can only add decodes, never regress.
+            let dec = demod
+                .as_mut()
+                .and_then(|d| decode_candidate_coherent(d, wf, c))
+                .or_else(|| decode_candidate(wf, c).map(|p| (p, coarse_freq, coarse_dt)));
+            let Some((payload, freq_hz, dt)) = dec else {
                 continue;
             };
             if !seen.insert(payload) {
                 continue; // already found (and subtracted) — don't emit or re-subtract
             }
-            let freq_hz =
-                (wf.min_bin as f32 + c.freq_offset as f32 + c.freq_sub as f32 / wf.freq_osr as f32)
-                    / sp;
-            let dt = (c.time_offset as f32 + c.time_sub as f32 / wf.time_osr as f32) * sp;
             decoded.push((payload, freq_hz, dt));
             if let Some((text, msg_type)) = message::decode(&payload, &mut hash) {
                 on_decode(Decode {
@@ -553,6 +575,46 @@ pub fn decode_streaming(
             subtract::subtract_ft8(&mut residual, payload, *f0, *dt, sample_rate);
         }
     }
+}
+
+/// Coherent decode of one candidate (FT8): analyze to LLR variants, then try BP +
+/// OSD + CRC on each variant in WSJT-X pass order, returning the first valid
+/// payload along with the coherently-refined frequency and time offset.
+fn decode_candidate_coherent(
+    demod: &mut cohere::Demod,
+    wf: &Waterfall,
+    c: &Candidate,
+) -> Option<([u8; 10], f32, f32)> {
+    let sp = wf.symbol_period;
+    let f0 =
+        (wf.min_bin as f32 + c.freq_offset as f32 + c.freq_sub as f32 / wf.freq_osr as f32) / sp;
+    // Downsampled start guess: 32 samples/symbol at 200 Hz (= NSPS/NDOWN). The
+    // magnitude waterfall's candidate start runs ~one symbol high relative to the
+    // coherent demod's baseband origin (its analysis frame is 2 symbols wide:
+    // nfft = block_size·FREQ_OSR = 2·NSPS, Hann-windowed), so subtract one symbol
+    // before fine sync. Measured via the DM420_TOFF sweep on the 24-slot real set:
+    // a flat optimum plateau across −40..−20 downsampled samples, centered at −32 ≡
+    // one symbol; the naive half-window geometric estimate (−16) undershoots by 2×
+    // and loses ~13 decodes.
+    const SPS2: f32 = 32.0; // downsampled samples per symbol
+    let i0 = (c.time_offset as f32 + c.time_sub as f32 / wf.time_osr as f32) * SPS2 - SPS2;
+    let an = demod.analyze(f0, i0)?;
+    // Try all five LLR variants (nsym=1/2/3 coherent integration) in WSJT-X pass order.
+    for llr in an.llrs.iter() {
+        let (plain, errors) = bp_decode(llr, LDPC_ITERS);
+        if errors == 0 {
+            if let Some(p) = verify_codeword(wf.protocol, &plain) {
+                return Some((p, an.freq_hz, an.dt));
+            }
+        } else if osd_enabled() && errors <= OSD_MAX_ERRORS {
+            for cand in osd::osd_decode(llr) {
+                if let Some(p) = verify_codeword(wf.protocol, &cand) {
+                    return Some((p, an.freq_hz, an.dt));
+                }
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
