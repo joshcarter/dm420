@@ -174,7 +174,12 @@ fn run_jt9(bin: &str, args: &[String], wav: &Path) -> Result<Vec<Row>, String> {
 fn parse_jt9(stdout: &str) -> Vec<Row> {
     let mut rows = Vec::new();
     for line in stdout.lines() {
-        let Some((pre, rest)) = line.split_once('~') else {
+        // jt9 decode lines are `HHMMSS SNR DT FREQ <marker> MESSAGE`, where the
+        // single-char sync marker is `~` for FT8 and `+` for FT4. Split on whichever
+        // is present (FT8 lines always carry `~`, so they're unaffected; FT4 lines
+        // have no `~`, so they fall through to `+`, which is the marker and always
+        // precedes the message — even when the message itself contains a `+report`).
+        let Some((pre, rest)) = line.split_once('~').or_else(|| line.split_once('+')) else {
             continue;
         };
         let msg = rest.trim();
