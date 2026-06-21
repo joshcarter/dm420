@@ -1,11 +1,20 @@
 # Closing the FT8 decode-sensitivity gap
 
-**Status:** Phase 1 (OSD) done. **Owner:** TBD. **Metric:** the `ab_jt9` example.
+**Status:** Phase 1 (OSD) + Phase 2 (subtraction) done. **Owner:** TBD.
+**Metric:** the `ab_jt9` example.
 
-> **Progress.** Phase 1 OSD landed (commit `3f14b7d`). Controlled A/B on 24 real
-> busy-band FT8 slots (`DM420_OSD=0` vs default): matched decodes **450 → 471**,
-> gap **52% → 50%**, no rise in false decodes. Modest as expected — OSD is the
-> weak-signal lever; the larger masking bucket is Phase 2.
+> **Progress** (controlled A/B on 24 real busy-band FT8 slots vs `jt9 -d 3`):
+> - Baseline (no enhancements): matched **450**, gap **52%**.
+> - + Phase 1 OSD (`3f14b7d`): matched **471**, gap **50%**.
+> - + Phase 2 subtraction (`d2e0128`): matched **480**, gap **49%**.
+>
+> No rise in false decodes across either phase (`ours-only` steady at 5).
+> Subtraction (+9) came in below the masking bucket's promise: it **converges by
+> pass 3** (6 passes == 3), so the limiter is fit *quality* on close-spaced
+> signals, not pass count — a per-symbol fit cross-talks when two signals sit a
+> few Hz apart, which is exactly the masking case. The likely next lever is a
+> frequency-refined, more-global fit (see Phase 2 notes). Per-slot FT8 decode
+> ~20 ms → ~120 ms, well inside the ~2 s window; FT4 is single-pass and unaffected.
 
 ## The problem, measured
 
@@ -117,7 +126,29 @@ validation.
 **Expected:** recovers a meaningful slice of the < −12 dB tail; modest help in
 the −15..−10 mix.
 
-### Phase 2 — multi-pass subtraction (the bigger lever)
+### Phase 2 — multi-pass subtraction ✅ v1 done (commit `d2e0128`)
+
+Implemented in `modes/src/subtract.rs`; `decode_streaming` now loops decode →
+subtract → rebuild waterfall → decode (FT8 only; `DM420_SUBTRACT=0` off,
+`DM420_SUBTRACT_PASSES` tunes). v1 uses a **per-symbol** complex-gain fit with a
+±480-sample timing search. Result: matched 471 → 480, no false-decode rise.
+
+**Why v1 underdelivered, and the higher-quality fit (Phase 2.1).** The +9 is below
+the masking bucket's promise because a per-symbol fit **cross-talks for
+close-spaced signals** — two tones a few Hz apart aren't orthogonal over one
+0.16 s symbol, so fitting the strong signal partly absorbs (and partly leaves) the
+weak neighbor: exactly the masking case we care about. Over the *full* 12.6 s
+transmission they separate cleanly (3 Hz × 12.6 s ≈ 38 cycles), so the fix is a
+**frequency-refined, more-global fit** (what WSJT-X's `subtractft8` does):
+1. **Refine frequency to sub-Hz** before fitting — a small search (or quadratic
+   interpolation of the sync correlation) around the candidate's ±1.5 Hz `f0`.
+2. With accurate `f0`, fit a **global complex gain** (or a lightly-smoothed
+   slow-varying gain to still track fading), so close neighbors stay orthogonal
+   and the subtraction is clean.
+3. Re-measure with `ab_jt9`; converged by pass 3 already, so this is pure quality.
+
+Compute budget is ample (~120 ms/slot now vs a ~2 s window), so the extra search
+is affordable. This is the most promising remaining lever on the masking bucket.
 
 **Why second:** biggest mechanism bucket (~48 % masked), but it needs a pipeline
 refactor and time-domain re-synthesis with amplitude/phase/frequency fit — more
