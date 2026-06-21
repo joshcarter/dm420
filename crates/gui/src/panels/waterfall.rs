@@ -114,6 +114,13 @@ pub struct Waterfall {
     /// `true` widens the decode side to 2/3 (`WS_DECODE_WIDE_FRAC`). Loaded from
     /// the config file at startup, toggled live from the unlocked EDIT surface.
     wide_decode: bool,
+    /// Frequency-axis view window (Hz): the lowest visible audio offset and the
+    /// span shown top-to-bottom. The decode side and the spectrogram share it.
+    /// Default is the full `[0, WS_MAX_HZ]`; scroll-wheel zooms (to the cursor),
+    /// drag pans, double-click resets. View-only — no offset *state* is rescaled,
+    /// only how Hz maps to screen rows. Not persisted across runs.
+    view_lo_hz: f32,
+    view_span_hz: f32,
 }
 
 impl Waterfall {
@@ -132,6 +139,8 @@ impl Waterfall {
             tx_hold: None,
             last_next_tx: None,
             wide_decode: crate::settings::read_waterslide_wide(),
+            view_lo_hz: 0.0,
+            view_span_hz: WS_MAX_HZ,
         }
     }
 
@@ -584,6 +593,17 @@ impl Panel for Waterfall {
                 if body_big {
                     let body = screen.shrink(8.0);
                     let now_ms = chrono::Utc::now().timestamp_millis();
+                    // One interaction over the whole waterslide body, sensing both
+                    // clicks (station select / TX offset) and drags (pan). Created up
+                    // front so the frequency-view gestures resolve *before* the
+                    // spectrogram and decodes paint — they share the view window.
+                    let resp = ctx.ui.interact(
+                        body,
+                        ctx.ui.id().with("ws_select"),
+                        egui::Sense::click_and_drag(),
+                    );
+                    self.apply_view_gestures(ctx.ui, body, &resp);
+                    let (lo_frac, hi_frac) = self.view_fracs();
                     // Right half: real scrolling spectrogram (brightness = intensity),
                     // flowing right as the decode text flows left. NOW sits at
                     // `now_frac` across (1/2 centered, or 2/3 in the wide-decode
@@ -615,8 +635,16 @@ impl Panel for Waterfall {
                     // at 2:1 they differ. FT4's shorter slots scroll faster.
                     let protocol = ctx.bus.current_config().protocol;
                     let ws_secs = ws_history_secs(painter, body, protocol, now_frac);
-                    self.spectro
-                        .update_and_paint(ctx.ui, right, ctx.dt, ws_secs, column.as_ref(), &cmap);
+                    self.spectro.update_and_paint(
+                        ctx.ui,
+                        right,
+                        ctx.dt,
+                        ws_secs,
+                        column.as_ref(),
+                        &cmap,
+                        lo_frac,
+                        hi_frac,
+                    );
                     // Live QSO phase gates the selection. While armed/working — or
                     // still keyed at the tail of an over (`tx_hold`) — the selection
                     // is locked: the operator can't change the audio offset or pick
@@ -638,19 +666,18 @@ impl Panel for Waterfall {
 
                     // Click-to-select on the live waterslide (mock mode selects via
                     // the sim's own `ui()`; the real waterslide is draw-only). We
-                    // hit-test here and let `draw_waterslide` resolve the click to a
-                    // station (decoded line) or a bare TX offset (empty spectrum).
-                    // Only sense clicks (and offer the pointing-hand cursor) when
-                    // disarmed, so the locked selection can't be overridden.
-                    let resp =
-                        ctx.ui
-                            .interact(body, ctx.ui.id().with("ws_select"), egui::Sense::click());
+                    // hit-test via the body interaction above and let `draw_waterslide`
+                    // resolve the click to a station (decoded line) or a bare TX offset
+                    // (empty spectrum). Only act on clicks (and offer the pointing-hand
+                    // cursor) when disarmed, so the locked selection can't be
+                    // overridden; pan/zoom stay live regardless. A double-click is a
+                    // view reset (handled in `apply_view_gestures`), not a select.
                     let resp = if armed {
                         resp
                     } else {
                         resp.on_hover_cursor(egui::CursorIcon::PointingHand)
                     };
-                    let click = if armed {
+                    let click = if armed || resp.double_clicked() {
                         None
                     } else {
                         resp.clicked().then(|| resp.interact_pointer_pos()).flatten()
@@ -699,6 +726,8 @@ impl Panel for Waterfall {
                         app_core::slot_period(protocol) as f32,
                         op_accent,
                         now_frac,
+                        self.view_lo_hz,
+                        self.view_span_hz,
                     ) {
                         self.real_sel = sel;
                     }
@@ -747,10 +776,70 @@ impl Waterfall {
             self.slide.outgoing().station().map(str::to_owned)
         }
     }
+
+    /// The view window as fractions of the full `[0, WS_MAX_HZ]` range
+    /// (`lo_frac`, `hi_frac`) — fed to the spectrogram so its texture crops to
+    /// the same band the decode side shows.
+    fn view_fracs(&self) -> (f32, f32) {
+        (
+            self.view_lo_hz / WS_MAX_HZ,
+            (self.view_lo_hz + self.view_span_hz) / WS_MAX_HZ,
+        )
+    }
+
+    /// Apply scroll-wheel zoom (anchored at the cursor), drag-to-pan, and
+    /// double-click-to-reset to the frequency view window. View-only: it moves
+    /// `view_lo_hz`/`view_span_hz`, never any offset *state*. Always live — zoom
+    /// and pan work whether or not a QSO is armed.
+    fn apply_view_gestures(&mut self, ui: &egui::Ui, body: Rect, resp: &egui::Response) {
+        // Double-click anywhere resets to the full-band view.
+        if resp.double_clicked() {
+            self.view_lo_hz = 0.0;
+            self.view_span_hz = WS_MAX_HZ;
+            return;
+        }
+
+        // Wheel zoom, anchored so the Hz under the cursor stays put. Bottom of the
+        // pane is `view_lo`, top is `view_lo + span`, so `frac` runs 0 (bottom) → 1
+        // (top). Scrolling up (positive) shrinks the span = zoom in.
+        let scroll = if resp.hovered() {
+            ui.input(|i| i.smooth_scroll_delta.y)
+        } else {
+            0.0
+        };
+        if scroll != 0.0
+            && let Some(p) = resp.hover_pos()
+        {
+            let frac = ((body.bottom() - p.y) / body.height().max(1.0)).clamp(0.0, 1.0);
+            let cursor_hz = self.view_lo_hz + frac * self.view_span_hz;
+            let factor = (1.0 - scroll / WS_ZOOM_DIV).clamp(0.2, 5.0);
+            self.view_span_hz = (self.view_span_hz * factor).clamp(WS_MIN_SPAN_HZ, WS_MAX_HZ);
+            self.view_lo_hz = cursor_hz - frac * self.view_span_hz;
+        }
+
+        // Drag to pan: keep the grabbed Hz under the pointer (drag down → window
+        // rises, revealing higher frequencies from above).
+        if resp.dragged() {
+            let hz_per_px = self.view_span_hz / body.height().max(1.0);
+            self.view_lo_hz += resp.drag_delta().y * hz_per_px;
+        }
+
+        // Keep the window inside the full band.
+        self.view_span_hz = self.view_span_hz.clamp(WS_MIN_SPAN_HZ, WS_MAX_HZ);
+        self.view_lo_hz = self.view_lo_hz.clamp(0.0, WS_MAX_HZ - self.view_span_hz);
+    }
 }
 
 /// Audio-offset axis span (Hz): FT8/FT4 decodes land in roughly 0..3000 Hz.
 const WS_MAX_HZ: f32 = 3000.0;
+
+/// Tightest frequency span (Hz) the view may zoom to — keeps a few signal lanes
+/// on screen so zoom-in stays useful rather than collapsing to a single trace.
+const WS_MIN_SPAN_HZ: f32 = 200.0;
+
+/// Scroll-delta divisor for wheel zoom: larger = gentler. One notch (~50 px of
+/// smoothed scroll) is roughly a ±12% span change.
+const WS_ZOOM_DIV: f32 = 400.0;
 
 /// NOW-line position (fraction of panel width from the left) in the "wide decode"
 /// split: the decode/text side gets 2/3 of the panel and the spectrogram 1/3. The
@@ -831,6 +920,7 @@ impl Spectrogram {
 
     /// Advance the scroll by `dt`, fill the newly-exposed columns with `latest`,
     /// recolour through `cmap`, and blit into `rect` (the right half).
+    #[allow(clippy::too_many_arguments)]
     fn update_and_paint(
         &mut self,
         ui: &egui::Ui,
@@ -839,6 +929,11 @@ impl Spectrogram {
         history_secs: f32,
         latest: Option<&SpectrumRow>,
         cmap: &[Color32; 256],
+        // Frequency-view window as fractions of the full band: `lo_frac`/`hi_frac`
+        // are `view_lo`/`view_hi ÷ WS_MAX_HZ`. The texture is cropped vertically to
+        // this band so the spectrogram zooms/pans in lock-step with the decode side.
+        lo_frac: f32,
+        hi_frac: f32,
     ) {
         if let Some(row) = latest {
             self.ensure_size(row.mags.len().clamp(1, SPECTRO_MAX_H));
@@ -883,7 +978,14 @@ impl Spectrogram {
                 )
             }
         }
-        let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
+        // Crop the texture to the frequency window. Row 0 (texture top, v=0) is the
+        // highest bin and the bottom row (v=1) the lowest, so the top of the rect
+        // (high freq) maps to `v = 1 - hi_frac` and the bottom (low freq) to
+        // `v = 1 - lo_frac` — the full band (0..1) when not zoomed.
+        let uv = Rect::from_min_max(
+            Pos2::new(0.0, 1.0 - hi_frac),
+            Pos2::new(1.0, 1.0 - lo_frac),
+        );
         ui.painter_at(rect)
             .image(self.tex.as_ref().unwrap().id(), rect, uv, Color32::WHITE);
     }
@@ -1047,6 +1149,11 @@ fn draw_waterslide(
     // ~0.667 = the wide-decode 2:1 split). Both sides span `history_secs`, so the
     // right (spectrogram) side gets its own pixels-per-second when it's narrower.
     now_frac: f32,
+    // Frequency-view window (Hz): the lowest visible offset and the span shown
+    // bottom-to-top. `(0, WS_MAX_HZ)` is the un-zoomed full band. Offsets outside
+    // the window are culled; the click→offset inverse reads against it too.
+    view_lo: f32,
+    view_span: f32,
 ) -> Option<RealSel> {
     let painter = painter.with_clip_rect(rect);
     let now_x = rect.left() + rect.width() * now_frac; // the NOW line
@@ -1059,12 +1166,18 @@ fn draw_waterslide(
     let pps_right = right_w / history_secs;
     let mut hit: Option<RealSel> = None;
 
-    // Audio offset → vertical position (low Hz at bottom, high Hz at top).
-    let y_of = |off: f32| rect.bottom() - (off / WS_MAX_HZ).clamp(0.0, 1.0) * rect.height();
+    // Audio offset → vertical position (low Hz at bottom, high Hz at top), mapped
+    // through the current frequency-view window. Unclamped: callers that need edge
+    // behaviour (the TX lane) clamp to `rect`; decode placement culls out-of-window.
+    let view_hi = view_lo + view_span;
+    let y_of = |off: f32| rect.bottom() - ((off - view_lo) / view_span) * rect.height();
 
     // Faint frequency graticule with Hz labels (parked at the right edge, in the
-    // otherwise-blank FFT half).
+    // otherwise-blank FFT half). Only the gridlines inside the view window are drawn.
     for hz in [500.0f32, 1000.0, 1500.0, 2000.0, 2500.0] {
+        if hz < view_lo || hz > view_hi {
+            continue;
+        }
         let y = y_of(hz);
         painter.line_segment(
             [Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)],
@@ -1146,7 +1259,14 @@ fn draw_waterslide(
         if x + half_space + msg_w < rect.left() {
             continue; // fully scrolled off the left edge
         }
-        let ty = y_of(d.offset.0 + half_bw);
+        // Cull decodes whose signal centre falls outside the frequency window —
+        // when zoomed in, off-window traffic drops out rather than piling onto the
+        // top/bottom edge (the spatial half of the de-clutter).
+        let center_hz = d.offset.0 + half_bw;
+        if center_hz < view_lo || center_hz > view_hi {
+            continue;
+        }
+        let ty = y_of(center_hz);
         placed.push(Placed {
             idx,
             x,
@@ -1316,37 +1436,65 @@ fn draw_waterslide(
     // keyed — the same convention as SEND/STOP and the panel frame. Labelled with
     // the selected station's QSO phase (`tag`) or a bare offset.
     let lane = accent;
-    let bottom = y_of(tx_off);
-    let top = y_of(tx_off + bandwidth_hz).min(bottom - 3.0); // floor at 3px so it stays visible
-    let band = Rect::from_min_max(Pos2::new(rect.left(), top), Pos2::new(rect.right(), bottom));
-    painter.rect_filled(band, 0.0, lane.gamma_multiply(0.10));
-    let rule_top = band.top() - WS_RULE_GAP;
-    let rule_bottom = band.bottom() + WS_RULE_GAP;
-    painter.line_segment(
-        [Pos2::new(band.left(), rule_top), Pos2::new(band.right(), rule_top)],
-        egui::Stroke::new(1.5, lane),
-    );
-    painter.line_segment(
-        [Pos2::new(band.left(), rule_bottom), Pos2::new(band.right(), rule_bottom)],
-        egui::Stroke::new(1.5, lane),
-    );
     let tx_label = match tag {
         Some(tag) => format!("{tag}  {} Hz", tx_off as i32),
         None => format!("\u{25B6} TX {} Hz", tx_off as i32),
     };
-    painter.text(
-        Pos2::new(rect.left() + 4.0, rule_top - 1.0),
-        Align2::LEFT_BOTTOM,
-        tx_label,
-        snr_font,
-        lane,
-    );
+    if tx_off + bandwidth_hz < view_lo {
+        // Entirely below the view: a chevron + label parked at the bottom edge so
+        // the operator never loses track of where they're transmitting.
+        painter.text(
+            Pos2::new(rect.left() + 4.0, rect.bottom() - 2.0),
+            Align2::LEFT_BOTTOM,
+            format!("\u{25BC} {tx_label}"),
+            snr_font,
+            lane,
+        );
+    } else if tx_off > view_hi {
+        // Entirely above the view: chevron + label at the top edge.
+        painter.text(
+            Pos2::new(rect.left() + 4.0, rect.top() + 2.0),
+            Align2::LEFT_TOP,
+            format!("\u{25B2} {tx_label}"),
+            snr_font,
+            lane,
+        );
+    } else {
+        // Visible (possibly partially): clamp the shaded band to the pane so it
+        // doesn't invert or draw off-rect when the offset sits near a view edge.
+        let bottom = y_of(tx_off).min(rect.bottom());
+        let top = y_of(tx_off + bandwidth_hz)
+            .max(rect.top())
+            .min(bottom - 3.0); // floor at 3px so it stays visible
+        let band = Rect::from_min_max(Pos2::new(rect.left(), top), Pos2::new(rect.right(), bottom));
+        painter.rect_filled(band, 0.0, lane.gamma_multiply(0.10));
+        let rule_top = band.top() - WS_RULE_GAP;
+        let rule_bottom = band.bottom() + WS_RULE_GAP;
+        painter.line_segment(
+            [Pos2::new(band.left(), rule_top), Pos2::new(band.right(), rule_top)],
+            egui::Stroke::new(1.5, lane),
+        );
+        painter.line_segment(
+            [Pos2::new(band.left(), rule_bottom), Pos2::new(band.right(), rule_bottom)],
+            egui::Stroke::new(1.5, lane),
+        );
+        painter.text(
+            Pos2::new(rect.left() + 4.0, rule_top - 1.0),
+            Align2::LEFT_BOTTOM,
+            tx_label,
+            snr_font,
+            lane,
+        );
+    }
 
     // Resolve a click into a new selection: a decoded station (captured in the
     // loop) wins; otherwise it's a bare TX offset read off the vertical position.
     if let Some(cp) = click {
         return Some(hit.unwrap_or_else(|| {
-            let off = ((rect.bottom() - cp.y) / rect.height() * WS_MAX_HZ).clamp(0.0, WS_MAX_HZ);
+            // Inverse of the windowed `y_of`: read the offset off the vertical click
+            // position against the current view, then clamp to the full band.
+            let off =
+                (view_lo + (rect.bottom() - cp.y) / rect.height() * view_span).clamp(0.0, WS_MAX_HZ);
             RealSel {
                 offset: off,
                 target: None,
