@@ -23,6 +23,7 @@ audio = { path = "crates/audio" }
 dsp = { path = "crates/dsp" }
 modes = { path = "crates/modes" }
 qso = { path = "crates/qso" }
+callbook = { path = "crates/callbook" }
 logbook = { path = "crates/logbook" }
 scanner = { path = "crates/scanner" }
 net = { path = "crates/net" }

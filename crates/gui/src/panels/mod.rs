@@ -26,11 +26,13 @@ pub struct MapPick {
 }
 
 mod band_scan;
+mod call_sign;
 mod contacts;
 mod log_book;
 pub(crate) mod waterfall;
 
 pub use band_scan::BandScan;
+pub use call_sign::CallSign;
 pub use contacts::Contacts;
 pub use log_book::LogBook;
 pub use waterfall::Waterfall;

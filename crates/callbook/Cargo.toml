@@ -1,0 +1,9 @@
+[package]
+name = "callbook"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Offline call-sign → DXCC country resolver (prefix table). Pure, no I/O."
+
+[dependencies]

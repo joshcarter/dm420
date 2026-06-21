@@ -33,6 +33,9 @@ mocks.workspace = true
 # publishes `QsoState`, serves `qso/{id}/command`.
 qso.workspace = true
 
+# Offline call-sign → country/flag resolver (Tier-1 of the Call Sign panel).
+callbook.workspace = true
+
 # The real rig/decode producers (vendored Joel + bus adapters). Renamed to avoid
 # shadowing the std `core` crate. Used at runtime by default (`DM420_MOCK=1` opts
 # into mocks instead).
