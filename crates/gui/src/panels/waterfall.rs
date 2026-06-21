@@ -617,24 +617,48 @@ impl Panel for Waterfall {
                     let ws_secs = ws_history_secs(painter, body, protocol, now_frac);
                     self.spectro
                         .update_and_paint(ctx.ui, right, ctx.dt, ws_secs, column.as_ref(), &cmap);
-                    // Click-to-select on the live waterslide (mock mode selects via
-                    // the sim's own `ui()`; the real waterslide is draw-only). We
-                    // hit-test here and let `draw_waterslide` resolve the click to a
-                    // station (decoded line) or a bare TX offset (empty spectrum).
-                    let resp = ctx
-                        .ui
-                        .interact(body, ctx.ui.id().with("ws_select"), egui::Sense::click())
-                        .on_hover_cursor(egui::CursorIcon::PointingHand);
-                    let click = resp.clicked().then(|| resp.interact_pointer_pos()).flatten();
-
-                    // Selection feedback: highlight the selected station's lane and
-                    // tag it with the live QSO phase (ARMED while waiting for its CQ,
-                    // WORKING once the exchange is under way).
+                    // Live QSO phase gates the selection. While armed/working — or
+                    // still keyed at the tail of an over (`tx_hold`) — the selection
+                    // is locked: the operator can't change the audio offset or pick
+                    // another station mid-QSO. It's only mutable when disarmed.
                     let phase = ctx
                         .bus
                         .qso_state()
                         .map(|s| s.phase)
                         .unwrap_or(QsoPhase::Idle);
+                    let armed = !matches!(phase, QsoPhase::Idle) || self.tx_hold.is_some();
+
+                    // A completed contact (final 73 sent) deselects the worked
+                    // station so the send box reverts to the default CQ next frame.
+                    // The audio offset is left where it is.
+                    if matches!(phase, QsoPhase::Complete) {
+                        self.real_sel.target = None;
+                        self.real_sel.resume = None;
+                    }
+
+                    // Click-to-select on the live waterslide (mock mode selects via
+                    // the sim's own `ui()`; the real waterslide is draw-only). We
+                    // hit-test here and let `draw_waterslide` resolve the click to a
+                    // station (decoded line) or a bare TX offset (empty spectrum).
+                    // Only sense clicks (and offer the pointing-hand cursor) when
+                    // disarmed, so the locked selection can't be overridden.
+                    let resp =
+                        ctx.ui
+                            .interact(body, ctx.ui.id().with("ws_select"), egui::Sense::click());
+                    let resp = if armed {
+                        resp
+                    } else {
+                        resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+                    };
+                    let click = if armed {
+                        None
+                    } else {
+                        resp.clicked().then(|| resp.interact_pointer_pos()).flatten()
+                    };
+
+                    // Selection feedback: highlight the selected station's lane and
+                    // tag it with the live QSO phase (ARMED while waiting for its CQ,
+                    // WORKING once the exchange is under way).
                     let sel_call = self.real_sel.target.as_ref().map(|(c, _)| c.clone());
                     let tag = sel_call.as_deref().map(|c| match phase {
                         QsoPhase::Armed => format!("ARMED ▸ {c}"),
