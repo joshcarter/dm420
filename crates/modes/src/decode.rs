@@ -6,12 +6,18 @@ use crate::constants::{FT4_COSTAS, FT4_GRAY, FT4_XOR, FT8_COSTAS, FT8_GRAY};
 use crate::crc;
 use crate::ldpc::{N, bp_decode};
 use crate::message::{self, CallHash, MessageType};
+use crate::osd;
+use std::sync::OnceLock;
 use crate::waterfall::{Monitor, Protocol, Waterfall, mag_db};
 use std::collections::HashSet;
 
 const MIN_SCORE: i32 = 10;
 const MAX_CANDIDATES: usize = 140;
 const LDPC_ITERS: usize = 25;
+/// Run the OSD backstop only when belief-propagation got within this many parity
+/// errors (out of 83). Real near-misses leave a handful; pure noise plateaus much
+/// higher, so this skips OSD on hopeless candidates without costing recall.
+const OSD_MAX_ERRORS: i32 = 40;
 const TIME_OSR: usize = 2;
 const FREQ_OSR: usize = 2;
 
@@ -394,10 +400,34 @@ fn decode_candidate(wf: &Waterfall, c: &Candidate) -> Option<[u8; 10]> {
     let mut log174 = extract_llr(wf, c);
     normalize_llr(&mut log174);
     let (plain, errors) = bp_decode(&log174, LDPC_ITERS);
-    if errors > 0 {
-        return None;
+    if errors == 0 {
+        if let Some(p) = verify_codeword(wf.protocol, &plain) {
+            return Some(p);
+        }
+    } else if osd_enabled() && errors <= OSD_MAX_ERRORS {
+        // Belief-propagation stalled with a few residual parity errors — a
+        // near-miss OSD can often finish. Each candidate codeword is parity-valid
+        // by construction, so CRC is what separates a real decode from a wrong one.
+        for cand in osd::osd_decode(&log174) {
+            if let Some(p) = verify_codeword(wf.protocol, &cand) {
+                return Some(p);
+            }
+        }
     }
-    let a91 = pack_bits(&plain);
+    None
+}
+
+/// Whether the OSD backstop runs (default on). `DM420_OSD=0` disables it — an
+/// escape hatch and the A/B switch for measuring OSD's contribution.
+fn osd_enabled() -> bool {
+    static EN: OnceLock<bool> = OnceLock::new();
+    *EN.get_or_init(|| std::env::var("DM420_OSD").map(|v| v != "0").unwrap_or(true))
+}
+
+/// Validate a hard-decision codeword: check the CRC-14 and, on success, return
+/// the 10-byte payload (un-whitening FT4). Returns `None` on CRC mismatch.
+fn verify_codeword(protocol: Protocol, plain: &[u8; N]) -> Option<[u8; 10]> {
+    let a91 = pack_bits(plain);
     let crc_extracted = crc::extract_crc(&a91);
     let mut chk = a91;
     chk[9] &= 0xF8;
@@ -407,7 +437,7 @@ fn decode_candidate(wf: &Waterfall, c: &Candidate) -> Option<[u8; 10]> {
         return None;
     }
     let mut payload = [0u8; 10];
-    if wf.protocol == Protocol::Ft4 {
+    if protocol == Protocol::Ft4 {
         for i in 0..10 {
             payload[i] = a91[i] ^ FT4_XOR[i];
         }

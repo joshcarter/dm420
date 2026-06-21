@@ -21,6 +21,7 @@ mod encode;
 mod fft;
 mod ldpc;
 mod message;
+mod osd;
 mod slot;
 mod text;
 mod waterfall;
