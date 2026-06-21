@@ -29,6 +29,10 @@ fn cell<T>() -> Cell<T> {
     Arc::new(Mutex::new(None))
 }
 
+/// Capacity of the decode ring (see the comment at the `Ring::new` call site): big
+/// enough that a wide monitor on a crowded band never evicts a still-visible decode.
+const DECODE_RING_CAP: usize = 8192;
+
 /// A rolling window for a stream topic: the pump pushes, dropping the oldest past
 /// `cap`; the GUI snapshots the tail it wants each frame.
 #[derive(Clone)]
@@ -181,7 +185,12 @@ impl BusView {
         let qso = cell();
         let bands: Arc<Mutex<HashMap<Band, BandActivity>>> = Arc::new(Mutex::new(HashMap::new()));
         let logs = Ring::new(512);
-        let decodes = Ring::new(64);
+        // Sized to hold every decode that can be on the waterslide at once: the panel
+        // shows (panel_width / line_width) slot-columns of history (monitor-dependent —
+        // an ultrawide shows many), each column stacking a busy slot's 30–50 decodes,
+        // and the panel culls by age, not count. Keep this well past the worst case so
+        // a wide monitor + crowded band never drops still-visible decodes. ~1 MB.
+        let decodes = Ring::new(DECODE_RING_CAP);
         let heard: Arc<Mutex<HashMap<String, HeardEntry>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let health: Arc<Mutex<HashMap<SubsystemId, SubsystemHealth>>> =
@@ -486,9 +495,10 @@ impl BusView {
         self.health.lock().unwrap().get(&id).cloned()
     }
 
-    /// The `n` most recent decodes, newest first.
-    pub fn recent_decodes(&self, n: usize) -> Vec<Decode> {
-        self.decodes.snapshot().into_iter().rev().take(n).collect()
+    /// All retained decodes, newest first. The waterslide wants the full ring (it
+    /// culls by on-screen age, not count), so the only bound is `DECODE_RING_CAP`.
+    pub fn recent_decodes(&self) -> Vec<Decode> {
+        self.decodes.snapshot().into_iter().rev().collect()
     }
 
     /// Push a station-identity / contest change to the running QSO engine (call on

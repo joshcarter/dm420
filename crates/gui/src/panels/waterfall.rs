@@ -686,7 +686,7 @@ impl Panel for Waterfall {
                         painter,
                         body,
                         pal,
-                        &ctx.bus.recent_decodes(64),
+                        &ctx.bus.recent_decodes(),
                         now_ms,
                         click,
                         self.real_sel.offset,
