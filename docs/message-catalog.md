@@ -29,7 +29,7 @@ pub struct RadioId(pub String);      // stable per-radio id from config
 pub struct StationId(pub String);    // one operator/core instance (multi-op gossip)
 pub struct Callsign(pub String);
 pub struct GridSquare(pub String);   // Maidenhead, e.g. "FN31"
-pub struct Section(pub String);      // ARRL/RAC section, e.g. "CO" — exchange/log only, not a map location
+pub struct Section(pub String);      // ARRL/RAC section, e.g. "CO" — exchange/log, and a coarse map location (Field Day, no grid)
 
 pub struct AbsHz(pub u64);           // absolute dial frequency
 pub struct OffsetHz(pub f32);        // audio offset within the passband
@@ -307,9 +307,10 @@ pub enum InterlockError { Denied, Expired, NotHolder }
 ## 12. Open spots to close next
 
 1. **[Joel]** `ParsedMessage` / `ExchangePayload` final variants against `ft8_lib` output and the
-   Field Day message set. *(Resolved: CQ carries a 4-char grid in both Standard and Field Day, so
-   the map plots from grids only — `Section` stays in the exchange/log but isn't a location source.
-   Edge case accepted: a station heard only mid-exchange, never on a CQ, won't appear on the map.)*
+   Field Day message set. *(Resolved: CQ carries a 4-char grid in both Standard and Field Day. A
+   Field Day **responder** sends only its ARRL/RAC `Section` (no grid), so the map now places those
+   from a section → regional-centroid table (`gui::panel_data::section_to_lonlat`) in addition to
+   grids. `LogEntry`/`CompletedQso` carry the `Section` so worked Field Day contacts plot too.)*
 2. **[Joel/Josh]** `DecodeRef` stability key — `(radio, slot, index)` vs a `DecodeId` minted on
    each `Decode`. Selection and QSO `Start` both depend on it.
 3. **[Josh]** Whether `operating` and `rig_state` stay split (clean single-writer) or merge into

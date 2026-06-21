@@ -20,6 +20,8 @@ use std::time::Duration;
 use bus::types::*;
 use bus::{BusError, BusHandle, BusMessage, Topic, TopicSelector};
 
+use crate::panel_data::Locator;
+
 /// A latest-value cell for a `State` topic. The pump overwrites; the GUI reads.
 type Cell<T> = Arc<Mutex<Option<T>>>;
 
@@ -57,13 +59,14 @@ impl<T: Clone> Ring<T> {
     }
 }
 
-/// A station to plot on the Contacts map: a callsign, the grid we placed it from,
-/// and the most-recent time we logged (worked) or heard (unworked) it, ms since
-/// epoch. The panel uses `last_ms` for the recent/all filter and for dimming
-/// unworked markers by age.
+/// A station to plot on the Contacts map: a callsign, the locator we place it from
+/// (grid, or an ARRL/RAC section for Field Day stations that carry no grid), and
+/// the most-recent time we logged (worked) or heard (unworked) it, ms since epoch.
+/// The panel uses `last_ms` for the recent/all filter and for dimming unworked
+/// markers by age.
 pub struct MapSpot {
     pub call: String,
-    pub grid: String,
+    pub loc: Locator,
     pub last_ms: i64,
     /// `true` if worked (in the log) → plus marker; `false` if only heard →
     /// circle (or triangle while calling CQ) that dims with age.
@@ -86,11 +89,12 @@ pub struct MapSpot {
     pub slot: Option<SlotId>,
 }
 
-/// A station heard with a placeable grid: the grid we placed it from, the
-/// last-heard time (ms since epoch), the band the rig was on when heard, and
-/// whether its newest sighting was a CQ. Accumulated by [`pump_heard`].
+/// A station heard with a placeable locator (grid, or an ARRL/RAC section for
+/// Field Day): the locator we place it from, the last-heard time (ms since epoch),
+/// the band the rig was on when heard, and whether its newest sighting was a CQ.
+/// Accumulated by [`pump_heard`].
 struct HeardEntry {
-    grid: GridSquare,
+    loc: Locator,
     last_ms: i64,
     band: Option<Band>,
     cq: bool,
@@ -338,18 +342,25 @@ impl BusView {
         self.logs.buf.lock().unwrap().len()
     }
 
-    /// Distinct worked stations that carry a grid, most-recent contact per call.
-    /// Feeds the Contacts map's "worked" (filled) layer.
+    /// Distinct worked stations that carry a placeable locator (a grid, or — for
+    /// Field Day contacts that carried no grid — an ARRL/RAC section), most-recent
+    /// contact per call. Feeds the Contacts map's "worked" (filled) layer.
     pub fn worked_spots(&self) -> Vec<MapSpot> {
         let mut seen = HashSet::new();
         let mut out = Vec::new();
         for e in self.logs.snapshot().into_iter().rev() {
-            if let Some(grid) = &e.grid
+            // Grid is preferred; fall back to the Field Day section.
+            let loc = e
+                .grid
+                .as_ref()
+                .map(|g| Locator::Grid(g.0.clone()))
+                .or_else(|| e.section.as_ref().map(|s| Locator::Section(s.0.clone())));
+            if let Some(loc) = loc
                 && seen.insert(e.call.0.clone())
             {
                 out.push(MapSpot {
                     call: e.call.0.clone(),
-                    grid: grid.0.clone(),
+                    loc,
                     last_ms: e.time.0,
                     worked: true,
                     band: Some(e.band),
@@ -388,7 +399,7 @@ impl BusView {
             .filter(|(_, e)| e.last_ms >= cutoff)
             .map(|(call, e)| MapSpot {
                 call: call.clone(),
-                grid: e.grid.0.clone(),
+                loc: e.loc.clone(),
                 last_ms: e.last_ms,
                 worked: false,
                 band: e.band,
@@ -624,14 +635,12 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// Extract a placeable `(call, grid, calling_cq)` from a decode, if it advertises a
-/// locator — a CQ with a grid, or a standard grid exchange. The third element marks
-/// the CQ case so the map can flag answerable callers.
-///
-/// NOTE (Field Day): a Field Day exchange carries an ARRL `Section`, not a grid
-/// (`ExchangePayload::FieldDay`), so those stations yield `None` here and won't be
-/// placed yet. Plotting them needs section → coordinate inference — see TODO.md.
-fn station_grid(d: &Decode) -> Option<(String, GridSquare, bool)> {
+/// Extract a placeable `(call, locator, calling_cq)` from a decode, if it
+/// advertises a location — a CQ with a grid, a standard grid exchange, or a Field
+/// Day exchange (which carries an ARRL/RAC section, not a grid: responders send
+/// only their section). The third element marks the CQ case so the map can flag
+/// answerable callers.
+fn station_locator(d: &Decode) -> Option<(String, Locator, bool)> {
     let DecodeContent::Slotted { message, .. } = &d.content else {
         return None;
     };
@@ -640,12 +649,18 @@ fn station_grid(d: &Decode) -> Option<(String, GridSquare, bool)> {
             caller,
             grid: Some(g),
             ..
-        } => Some((caller.0.clone(), g.clone(), true)),
+        } => Some((caller.0.clone(), Locator::Grid(g.0.clone()), true)),
         ParsedMessage::Exchange {
             from,
             payload: ExchangePayload::Grid(g),
             ..
-        } => Some((from.0.clone(), g.clone(), false)),
+        } => Some((from.0.clone(), Locator::Grid(g.0.clone()), false)),
+        // Field Day: a responder's exchange carries a section, never a grid.
+        ParsedMessage::Exchange {
+            from,
+            payload: ExchangePayload::FieldDay { section, .. },
+            ..
+        } => Some((from.0.clone(), Locator::Section(section.0.clone()), false)),
         _ => None,
     }
 }
@@ -765,7 +780,7 @@ fn pump_heard(
         loop {
             match sub.recv().await {
                 Ok(d) => {
-                    if let Some((call, grid, cq)) = station_grid(&d) {
+                    if let Some((call, loc, cq)) = station_locator(&d) {
                         let t = d.t.0;
                         // The rig's current dial — gives both the band this station
                         // was heard on and the absolute frequency we saw it at
@@ -785,7 +800,7 @@ fn pump_heard(
                             m.insert(
                                 call,
                                 HeardEntry {
-                                    grid,
+                                    loc,
                                     last_ms: t,
                                     band,
                                     cq,

@@ -174,6 +174,7 @@ fn log_entry(seq: u64, call: &str, grid: &str, snt: i8, rcv: i8, time_ms: i64, b
         exchange_sent: fmt_snr(snt),
         exchange_rcvd: fmt_snr(rcv),
         grid: Some(GridSquare(grid.into())),
+        section: None,
     }
 }
 

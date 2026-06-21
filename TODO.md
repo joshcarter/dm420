@@ -38,14 +38,17 @@ different band counts as a different contact. Maybe when UI is
 unlocked, have a "reset" button on the log book which moves the old
 log book to a new file name.
 
-Map panel: Field Day station positions. The map now places heard stations
-from grid squares (CQ grid / standard grid exchange). During ARRL Field Day
-the exchange carries an ARRL *section* (e.g. `WI`), not a grid, so those
-stations can't be placed by grid and are currently skipped. We need to infer
-an approximate position from the section identifier (a section → bounding
-region/centroid table, then the same in-grid land-snapping treatment) so
-Field Day contacts and heard stations still appear on the map. See the note
-in `bus_view::station_grid` and `docs/map_panel.md`.
+Map panel: Field Day station positions — DONE (heard + worked). A Field Day
+responder sends only its ARRL *section* (e.g. `WI`), not a grid. The map now
+places those from a section → regional-centroid table
+(`gui::panel_data::section_to_lonlat`), spreading co-section stations across the
+section's extent via the same per-callsign jitter as grid cells.
+`bus_view::station_locator` yields a `Locator::{Grid,Section}`, and
+`LogEntry`/`CompletedQso` carry the `Section` so worked FD contacts plot too.
+Land-snapping is implemented (`panel_data::snap_to_land`): a position over water
+is relocated to the nearest land within its region, tested against the same
+land/lake mesh the map draws. Applies to grids and sections alike; resolved
+positions are memoized so a spot stays put across redraws.
 
 # Next
 

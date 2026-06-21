@@ -305,6 +305,7 @@ fn build_log(
         exchange_sent: done.exchange_sent,
         exchange_rcvd: done.exchange_rcvd,
         grid: done.grid,
+        section: done.section,
     }
 }
 

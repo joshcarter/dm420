@@ -7,6 +7,11 @@
 //! The geometry is in the prototype's logical pixels at a 960×600 panel; keep
 //! the ratios, exact px aren't sacred.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+
+use crate::geo_data;
+
 // ============================================================ LAYOUT
 pub const PANEL_W: f32 = 960.0;
 pub const PANEL_H: f32 = 600.0;
@@ -103,6 +108,7 @@ pub const RELIEF_LAT1: f32 = 90.0;
 // ============================================================ MAIDENHEAD GRID → LON/LAT
 /// A decoded Maidenhead locator: cell CENTER plus the size of the smallest cell
 /// that was parsed (used to spread co-grid stations without leaving the square).
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GridLoc {
     pub lon: f32,
     pub lat: f32,
@@ -157,24 +163,284 @@ pub fn grid_to_lonlat(grid: &str) -> Option<GridLoc> {
     })
 }
 
-/// Position a station from its callsign + grid: the grid-cell center plus a small
-/// deterministic per-callsign offset (±0.4 of the cell) so co-grid stations don't
-/// overlap. Stable across redraws (hash-based, no randomness). `None` if the grid
-/// can't be parsed.
-pub fn station_lonlat(call: &str, grid: &str) -> Option<(f32, f32)> {
+/// Spread a station within a located region (grid cell or section bounds): the
+/// region center plus a small deterministic per-callsign offset (±0.4 of the
+/// region) so co-located stations don't overlap. Stable across redraws
+/// (hash-based, no randomness).
+fn spread(call: &str, loc: GridLoc) -> (f32, f32) {
     let GridLoc {
         lon,
         lat,
         lon_size,
         lat_size,
-    } = grid_to_lonlat(grid)?;
+    } = loc;
     // Two independent hashes (distinct seeds) so the lon/lat offsets don't share a
     // bit window — a single 32-bit FNV word concentrates entropy in its low bits.
     let frac = |h: u32| ((h & 0xffff) as f32 / 65535.0 - 0.5) * 0.8; // −0.4..0.4
-    Some((
+    (
         lon + frac(fnv1a(call, 0x811c_9dc5)) * lon_size,
         lat + frac(fnv1a(call, 0x517c_c1b7)) * lat_size,
-    ))
+    )
+}
+
+/// Position a station from its callsign + grid. `None` if the grid can't be parsed.
+pub fn station_lonlat(call: &str, grid: &str) -> Option<(f32, f32)> {
+    place(call, &Locator::Grid(grid.to_string()))
+}
+
+/// Where a map spot's location comes from. A grid (precise) or an ARRL/RAC section
+/// (coarse — a Field Day responder sends only its section, never a grid). Strings,
+/// not the `types` newtypes, to keep this module dependency-free.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Locator {
+    Grid(String),
+    Section(String),
+}
+
+/// Position a station from whatever locator we have. Sections place at the
+/// section's regional centroid with the spread scaled to the section's extent, so
+/// co-section stations scatter across the region rather than stacking on one
+/// point. `None` if the locator can't be resolved.
+pub fn place_station(call: &str, loc: &Locator) -> Option<(f32, f32)> {
+    place(call, loc)
+}
+
+/// Memo of resolved spots: `(call, locator-key)` → position (or `None` if unplaceable).
+type PlacedCache = HashMap<(String, String), Option<(f32, f32)>>;
+
+thread_local! {
+    /// Memoized resolved positions, keyed by `(call, locator)`. Placement is a pure
+    /// deterministic function, so this is just a cache: it skips the snap-to-land
+    /// search on every redraw (and per `docs/map_panel.md`, a station's chosen spot
+    /// must *stay put* once picked — same input, same output, guaranteed). The egui
+    /// UI is single-threaded, so a `thread_local` is enough.
+    static PLACED: RefCell<PlacedCache> = RefCell::new(HashMap::new());
+}
+
+/// Resolve a station's map position: locator → region, spread within it, then snap
+/// off water onto land within the region (`docs/map_panel.md`). Memoized so the
+/// search runs once per station and the spot is stable across frames.
+fn place(call: &str, loc: &Locator) -> Option<(f32, f32)> {
+    let key = (
+        call.to_string(),
+        match loc {
+            Locator::Grid(g) => format!("g:{}", g.to_ascii_uppercase()),
+            Locator::Section(s) => format!("s:{}", s.trim().to_ascii_uppercase()),
+        },
+    );
+    if let Some(cached) = PLACED.with(|m| m.borrow().get(&key).copied()) {
+        return cached;
+    }
+    let region = match loc {
+        Locator::Grid(g) => grid_to_lonlat(g),
+        Locator::Section(s) => section_to_lonlat(s),
+    };
+    let out = region.map(|r| snap_to_land(spread(call, r), r));
+    PLACED.with(|m| m.borrow_mut().insert(key, out));
+    out
+}
+
+// ============================================================ SNAP-TO-LAND
+/// If `(lon, lat)` already sits on land, keep it. Otherwise relocate it to the
+/// nearest land point *within the region* (`docs/map_panel.md`: an approximate
+/// position over water is moved onto land inside its locator). Search is a lattice
+/// over the same ±0.4-of-region envelope the spread uses, so a snapped marker never
+/// leaves the cell/section. Returns the original point if the whole region is water
+/// (best effort — e.g. a mid-ocean grid cell).
+fn snap_to_land(point: (f32, f32), region: GridLoc) -> (f32, f32) {
+    let (lon, lat) = point;
+    if point_on_land(lon, lat) {
+        return point;
+    }
+    let half_lon = 0.4 * region.lon_size;
+    let half_lat = 0.4 * region.lat_size;
+    const N: i32 = 8; // (2N+1)² = 289 candidate points across the region
+    let mut best: Option<(f32, f32)> = None;
+    let mut best_d = f32::MAX;
+    for iy in -N..=N {
+        for ix in -N..=N {
+            let cx = region.lon + half_lon * (ix as f32 / N as f32);
+            let cy = region.lat + half_lat * (iy as f32 / N as f32);
+            if point_on_land(cx, cy) {
+                let d = (cx - lon).powi(2) + (cy - lat).powi(2);
+                if d < best_d {
+                    best_d = d;
+                    best = Some((cx, cy));
+                }
+            }
+        }
+    }
+    best.unwrap_or(point)
+}
+
+/// Is `(lon, lat)` on land? True inside the land mesh but outside every lake — the
+/// same triangulated geometry the Contacts map fills (land) and overlays as water
+/// (lakes), so snapping agrees with what's drawn.
+fn point_on_land(lon: f32, lat: f32) -> bool {
+    in_mesh(lon, lat, geo_data::LAND_VERTS, geo_data::LAND_IDX)
+        && !in_mesh(lon, lat, geo_data::LAKES_VERTS, geo_data::LAKES_IDX)
+}
+
+/// Point-in-mesh test: true if `(lon, lat)` falls inside any triangle. `verts` are
+/// `(lat, lon)`; `idx` lists triangles as index triples. A bounding-box reject per
+/// triangle keeps this cheap despite the world-scale mesh.
+fn in_mesh(lon: f32, lat: f32, verts: &[(f32, f32)], idx: &[u32]) -> bool {
+    for t in idx.chunks_exact(3) {
+        let a = verts[t[0] as usize];
+        let b = verts[t[1] as usize];
+        let c = verts[t[2] as usize];
+        // verts are (lat, lon): x = lon = .1, y = lat = .0.
+        let (ax, ay) = (a.1, a.0);
+        let (bx, by) = (b.1, b.0);
+        let (cx, cy) = (c.1, c.0);
+        // Cheap AABB reject before the full edge test.
+        if lon < ax.min(bx).min(cx)
+            || lon > ax.max(bx).max(cx)
+            || lat < ay.min(by).min(cy)
+            || lat > ay.max(by).max(cy)
+        {
+            continue;
+        }
+        if point_in_tri(lon, lat, ax, ay, bx, by, cx, cy) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Standard half-plane sign test for point `(px, py)` against triangle `a, b, c`.
+/// Boundary points count as inside.
+#[allow(clippy::too_many_arguments)]
+fn point_in_tri(
+    px: f32,
+    py: f32,
+    ax: f32,
+    ay: f32,
+    bx: f32,
+    by: f32,
+    cx: f32,
+    cy: f32,
+) -> bool {
+    let sign = |px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32| {
+        (px - bx) * (ay - by) - (ax - bx) * (py - by)
+    };
+    let d1 = sign(px, py, ax, ay, bx, by);
+    let d2 = sign(px, py, bx, by, cx, cy);
+    let d3 = sign(px, py, cx, cy, ax, ay);
+    let neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
+    let pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
+    !(neg && pos)
+}
+
+// ====================================================== ARRL/RAC SECTION → LON/LAT
+/// ARRL/RAC Field Day sections → an approximate region: `(abbr, center_lon,
+/// center_lat, lon_extent, lat_extent)` in degrees. Coarse on purpose — a section
+/// is a state-or-larger region, so the extent feeds the same per-callsign spread
+/// as a grid cell, scattering co-section stations across the region instead of
+/// stacking them. Centroids are eyeballed, good enough to land a marker in the
+/// right state/province (all a section warrants). Covers the 70 ARRL + 13 RAC
+/// sections; `DX` and bare-class traffic carry no location and resolve to `None`.
+const SECTIONS: &[(&str, f32, f32, f32, f32)] = &[
+    // --- ARRL: whole-state sections ---
+    ("AL", -86.8, 32.8, 3.0, 3.0),
+    ("AK", -150.0, 63.0, 16.0, 6.0),
+    ("AZ", -111.7, 34.3, 4.0, 4.0),
+    ("AR", -92.4, 34.8, 3.0, 2.5),
+    ("CO", -105.5, 39.0, 5.0, 3.0),
+    ("CT", -72.7, 41.6, 1.5, 1.0),
+    ("DE", -75.5, 39.0, 0.6, 1.2),
+    ("GA", -83.5, 32.7, 3.0, 3.0),
+    ("ID", -114.5, 44.4, 5.0, 6.0),
+    ("IL", -89.2, 40.0, 3.0, 5.0),
+    ("IN", -86.3, 39.9, 2.5, 4.0),
+    ("IA", -93.5, 42.0, 5.0, 2.5),
+    ("KS", -98.3, 38.5, 6.0, 2.5),
+    ("KY", -85.3, 37.5, 5.0, 2.0),
+    ("LA", -92.0, 31.0, 3.5, 3.0),
+    ("ME", -69.2, 45.4, 3.0, 3.5),
+    ("MI", -85.0, 44.3, 5.0, 5.0),
+    ("MN", -94.3, 46.3, 6.0, 5.0),
+    ("MS", -89.7, 32.7, 2.5, 4.0),
+    ("MO", -92.5, 38.4, 5.0, 3.5),
+    ("MT", -109.5, 47.0, 11.0, 4.0),
+    ("NE", -99.8, 41.5, 8.0, 2.5),
+    ("NV", -116.9, 39.5, 4.0, 7.0),
+    ("NH", -71.6, 43.7, 1.5, 3.0),
+    ("NM", -106.1, 34.5, 6.0, 5.0),
+    ("NC", -79.4, 35.5, 8.0, 2.5),
+    ("ND", -100.5, 47.5, 7.0, 2.5),
+    ("OH", -82.8, 40.3, 4.0, 3.5),
+    ("OK", -97.5, 35.5, 7.0, 2.5),
+    ("OR", -120.6, 44.0, 7.0, 4.0),
+    ("RI", -71.5, 41.7, 0.7, 0.8),
+    ("SC", -80.9, 33.9, 4.0, 2.5),
+    ("SD", -100.3, 44.4, 7.0, 2.5),
+    ("TN", -86.3, 35.8, 9.0, 1.8),
+    ("UT", -111.7, 39.3, 3.5, 5.0),
+    ("VT", -72.7, 44.1, 1.0, 3.0),
+    ("VA", -78.7, 37.5, 7.0, 2.5),
+    ("WV", -80.6, 38.6, 4.0, 3.0),
+    ("WI", -89.8, 44.6, 4.0, 4.5),
+    ("WY", -107.5, 43.0, 7.0, 3.5),
+    // --- ARRL: multi-section states ---
+    ("EPA", -76.0, 40.9, 3.0, 1.5), // Eastern Pennsylvania
+    ("WPA", -79.7, 41.0, 2.5, 1.8), // Western Pennsylvania
+    ("MDC", -76.8, 39.0, 3.0, 1.0), // Maryland-DC
+    ("NNJ", -74.4, 40.8, 0.8, 1.0), // Northern New Jersey
+    ("SNJ", -74.7, 39.5, 0.9, 1.0), // Southern New Jersey
+    ("ENY", -73.9, 42.6, 1.2, 2.0), // Eastern New York
+    ("NNY", -75.0, 44.2, 2.0, 1.2), // Northern New York
+    ("NLI", -73.3, 40.8, 1.2, 0.5), // NYC / Long Island
+    ("EMA", -71.0, 42.4, 1.2, 0.8), // Eastern Massachusetts
+    ("WMA", -72.6, 42.4, 1.2, 0.8), // Western Massachusetts
+    ("EWA", -118.5, 47.3, 3.0, 2.0), // Eastern Washington
+    ("WWA", -122.3, 47.5, 1.5, 2.5), // Western Washington
+    ("SF", -122.6, 38.3, 0.8, 1.0), // San Francisco
+    ("EB", -122.0, 37.8, 0.8, 0.8), // East Bay
+    ("SCV", -121.8, 37.2, 0.8, 0.8), // Santa Clara Valley
+    ("SJV", -119.8, 36.5, 2.0, 3.0), // San Joaquin Valley
+    ("SV", -121.5, 39.3, 1.5, 2.5), // Sacramento Valley
+    ("LAX", -118.3, 34.1, 1.0, 0.8), // Los Angeles
+    ("ORG", -117.8, 33.7, 0.6, 0.6), // Orange
+    ("SB", -119.8, 34.7, 2.0, 1.2), // Santa Barbara
+    ("SDG", -116.9, 33.0, 1.5, 1.2), // San Diego
+    ("NTX", -97.0, 33.0, 4.0, 2.0), // North Texas
+    ("STX", -98.5, 29.0, 4.0, 3.0), // South Texas
+    ("WTX", -102.0, 31.5, 4.0, 3.0), // West Texas
+    ("NFL", -82.5, 30.0, 4.0, 1.5), // Northern Florida
+    ("SFL", -80.5, 26.3, 1.5, 1.5), // Southern Florida
+    ("WCF", -82.2, 28.0, 1.0, 1.5), // West Central Florida
+    ("PR", -66.5, 18.2, 1.2, 0.4),  // Puerto Rico
+    ("VI", -64.8, 18.0, 0.4, 0.3),  // Virgin Islands
+    ("PAC", -157.9, 21.3, 3.0, 2.0), // Pacific (Hawaii)
+    // --- RAC: Canadian sections ---
+    ("MAR", -64.0, 45.5, 4.0, 2.0), // Maritime (NS/NB/PEI)
+    ("NL", -57.0, 49.0, 6.0, 4.0),  // Newfoundland/Labrador
+    ("QC", -72.0, 47.0, 10.0, 5.0), // Quebec
+    ("ONE", -76.5, 45.2, 2.0, 1.5), // Ontario East
+    ("ONN", -85.0, 49.0, 10.0, 4.0), // Ontario North
+    ("ONS", -81.0, 43.2, 2.5, 1.5), // Ontario South
+    ("GTA", -79.4, 43.7, 1.0, 0.6), // Greater Toronto Area
+    ("MB", -98.0, 53.0, 6.0, 6.0),  // Manitoba
+    ("SK", -106.0, 53.0, 7.0, 6.0), // Saskatchewan
+    ("AB", -114.0, 53.5, 6.0, 6.0), // Alberta
+    ("BC", -123.0, 52.0, 8.0, 7.0), // British Columbia
+    ("NT", -120.0, 64.0, 30.0, 8.0), // Northern Territories (YT/NWT/NU)
+];
+
+/// Resolve an ARRL/RAC section abbreviation to its region centroid + extent.
+/// Case-insensitive. `None` for unknown sections (e.g. `DX`) so callers skip them.
+pub fn section_to_lonlat(section: &str) -> Option<GridLoc> {
+    let s = section.trim().to_ascii_uppercase();
+    SECTIONS
+        .iter()
+        .find(|(abbr, ..)| *abbr == s)
+        .map(|&(_, lon, lat, lon_size, lat_size)| GridLoc {
+            lon,
+            lat,
+            lon_size,
+            lat_size,
+        })
 }
 
 /// FNV-1a 32-bit hash from an explicit offset basis (`seed`) — fast and stable,
@@ -266,7 +532,7 @@ pub fn haversine_km(la1: f32, lo1: f32, la2: f32, lo2: f32) -> f32 {
     2.0 * re * a.sqrt().min(1.0).asin()
 }
 
-// Coastline/land/lakes geometry now lives in `geo_data.rs` (Natural Earth 50m,
+// Coastline/land/lakes geometry now lives in `geo_data.rs` (Natural Earth 10m,
 // pre-triangulated). See `tools/gen_geo.py` to regenerate.
 
 // ============================================================ WATERFALL DECODE RAIL (fake)
@@ -365,5 +631,76 @@ mod tests {
         // Different callsigns in the same grid get different spots.
         assert_ne!(a, station_lonlat("W2NYC", "FN31").unwrap());
         assert!(station_lonlat("NOGRID", "ZZ99").is_none());
+    }
+
+    #[test]
+    fn section_known_and_case_insensitive() {
+        let wi = section_to_lonlat("WI").unwrap();
+        // Wisconsin centroid lands in the upper Midwest, north of the equator.
+        assert!(wi.lon < -80.0 && wi.lon > -100.0);
+        assert!(wi.lat > 40.0 && wi.lat < 50.0);
+        // Section lookup folds case and trims.
+        assert_eq!(section_to_lonlat(" wi "), Some(wi));
+        // Unknown sections (e.g. DX) and grids resolve to None.
+        assert!(section_to_lonlat("DX").is_none());
+        assert!(section_to_lonlat("ZZZ").is_none());
+    }
+
+    #[test]
+    fn place_station_spreads_within_section() {
+        let region = section_to_lonlat("CO").unwrap();
+        let a = place_station("N0JDC", &Locator::Section("CO".into())).unwrap();
+        let b = place_station("N0JDC", &Locator::Section("CO".into())).unwrap();
+        assert_eq!(a, b, "section placement is deterministic");
+        // Stays within ±0.4 of the section extent — the marker never leaves the region.
+        assert!((a.0 - region.lon).abs() <= 0.4 * region.lon_size + 1e-4);
+        assert!((a.1 - region.lat).abs() <= 0.4 * region.lat_size + 1e-4);
+        // Distinct calls in one section scatter; a grid locator still routes correctly.
+        assert_ne!(a, place_station("W4LL", &Locator::Section("CO".into())).unwrap());
+        assert_eq!(
+            place_station("K1ABC", &Locator::Grid("FN31".into())),
+            station_lonlat("K1ABC", "FN31"),
+        );
+        assert!(place_station("X", &Locator::Section("DX".into())).is_none());
+    }
+
+    #[test]
+    fn point_on_land_classifies_known_points() {
+        // Denver, CO — solidly inland.
+        assert!(point_on_land(-104.99, 39.74));
+        // Mid–Pacific and mid–Atlantic — open ocean.
+        assert!(!point_on_land(-140.0, 30.0));
+        assert!(!point_on_land(-40.0, 35.0));
+    }
+
+    #[test]
+    fn snap_relocates_water_point_onto_land() {
+        // A region centred off the California coast (open water) but wide enough that
+        // its eastern edge reaches the mainland.
+        let region = GridLoc {
+            lon: -125.0,
+            lat: 37.0,
+            lon_size: 8.0,
+            lat_size: 2.0,
+        };
+        assert!(!point_on_land(region.lon, region.lat), "centre must be water");
+        let snapped = snap_to_land((region.lon, region.lat), region);
+        assert!(point_on_land(snapped.0, snapped.1), "snapped point is on land");
+        // Stays inside the ±0.4 region envelope.
+        assert!((snapped.0 - region.lon).abs() <= 0.4 * region.lon_size + 1e-4);
+        assert!((snapped.1 - region.lat).abs() <= 0.4 * region.lat_size + 1e-4);
+    }
+
+    #[test]
+    fn snap_keeps_point_when_region_is_all_water() {
+        // A small mid-ocean region: nothing to snap to, so the point is unchanged.
+        let region = GridLoc {
+            lon: -150.0,
+            lat: 30.0,
+            lon_size: 2.0,
+            lat_size: 2.0,
+        };
+        let p = (region.lon, region.lat);
+        assert_eq!(snap_to_land(p, region), p);
     }
 }

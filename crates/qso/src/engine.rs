@@ -64,6 +64,9 @@ pub struct TxIntent {
 pub struct CompletedQso {
     pub call: Callsign,
     pub grid: Option<GridSquare>,
+    /// The partner's ARRL/RAC section, from a Field Day exchange. Carried for the
+    /// map: a Field Day responder sends only a section, never a grid.
+    pub section: Option<Section>,
     pub exchange_sent: String,
     pub exchange_rcvd: String,
 }
@@ -742,6 +745,7 @@ impl Engine {
             return CompletedQso {
                 call: Callsign(String::new()),
                 grid: None,
+                section: None,
                 exchange_sent: String::new(),
                 exchange_rcvd: String::new(),
             };
@@ -765,6 +769,7 @@ impl Engine {
         CompletedQso {
             call: a.partner.clone(),
             grid: a.partner_grid.clone(),
+            section: a.rcvd_fd.as_ref().map(|(_, s)| s.clone()),
             exchange_sent: sent,
             exchange_rcvd: rcvd,
         }

@@ -142,7 +142,7 @@ fn resolve_projection(
     }
     let mut pts: Vec<Vec2> = spots
         .iter()
-        .filter_map(|s| pd::station_lonlat(&s.call, &s.grid))
+        .filter_map(|s| pd::place_station(&s.call, &s.loc))
         .map(|(lon, lat)| Vec2::new(pd::map_x(lon), pd::map_y(lat)))
         .collect();
     pts.push(Vec2::new(pd::map_x(home_ll.0), pd::map_y(home_ll.1)));
@@ -333,7 +333,7 @@ impl Panel for Contacts {
             let on_view = spots
                 .iter()
                 .find(|s| s.call.eq_ignore_ascii_case(call))
-                .and_then(|s| pd::station_lonlat(&s.call, &s.grid))
+                .and_then(|s| pd::place_station(&s.call, &s.loc))
                 .map(|(lon, lat)| proj.content.contains(proj.lonlat(lon, lat)));
             if on_view == Some(false) {
                 self.view = None;
@@ -385,7 +385,7 @@ impl Panel for Contacts {
             let hit = spots
                 .iter()
                 .filter_map(|s| {
-                    pd::station_lonlat(&s.call, &s.grid)
+                    pd::place_station(&s.call, &s.loc)
                         .map(|(lon, lat)| (s, proj.lonlat(lon, lat).distance(pos)))
                 })
                 .filter(|(_, d)| *d <= HIT_RADIUS)
@@ -597,7 +597,7 @@ fn draw_map(
     let map_painter = painter.with_clip_rect(screen.shrink(2.0));
     let painter = &map_painter;
 
-    // 1) basemap: pre-triangulated land + lakes (Natural Earth 50m, earcut offline).
+    // 1) basemap: pre-triangulated land + lakes (Natural Earth 10m, earcut offline).
     let project = |verts: &[(f32, f32)]| -> Vec<Pos2> {
         verts.iter().map(|&(la, lo)| proj(lo, la)).collect()
     };
@@ -718,7 +718,7 @@ fn draw_map(
         spots
             .iter()
             .find(|s| s.call.eq_ignore_ascii_case(call))
-            .and_then(|s| pd::station_lonlat(&s.call, &s.grid))
+            .and_then(|s| pd::place_station(&s.call, &s.loc))
             .map(|(lon, lat)| proj(lon, lat))
     });
     if let Some(sp) = selected_pos {
@@ -789,7 +789,7 @@ fn draw_map(
     // markers dim with last-heard age (full → 0.2 over the hour; spots older than an
     // hour are filtered upstream); a CQ caller reads as a filled disc, others a circle.
     for s in spots.iter().filter(|s| !s.worked) {
-        let Some((lon, lat)) = pd::station_lonlat(&s.call, &s.grid) else {
+        let Some((lon, lat)) = pd::place_station(&s.call, &s.loc) else {
             continue;
         };
         let age = ((now_ms - s.last_ms).max(0) as f32 / 3_600_000.0).clamp(0.0, 1.0);
@@ -806,7 +806,7 @@ fn draw_map(
     }
     // Worked → accent plus sign.
     for s in spots.iter().filter(|s| s.worked) {
-        let Some((lon, lat)) = pd::station_lonlat(&s.call, &s.grid) else {
+        let Some((lon, lat)) = pd::place_station(&s.call, &s.loc) else {
             continue;
         };
         plot(&s.call, lon, lat, Marker::Plus, pal.accent, pal.body);

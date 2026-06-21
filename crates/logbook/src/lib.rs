@@ -145,6 +145,7 @@ mod tests {
             exchange_sent: "-10".into(),
             exchange_rcvd: "-12".into(),
             grid: Some(GridSquare("FN31".into())),
+            section: None,
         }
     }
 

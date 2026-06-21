@@ -62,7 +62,9 @@ pub struct Callsign(pub String);
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct GridSquare(pub String);
 
-/// An ARRL/RAC section, e.g. `"CO"` — exchange/log only, never a map location.
+/// An ARRL/RAC section, e.g. `"CO"`. Carried in the exchange/log, and also a
+/// coarse map location for Field Day stations that send no grid (resolved to a
+/// regional centroid by the GUI's `panel_data::section_to_lonlat`).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Section(pub String);
 
@@ -486,6 +488,12 @@ pub struct LogEntry {
     pub exchange_rcvd: String,
     /// For the map.
     pub grid: Option<GridSquare>,
+    /// For the map: the ARRL/RAC section from a Field Day exchange. A coarser
+    /// location source than `grid`, used to place a contact that carried no grid
+    /// (Field Day responders send only their section). `#[serde(default)]` keeps
+    /// logs written before this field was added loadable.
+    #[serde(default)]
+    pub section: Option<Section>,
     // ...remaining ADIF-mappable fields land here as the logbook crate grows.
 }
 
@@ -990,6 +998,7 @@ mod tests {
             exchange_sent: "-09".into(),
             exchange_rcvd: "R-12".into(),
             grid: Some(GridSquare("EM73".into())),
+            section: None,
         });
         round_trip(WorkedStatus::New);
         round_trip(WorkedStatus::WorkedByMe);
