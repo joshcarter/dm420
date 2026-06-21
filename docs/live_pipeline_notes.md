@@ -1,4 +1,4 @@
-# Live FT8 pipeline — prototype notes & "real implementation" TODO
+# Live FT8/FT4 pipeline — prototype notes & "real implementation" TODO
 
 This documents the shortcuts taken while bringing up the live path (real Kenwood
 CAT control, live audio capture, FT8 decode, and the scrolling waterslide/
@@ -16,8 +16,9 @@ Severity: 🔴 correctness/blocker · 🟡 should-fix · 🟢 polish.
   **substring** match — `open_cpal_device` was upgraded from exact-match). Unset ⇒
   system default input. A panel-by-panel device picker (`audio::list_devices()`)
   is still the eventual UI.
-- ✅ **Mode is configurable.** `DM420_MODE=ft8|ft4`. (A band/mode selector in the
-  UI is still future work.)
+- ✅ **Mode is configurable.** `DM420_MODE=ft8|ft4`, plus a live FT8/FT4 toggle in the
+  waterslide header (`set_protocol`); switching retunes the dial to the mode's calling
+  frequency. (A full band selector UI is still future work.)
 - 🟡 **Real path is the default; `DM420_MOCK` / `DM420_WAV` env vars switch it.**
   Fine for bring-up; the env layer (`settings.rs`) is structured so a future
   per-panel settings UI edits the same `Settings`/`CoreConfig` instead of the
@@ -32,10 +33,10 @@ Severity: 🔴 correctness/blocker · 🟡 should-fix · 🟢 polish.
   polls with a failure threshold, and drops + reopens with capped backoff on link
   loss. The `RigCommand` server replies `"rig offline"` while down. The Waterfall
   panel dims the VFO readout to `---.---` when the rig is faulted.
-- 🔴 **TX is hard-blocked.** `allow_transmit: false` everywhere; no PTT/audio-TX
-  path is wired. The interlock-token validation is stubbed — see the comment in
-  `rig_adapter::apply` ("future core granter"). A real TX path needs the granter,
-  PTT sequencing, and the `AudioTx`/`TxReport` topics.
+- ✅ **TX is live (FT8).** `allow_transmit` is on; `core::tx` serves `AudioTx`, keys PTT
+  through the real interlock granter (`core::interlock`), plays the synth to the rig's
+  data-in, and reports on `TxReport`; the `qso` engine drives the sequence. **FT4 TX is
+  not yet done** — the encoder synthesizes FT8 only (`encode.rs`); see `JOEL.md`.
 
 ## Still-mock subsystems (in real mode)
 

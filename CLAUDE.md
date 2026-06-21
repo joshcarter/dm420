@@ -63,19 +63,20 @@ subscriber must never stall a publisher.**
 | `rig` | ✅ implemented | Kenwood CAT, mock rig, port/baud/profile autodetect (vendored, W4LL) |
 | `audio` | ✅ implemented | cpal capture/playback/device list (vendored) |
 | `dsp` | ✅ implemented | hand-rolled radix-2 FFT + spectrum rows |
-| `modes` | ✅ implemented | FT8/FT4 encode+decode — MIT `ft8_lib` port (vendored, W4LL; see `crates/modes/ATTRIBUTION.md`) |
+| `modes` | ✅ implemented | FT8+FT4 **decode**; **encode/synth is FT8-only** (FT4 synth pending — see `JOEL.md`). MIT `ft8_lib` port (vendored, W4LL; see `crates/modes/ATTRIBUTION.md`) |
 | `mocks` | ✅ implemented | fake producers for every topic; `mocks::spawn_support` |
 | `gui` | ✅ active dev | the app |
-| `qso` | 🪧 **stub** (~8 lines) | contact state machine — not built; currently mocked |
+| `qso` | ✅ implemented | contact auto-sequencer (CQ→report→RR73→73, incl. Field Day); tracks mode from decodes and drives the real TX path (`engine.rs`/`shell.rs`/`message.rs`, ~1.8k lines) |
 | `logbook` | ✅ implemented | JSON-persistent log store: logs on RR73, replays history on startup; ADIF + peer-merge still pending |
 | `callbook` | ✅ implemented | offline call-sign → country/ISO prefix resolver (Tier-1 of the Call Sign panel); pure, no I/O. Online name enrichment (Tier-2) not built |
 | `scanner` | 🪧 **stub** | band-scanner strategy — not built; currently mocked |
 
-In **real mode** the **scanner** is still mock (`mocks::spawn_support`); the **logbook**
-is now the real persistent crate (spawned by `core::spawn`, JSON at `~/.dm420/logbook.json`
-or `DM420_LOGBOOK`), and the clock is real wall-clock. So the Log Book and Contacts/map
-panels show **real** QSOs in real mode — and seeded **fake** QSOs in mock mode, which still
-uses `mocks::spawn` for everything.
+In **real mode** the **scanner** is the only remaining mock (`mocks::spawn_support`); the
+**qso** auto-sequencer, **logbook**, decode, interlock granter, and **audio-TX** are all
+real (spawned by `core::spawn`), and the clock is real wall-clock. So real mode runs live
+**end-to-end QSOs — RX and TX — on FT8**, and the Log Book and Contacts/map panels show
+**real** QSOs. Mock mode still uses `mocks::spawn` for everything (seeded **fake** QSOs,
+no keying).
 
 ### GUI internals (`crates/gui/src`)
 
@@ -88,7 +89,7 @@ uses `mocks::spawn` for everything.
   runs one *pump* task per subscribed topic into shared `Cell`/`Ring`s; panels read
   those each frame with **no `.await`**. The one piece the handoff docs don't cover.
 - `panels/` — the active instruments behind the `Panel` trait + `PanelCtx`:
-  `waterfall` (the live FT8 **waterslide** + Send row + unlocked config form),
+  `waterfall` (the live FT8/FT4 **waterslide** + real auto-sequenced Send row + mode toggle + unlocked config form),
   `log_book`, `band_scan`, `call_sign` (selected-station country/flag/distance/
   bearing, offline via the `callbook` crate + `flag.rs`), `contacts` (the map).
 - `waterslide_panel.rs` / `waterslide_sim.rs` — **still live**: rendering helpers,
@@ -170,23 +171,25 @@ DM420_MOCK=1 cargo run -p gui                                   # no hardware (m
 
 ## Current state & near-term directions
 
-The **live FT8 receive path works end-to-end** (real Kenwood CAT, cpal capture, FT8
-decode, scrolling waterslide). Recent work (`git log`) has been GUI: FT8 Send row with a
-**mock** arm/transmit lifecycle, active-panel keyboard routing, focus markers, and
-configurable station call/grid. **Read `docs/live_pipeline_notes.md` before touching the
-pipeline** — it catalogs the prototype shortcuts and severity-tagged known issues.
+The **full FT8 QSO path works end-to-end on air** — real Kenwood CAT, cpal capture, FT8
+decode + scrolling waterslide on RX, and a real auto-sequenced TX path (interlock granter
+→ PTT → audio-TX → `TxReport`) driven by the `qso` engine; `allow_transmit` is **on**.
+**Read `docs/live_pipeline_notes.md` before touching the pipeline** — it catalogs the
+remaining prototype shortcuts and severity-tagged known issues.
 
 Notable open items (see `TODO.md`, `docs/live_pipeline_notes.md`, `OVERVIEW.md §7`):
 
-- 🔴 **TX is hard-blocked** (`allow_transmit: false`). No PTT/audio-TX path; the
-  interlock-token granter (a `core` service) is stubbed. Real TX needs the granter, PTT
-  sequencing, and the `AudioTx`/`TxReport` topics. The Send row's transmit is mock.
-- 🔴 **Build the real `qso`, `logbook`, `scanner` crates** to displace the mocks (one
-  topic at a time, mirroring the `mocks::spawn` / `core::spawn` pattern).
+- 🔴 **FT4 transmit is unimplemented.** RX, slot timing, and the QSO/TX path are all
+  mode-aware, but the modes encoder synthesizes **FT8 only** (`encode.rs`), so `core/tx.rs`
+  rejects a non-FT8 over ("TX synthesis not implemented yet"). Completing FT4 needs an FT4
+  tone/GFSK synth, a mode-aware `synth_message`, slot-relative TX caps (`MAX_TX`/
+  `PTT_WATCHDOG` are FT8-sized), and an FT4 CQ-first mode source. See `JOEL.md`.
+- 🔴 **Build the real `scanner` crate** — the last mock (`qso` and `logbook` are now real;
+  `scanner` is still `mocks::spawn_support`). Mirror the `mocks::spawn` / `core::spawn`
+  pattern, one topic at a time.
 - 🔴 **Spectrogram ↔ decode-text drift:** text is placed by wall-clock age, the
   spectrogram scrolls by accumulated frame `dt`. Fix = place spectrogram columns by
   their `SpectrumRow.t`.
-- **FT4/FT8 mode switch + per-band calling-frequency tables** in the UI (`TODO.md`).
 - **Waterslide decode-text layout:** nudge overlapping decodes up/down for legibility
   **without** rearranging everything; clamp min/max font size; click-to-select must hit
   the true audio center (ignore any text-shift offset).

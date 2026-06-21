@@ -25,10 +25,13 @@ use crate::rig_adapter::CommandResult;
 
 /// The modes synth produces audio at 12 kHz.
 const TX_SAMPLE_RATE: u32 = 12_000;
-/// Hard cap on a single transmission so key-down always lands before the next slot
-/// even if playback never signals done. An FT8 over is ~12.6 s in a 15 s slot, and
-/// this stays under the rig's PTT watchdog so key-down beats it.
-const MAX_TX: Duration = Duration::from_secs(14);
+/// Safety cap on a single transmission so key-down always lands before the next
+/// slot even if playback never signals done — a backstop only (normal key-down is
+/// playback-driven). Sized just under the mode's slot and the rig's PTT watchdog:
+/// FT8 ≈ 14 s in a 15 s slot, FT4 ≈ 6.5 s in a 7.5 s slot.
+fn max_tx_for(mode: t::OverAirMode) -> Duration {
+    Duration::from_millis((slot_period_ms(mode) - 1000).max(2000) as u64)
+}
 
 /// Own-TX waterfall parameters — must mirror `core::decode` so our own-TX columns
 /// share the RX axis: a 1024-pt FFT at 12 kHz (~11.7 Hz bins) kept to ~0..3000 Hz,
@@ -182,13 +185,14 @@ async fn transmit(
         message = %message.text, "audio-tx: begin over",
     );
 
-    // FT8 only for now: the encoder has no FT4 synth yet.
-    if mode != t::OverAirMode::Ft8 {
+    // Map the on-air mode to a synthesizable protocol. FT8 and FT4 both have
+    // encoders; anything else (PSK31/RTTY) has no waveform synth, so fail cleanly.
+    let Some(protocol) = crate::decode::protocol_of(mode) else {
         return (
             Some(slot),
-            t::TxOutcome::Failed(format!("{mode:?} TX synthesis not implemented yet")),
+            t::TxOutcome::Failed(format!("{mode:?} has no waveform synthesizer")),
         );
-    }
+    };
 
     // Synthesize the slot waveform, then trim the silence off both ends: trailing
     // entirely (so key-down lands right after the signal), and leading down to a
@@ -196,7 +200,8 @@ async fn transmit(
     // synth's centered ~1.18 s in — a late start otherwise pushes our DT out of the
     // far station's decode window).
     let t_synth = Instant::now();
-    let Some(mut samples) = modes::synth_message(&message.text, offset.0, TX_SAMPLE_RATE) else {
+    let Some(mut samples) = modes::synth_message(&message.text, protocol, offset.0, TX_SAMPLE_RATE)
+    else {
         return (
             Some(slot),
             t::TxOutcome::Failed(format!("cannot encode {:?}", message.text)),
@@ -270,7 +275,7 @@ async fn transmit(
         max_bins,
         stop.clone(),
     );
-    let aborted = wait_done(out, abort_gen, base).await;
+    let aborted = wait_done(out, abort_gen, base, max_tx_for(mode)).await;
     stop.store(true, Ordering::Release);
     if aborted {
         out.silence(); // cut the carrier audio now
@@ -291,10 +296,15 @@ async fn transmit(
 /// stays keyed from the single key-up in [`transmit`] — a full over fits inside the
 /// rig's PTT watchdog, so there is no mid-over re-keying. Returns `true` if the
 /// operator aborted (Stop) before playback finished.
-async fn wait_done(out: &audio::OutputStream, abort_gen: &AtomicU64, base: u64) -> bool {
+async fn wait_done(
+    out: &audio::OutputStream,
+    abort_gen: &AtomicU64,
+    base: u64,
+    max_tx: Duration,
+) -> bool {
     let tick = Duration::from_millis(200);
     let mut elapsed = Duration::ZERO;
-    while !out.is_done() && elapsed < MAX_TX {
+    while !out.is_done() && elapsed < max_tx {
         if abort_gen.load(Ordering::Acquire) != base {
             tracing::debug!("audio-tx: Stop detected mid-over; aborting carrier");
             return true; // operator hit Stop — abort the over now

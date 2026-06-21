@@ -26,16 +26,48 @@ mod text;
 mod waterfall;
 
 pub use decode::{Decode, decode, decode_streaming};
-pub use encode::synth_ft8;
+pub use encode::{synth_ft4, synth_ft8};
 pub use message::MessageType;
 
-/// Synthesize a full FT8 slot of audio for a text message (e.g.
-/// `"CQ K1ABC FN42"`) at the given audio frequency and sample rate. Returns None
-/// if the message can't be encoded. Useful for generating test/known signals.
-pub fn synth_message(text: &str, audio_freq_hz: f32, sample_rate: u32) -> Option<Vec<f32>> {
+/// Synthesize a full slot of audio for a text message (e.g. `"CQ K1ABC FN42"`) in
+/// the given `protocol`, at the given audio frequency and sample rate. Returns
+/// `None` if the message can't be encoded. Drives the live TX path and generates
+/// known signals for tests.
+pub fn synth_message(
+    text: &str,
+    protocol: Protocol,
+    audio_freq_hz: f32,
+    sample_rate: u32,
+) -> Option<Vec<f32>> {
     let mut hash = message::CallHash::new();
     let payload = message::encode_message(text, &mut hash)?;
-    Some(encode::synth_ft8(&payload, audio_freq_hz, sample_rate))
+    Some(encode::synth(&payload, protocol, audio_freq_hz, sample_rate))
 }
 pub use slot::{current_slot_start, seconds_until_next_slot, slot_period, time_into_slot};
 pub use waterfall::Protocol;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `synth_message` is the public TX entry (`core::tx` calls it): same text,
+    /// a different waveform per protocol, and each round-trips under its own mode.
+    #[test]
+    fn synth_message_is_mode_aware_and_round_trips() {
+        let text = "CQ K1ABC FN42";
+        let ft8 = synth_message(text, Protocol::Ft8, 1500.0, 12000).expect("ft8 synth");
+        let ft4 = synth_message(text, Protocol::Ft4, 1500.0, 12000).expect("ft4 synth");
+        // Mode-aware lengths: 15 s vs 7.5 s @ 12 kHz.
+        assert_eq!(ft8.len(), 180_000, "FT8 slot length");
+        assert_eq!(ft4.len(), 90_000, "FT4 slot length");
+        // Each decodes back under its own protocol.
+        assert!(
+            decode(&ft8, 12000, Protocol::Ft8).iter().any(|d| d.message == text),
+            "FT8 synth_message should round-trip"
+        );
+        assert!(
+            decode(&ft4, 12000, Protocol::Ft4).iter().any(|d| d.message == text),
+            "FT4 synth_message should round-trip"
+        );
+    }
+}

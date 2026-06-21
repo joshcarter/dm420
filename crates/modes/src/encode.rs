@@ -1,16 +1,17 @@
-//! FT8 modulation — payload -> 79 tones -> GFSK audio.
+//! FT8/FT4 modulation — payload -> channel tones -> GFSK audio.
 //!
-//! Ported from ft8_lib `encode.c` (tone layout) and `gen_ft8.c` (GFSK synthesis).
-//! Used to synthesize known signals so the decode pipeline is self-verifying
-//! without a radio, and to produce test/demo audio.
+//! Ported from ft8_lib `encode.c` (tone layout) and `gen_ft8.c`/`gen_ft4.c` (GFSK
+//! synthesis). Used to synthesize known signals so the decode pipeline is
+//! self-verifying without a radio, and to produce the live TX waveform.
+//!
+//! Per-mode parameters (symbol period, slot length, GFSK BT, tone/Costas/Gray
+//! tables, whitening) come from [`Protocol`]; the GFSK kernel below is shared.
 
-use crate::constants::{FT8_COSTAS, FT8_GRAY};
+use crate::constants::{FT4_COSTAS, FT4_GRAY, FT8_COSTAS, FT8_GRAY};
 use crate::ldpc::encode174;
 use crate::message::payload_with_crc;
+use crate::waterfall::Protocol;
 
-pub const FT8_SYMBOL_PERIOD: f32 = 0.160;
-pub const FT8_SLOT_TIME: f32 = 15.0;
-const FT8_SYMBOL_BT: f32 = 2.0;
 const GFSK_CONST_K: f32 = 5.336446; // pi * sqrt(2 / ln 2)
 
 /// Map a 77-bit payload to the 79 FT8 channel tones (3 Costas sync groups
@@ -43,6 +44,54 @@ pub fn ft8_tones(payload: &[u8; 10]) -> [u8; 79] {
             FT8_GRAY[next3(&mut bitpos)]
         };
     }
+    tones
+}
+
+/// Map a 77-bit payload to the 105 FT4 channel tones: a leading ramp symbol, then
+/// the four Costas sync blocks (4 tones each) — the first three each followed by a
+/// 29-symbol Gray-coded data group — and a trailing ramp symbol. The payload is
+/// whitened with `FT4_XOR` *before* the CRC (the exact inverse of the decoder's
+/// post-CRC de-whitening), then LDPC-encoded; data is laid out 2 bits per symbol.
+pub fn ft4_tones(payload: &[u8; 10]) -> [u8; 105] {
+    // Whiten → CRC → LDPC: the inverse of `decode::decode_candidate`'s tail.
+    let mut whitened = *payload;
+    if let Some(xor) = Protocol::Ft4.whitening() {
+        for (b, x) in whitened.iter_mut().zip(xor.iter()) {
+            *b ^= *x;
+        }
+    }
+    let a91 = payload_with_crc(&whitened);
+    let mut codeword = [0u8; 22];
+    encode174(&a91, &mut codeword);
+
+    let mut bitpos = 0usize;
+    let next2 = |bp: &mut usize| -> usize {
+        let mut v = 0usize;
+        for _ in 0..2 {
+            let bit = (codeword[*bp / 8] >> (7 - (*bp % 8))) & 1;
+            v = (v << 1) | bit as usize;
+            *bp += 1;
+        }
+        v
+    };
+
+    // tones[0] and tones[104] stay 0 — the lead-in/lead-out ramp symbols. Sync
+    // blocks start one symbol in (matches `decode::ft4_sync_score`'s `1 + ...`).
+    let mut tones = [0u8; 105];
+    let mut i = 1;
+    for (m, costas) in FT4_COSTAS.iter().enumerate() {
+        for &sym in costas {
+            tones[i] = sym;
+            i += 1;
+        }
+        if m < 3 {
+            for _ in 0..29 {
+                tones[i] = FT4_GRAY[next2(&mut bitpos)];
+                i += 1;
+            }
+        }
+    }
+    debug_assert_eq!(i, 104, "FT4 layout must fill tones[1..104]");
     tones
 }
 
@@ -114,19 +163,34 @@ fn synth_gfsk(symbols: &[u8], f0: f32, bt: f32, symbol_period: f32, sample_rate:
     signal
 }
 
-/// Synthesize a full 15-second FT8 slot for `payload` at audio frequency `f0`,
-/// with the signal centered (silence padded) like a real transmission.
-pub fn synth_ft8(payload: &[u8; 10], f0: f32, sample_rate: u32) -> Vec<f32> {
-    let tones = ft8_tones(payload);
+/// Synthesize a full slot of audio for `payload` in `protocol` at audio frequency
+/// `f0`, with the signal centered (silence padded) like a real transmission. The
+/// per-mode timing/shape comes from [`Protocol`]; the GFSK kernel is shared.
+pub fn synth(payload: &[u8; 10], protocol: Protocol, f0: f32, sample_rate: u32) -> Vec<f32> {
+    let tones: Vec<u8> = match protocol {
+        Protocol::Ft8 => ft8_tones(payload).to_vec(),
+        Protocol::Ft4 => ft4_tones(payload).to_vec(),
+    };
     let sr = sample_rate as f32;
-    let n_data = (0.5 + tones.len() as f32 * FT8_SYMBOL_PERIOD * sr) as usize;
-    let n_total = (FT8_SLOT_TIME * sr) as usize;
+    let symbol_period = protocol.symbol_period();
+    let n_data = (0.5 + tones.len() as f32 * symbol_period * sr) as usize;
+    let n_total = (protocol.slot_time() * sr) as usize;
     let n_silence = (n_total - n_data) / 2;
 
     let mut signal = vec![0.0f32; n_total];
-    let data = synth_gfsk(&tones, f0, FT8_SYMBOL_BT, FT8_SYMBOL_PERIOD, sample_rate);
+    let data = synth_gfsk(&tones, f0, protocol.gfsk_bt(), symbol_period, sample_rate);
     signal[n_silence..n_silence + data.len()].copy_from_slice(&data);
     signal
+}
+
+/// Synthesize a full FT8 slot for `payload`. Convenience wrapper over [`synth`].
+pub fn synth_ft8(payload: &[u8; 10], f0: f32, sample_rate: u32) -> Vec<f32> {
+    synth(payload, Protocol::Ft8, f0, sample_rate)
+}
+
+/// Synthesize a full FT4 slot for `payload`. Convenience wrapper over [`synth`].
+pub fn synth_ft4(payload: &[u8; 10], f0: f32, sample_rate: u32) -> Vec<f32> {
+    synth(payload, Protocol::Ft4, f0, sample_rate)
 }
 
 #[cfg(test)]
@@ -148,6 +212,32 @@ mod tests {
         let payload = [0x00u8, 1, 2, 3, 4, 5, 6, 7, 8, 0];
         let sig = synth_ft8(&payload, 1000.0, 12000);
         assert_eq!(sig.len(), 180000);
+        let peak = sig.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+        assert!(peak > 0.5, "signal should be near full-scale, peak={peak}");
+    }
+
+    #[test]
+    fn ft4_tones_have_valid_layout() {
+        let payload = [0x00u8, 1, 2, 3, 4, 5, 6, 7, 8, 0];
+        let tones = ft4_tones(&payload);
+        // 105 channel symbols, all valid 4-FSK tones (0..4).
+        assert_eq!(tones.len(), 105);
+        assert!(tones.iter().all(|&t| t < 4));
+        // Leading/trailing ramp symbols are tone 0.
+        assert_eq!(tones[0], 0);
+        assert_eq!(tones[104], 0);
+        // The four Costas sync blocks sit at 1 + 33*m, matching the decoder.
+        for (m, costas) in FT4_COSTAS.iter().enumerate() {
+            let base = 1 + 33 * m;
+            assert_eq!(&tones[base..base + 4], costas, "Costas block {m}");
+        }
+    }
+
+    #[test]
+    fn ft4_synth_produces_full_slot() {
+        let payload = [0x00u8, 1, 2, 3, 4, 5, 6, 7, 8, 0];
+        let sig = synth_ft4(&payload, 1200.0, 12000);
+        assert_eq!(sig.len(), 90000); // 7.5 s @ 12 kHz
         let peak = sig.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
         assert!(peak > 0.5, "signal should be near full-scale, peak={peak}");
     }
