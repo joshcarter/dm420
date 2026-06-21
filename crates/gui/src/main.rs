@@ -14,6 +14,7 @@
 mod app;
 mod bus_view;
 mod chrome;
+mod flag;
 mod geo_data;
 mod logging;
 mod panel_data;
@@ -36,7 +37,7 @@ use app::App;
 use bus_view::BusView;
 use chrome::{lcd_panel, make_brushed, make_relief, measure, paint_chassis, shadow};
 use panel_data as pd;
-use panels::{BandScan, Contacts, LogBook, MapPick, Panel, PanelCtx, Waterfall};
+use panels::{BandScan, CallSign, Contacts, LogBook, MapPick, Panel, PanelCtx, Waterfall};
 use theme::*;
 
 fn main() -> eframe::Result<()> {
@@ -248,20 +249,23 @@ pub struct TreeIds {
     pub root: TileId,
     pub right: TileId,
     pub band: TileId,
-    /// The four panes, in keyboard-shortcut order (Cmd/Ctrl-1..4).
+    /// The five panes, in keyboard-shortcut order (Cmd/Ctrl-1..5).
     pub waterfall: TileId,
     pub log: TileId,
+    pub callsign: TileId,
     pub contacts: TileId,
 }
 
 impl TreeIds {
-    /// The pane bound to Cmd/Ctrl-`n` (1-based): 1 FT8, 2 Log, 3 Band, 4 Map.
+    /// The pane bound to Cmd/Ctrl-`n` (1-based): 1 FT8, 2 Log, 3 Band,
+    /// 4 Call Sign, 5 Map.
     pub fn by_number(&self, n: usize) -> Option<TileId> {
         match n {
             1 => Some(self.waterfall),
             2 => Some(self.log),
             3 => Some(self.band),
-            4 => Some(self.contacts),
+            4 => Some(self.callsign),
+            5 => Some(self.contacts),
             _ => None,
         }
     }
@@ -312,6 +316,7 @@ impl App {
             right: self.share_of(self.tree_ids.right),
             log: self.share_of(self.tree_ids.log),
             band: self.share_of(self.tree_ids.band),
+            callsign: self.share_of(self.tree_ids.callsign),
             contacts: self.share_of(self.tree_ids.contacts),
         }
     }
@@ -383,21 +388,28 @@ fn build_tree() -> (Tree<Box<dyn Panel>>, TreeIds) {
     let waterfall = tiles.insert_pane(Box::new(Waterfall::new()) as Box<dyn Panel>);
     let log = tiles.insert_pane(Box::new(LogBook::new()) as Box<dyn Panel>);
     let band = tiles.insert_pane(Box::new(BandScan::new()) as Box<dyn Panel>);
+    let callsign = tiles.insert_pane(Box::new(CallSign::new()) as Box<dyn Panel>);
     let contacts = tiles.insert_pane(Box::new(Contacts::new()) as Box<dyn Panel>);
 
     // Saved tile proportions from a previous session, if any; otherwise the
-    // design defaults (Log 142, Band 112, Contacts fills the rest; Waterfall on
-    // the left). Resizable from here either way.
+    // design defaults (Log 142, Band 128, Call Sign 150, Contacts fills the rest;
+    // Waterfall on the left). Resizable from here either way.
     let saved = settings::read_layout_shares();
 
-    let right = tiles.insert_vertical_tile(vec![log, band, contacts]);
+    let right = tiles.insert_vertical_tile(vec![log, band, callsign, contacts]);
     if let Some(Tile::Container(Container::Linear(lin))) = tiles.get_mut(right) {
-        let (log_s, band_s, contacts_s) = match saved {
-            Some(s) => (s.log, s.band, s.contacts),
-            None => (pd::LOG_H, pd::BANDSCAN_H, pd::PANEL_H - pd::LOG_H - pd::BANDSCAN_H),
+        let (log_s, band_s, call_s, contacts_s) = match saved {
+            Some(s) => (s.log, s.band, s.callsign, s.contacts),
+            None => (
+                pd::LOG_H,
+                pd::BANDSCAN_H,
+                pd::CALLSIGN_H,
+                pd::PANEL_H - pd::LOG_H - pd::BANDSCAN_H - pd::CALLSIGN_H,
+            ),
         };
         lin.shares.set_share(log, log_s);
         lin.shares.set_share(band, band_s);
+        lin.shares.set_share(callsign, call_s);
         lin.shares.set_share(contacts, contacts_s);
     }
 
@@ -418,6 +430,7 @@ fn build_tree() -> (Tree<Box<dyn Panel>>, TreeIds) {
             band,
             waterfall,
             log,
+            callsign,
             contacts,
         },
     )
@@ -565,8 +578,8 @@ impl eframe::App for App {
                 );
             });
 
-        // Keyboard focus: Cmd/Ctrl-1..4 selects a panel (1 FT8, 2 Log, 3 Band,
-        // 4 Map). `modifiers.command` is Cmd on macOS, Ctrl elsewhere.
+        // Keyboard focus: Cmd/Ctrl-1..5 selects a panel (1 FT8, 2 Log, 3 Band,
+        // 4 Call Sign, 5 Map). `modifiers.command` is Cmd on macOS, Ctrl elsewhere.
         let focus_num = ctx.input(|i| {
             if !i.modifiers.command {
                 return None;
@@ -576,6 +589,7 @@ impl eframe::App for App {
                 egui::Key::Num2,
                 egui::Key::Num3,
                 egui::Key::Num4,
+                egui::Key::Num5,
             ]
             .iter()
             .position(|k| i.key_pressed(*k))

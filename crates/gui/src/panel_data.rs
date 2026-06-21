@@ -28,6 +28,9 @@ pub const LOG_H: f32 = 142.0;
 // for the two band rows (2×30 + 7 gap = 67) plus header/gap and ~9px of screen
 // padding top & bottom. See `pin_band_height`.
 pub const BANDSCAN_H: f32 = 128.0;
+// Call Sign card: header/gap + callsign/flag + two info lines (country · grid ·
+// distance, then the message exchange). Compact; a normal resizable pane.
+pub const CALLSIGN_H: f32 = 128.0;
 pub const FOOTER_H: f32 = 30.0;
 // No panel column may be dragged narrower than this. See `enforce_min_width`.
 pub const MIN_PANEL_W: f32 = 256.0;

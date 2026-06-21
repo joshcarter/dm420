@@ -579,9 +579,10 @@ pub struct LayoutShares {
     /// Root horizontal split: Waterfall column vs. the right-hand stack.
     pub waterfall: f32,
     pub right: f32,
-    /// Right vertical split: Log Book / Band Scan / Contacts map.
+    /// Right vertical split: Log Book / Band Scan / Call Sign / Contacts map.
     pub log: f32,
     pub band: f32,
+    pub callsign: f32,
     pub contacts: f32,
 }
 
@@ -625,6 +626,9 @@ pub fn read_layout_shares() -> Option<LayoutShares> {
         right: get("right")?,
         log: get("log")?,
         band: get("band")?,
+        // Default for layout files saved before the Call Sign pane existed, so an
+        // older config still loads (shares are relative and re-normalized).
+        callsign: get("callsign").unwrap_or(crate::panel_data::CALLSIGN_H),
         contacts: get("contacts")?,
     })
 }
@@ -660,6 +664,7 @@ pub fn save_window_layout(win: WindowSize, layout: LayoutShares) {
             ("right", &format_f32(layout.right)),
             ("log", &format_f32(layout.log)),
             ("band", &format_f32(layout.band)),
+            ("callsign", &format_f32(layout.callsign)),
             ("contacts", &format_f32(layout.contacts)),
         ],
     );

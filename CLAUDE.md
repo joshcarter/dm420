@@ -68,6 +68,7 @@ subscriber must never stall a publisher.**
 | `gui` | ✅ active dev | the app |
 | `qso` | 🪧 **stub** (~8 lines) | contact state machine — not built; currently mocked |
 | `logbook` | ✅ implemented | JSON-persistent log store: logs on RR73, replays history on startup; ADIF + peer-merge still pending |
+| `callbook` | ✅ implemented | offline call-sign → country/ISO prefix resolver (Tier-1 of the Call Sign panel); pure, no I/O. Online name enrichment (Tier-2) not built |
 | `scanner` | 🪧 **stub** | band-scanner strategy — not built; currently mocked |
 
 In **real mode** the **scanner** is still mock (`mocks::spawn_support`); the **logbook**
@@ -81,14 +82,15 @@ uses `mocks::spawn` for everything.
 - `main.rs` — `eframe` entry, fonts, the egui_tiles `Tactical` behavior (linear splits,
   **not tabs**), the top bar (call/grid edit fields, UTC LCD clock, lock/unlock + focus
   marker), and `App::ui` (palette, brushed-metal/relief textures, panel-focus key
-  routing `Cmd/Ctrl+1..4`).
+  routing `Cmd/Ctrl+1..5`).
 - `app.rs` — the `App` struct (single source of UI state) + `BusView`.
 - `bus_view.rs` — **the sync↔async seam**. Owns a tokio runtime holding the `BusHandle`,
   runs one *pump* task per subscribed topic into shared `Cell`/`Ring`s; panels read
   those each frame with **no `.await`**. The one piece the handoff docs don't cover.
 - `panels/` — the active instruments behind the `Panel` trait + `PanelCtx`:
   `waterfall` (the live FT8 **waterslide** + Send row + unlocked config form),
-  `log_book`, `contacts` (the map), `band_scan`.
+  `log_book`, `band_scan`, `call_sign` (selected-station country/flag/distance/
+  bearing, offline via the `callbook` crate + `flag.rs`), `contacts` (the map).
 - `waterslide_panel.rs` / `waterslide_sim.rs` — **still live**: rendering helpers,
   `Target`, `martian_cmap`, and the decode-placement sim used *by* `panels/waterfall.rs`
   (not a dead older panel).
@@ -153,7 +155,7 @@ DM420_MOCK=1 cargo run -p gui                                   # no hardware (m
   placeholder header.)
 - **Two postures: locked (operate) / unlocked (configure).** Global; every panel reads
   `PanelCtx.unlocked` to reveal/hide edit affordances. Radio settings apply on **re-lock**.
-- **Keyboard focus is global:** one panel holds focus at a time (`Cmd/Ctrl+1..4` or
+- **Keyboard focus is global:** one panel holds focus at a time (`Cmd/Ctrl+1..5` or
   click); only the active panel acts on typed input. The waterslide also routes slash
   commands (`/f 14.074`, `/b 20m`) — keep parsing a shared utility.
 - **Keep dial/center frequency distinct from outgoing audio (TX) offset** everywhere —
