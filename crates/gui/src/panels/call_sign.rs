@@ -77,11 +77,8 @@ impl Panel for CallSign {
             Pos2::new(right - flag_w, screen.top() + 7.0),
             egui::vec2(flag_w, flag_h),
         );
-        if iso.is_empty() {
-            flag::draw_flag(painter, flag_rect, "?", pal);
-        } else {
-            flag::draw_flag(painter, flag_rect, iso, pal);
-        }
+        let shown_iso = if iso.is_empty() { "?" } else { iso };
+        flag::draw_flag(ctx.ui.ctx(), painter, flag_rect, shown_iso, pal);
 
         // ---- local facts from the bus: grid (heard or logged) + worked exchange ----
         let grid = ctx
