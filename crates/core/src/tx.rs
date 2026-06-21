@@ -1,7 +1,7 @@
 //! Audio-TX service: turns a [`TxRequest`](bus::types::TxRequest) into a
 //! slot-aligned on-air transmission.
 //!
-//! Serves `radio/{id}/audio_tx`. For each request it synthesizes the FT8 waveform
+//! Serves `radio/{id}/audio_tx`. For each request it synthesizes the FT8/FT4 waveform
 //! ([`modes::synth_message`]), keys the rig **once** over the rig command topic
 //! (`PttRequest{token}` — validated by the interlock granter), plays the audio to
 //! the configured output device (the rig's data-in), keys down at the end, and

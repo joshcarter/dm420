@@ -1,11 +1,11 @@
 # Phase 3 FT8/FT4 — port status & handoff
 
-> **STATUS: decode COMPLETE (FT8 + FT4); encode FT8-only.** The decode pipeline is
-> implemented and tested for **both** FT8 and FT4, cross-validated against reference
-> signals. The **encoder/synth is FT8-only** — FT4 tone/GFSK synthesis is not yet
-> written (see `JOEL.md` + the FT4 architecture notes). kenctl has `decode <file>` and
-> live `monitor`. Kept as a design record / map of the port. Future work: **FT4 encode**,
-> Phase 4 (auto-scan record/replay), and SNR calibration (currently a relative estimate).
+> **STATUS: decode + encode COMPLETE (FT8 + FT4).** Both the decode and encode/synth
+> pipelines are implemented and tested for FT8 and FT4, cross-validated against reference
+> signals — the FT4 synth is sample-identical to the `ft8_lib` reference (`ft4_cq_1200.wav`,
+> Pearson r = 1.0). On-air FT4 TX is not yet verified. kenctl has `decode <file>` and live
+> `monitor`. Kept as a design record / map of the port. Future work: Phase 4 (auto-scan
+> record/replay) and SNR calibration (currently a relative estimate).
 
 **Read this first, then [ATTRIBUTION.md](ATTRIBUTION.md).** A from-scratch,
 dependency-free **pure-Rust** FT8/FT4 decoder+encoder for `kenctl` Phase 3.

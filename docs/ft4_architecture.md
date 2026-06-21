@@ -1,5 +1,10 @@
 # FT4 ⇄ FT8 architecture — design notes before implementing FT4 transmit
 
+> **Update — built.** The design below is now implemented and offline-verified: the FT4
+> synth is sample-identical to the `ft8_lib` reference (`ft4_cq_1200.wav`, Pearson r = 1.0).
+> A first on-air FT4 QSO is the one remaining acceptance test. Original pre-implementation
+> notes follow unchanged.
+
 Status as of this writing: **decode is FT8+FT4 (done, tested); encode/synth is FT8-only.**
 Receiving FT4 works end-to-end; the QSO engine, interlock granter, audio-TX, slot
 clock, GUI mode toggle, and per-mode calling-frequency table are all already mode-aware.

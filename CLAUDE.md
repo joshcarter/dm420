@@ -63,7 +63,7 @@ subscriber must never stall a publisher.**
 | `rig` | ✅ implemented | Kenwood CAT, mock rig, port/baud/profile autodetect (vendored, W4LL) |
 | `audio` | ✅ implemented | cpal capture/playback/device list (vendored) |
 | `dsp` | ✅ implemented | hand-rolled radix-2 FFT + spectrum rows |
-| `modes` | ✅ implemented | FT8+FT4 **decode**; **encode/synth is FT8-only** (FT4 synth pending — see `JOEL.md`). MIT `ft8_lib` port (vendored, W4LL; see `crates/modes/ATTRIBUTION.md`) |
+| `modes` | ✅ implemented | FT8+FT4 **decode and encode/synth** (FT4 synth verified sample-identical to the `ft8_lib` reference offline; on-air TX not yet confirmed). MIT `ft8_lib` port (vendored, W4LL; see `crates/modes/ATTRIBUTION.md`) |
 | `mocks` | ✅ implemented | fake producers for every topic; `mocks::spawn_support` |
 | `gui` | ✅ active dev | the app |
 | `qso` | ✅ implemented | contact auto-sequencer (CQ→report→RR73→73, incl. Field Day); tracks mode from decodes and drives the real TX path (`engine.rs`/`shell.rs`/`message.rs`, ~1.8k lines) |
@@ -74,7 +74,8 @@ subscriber must never stall a publisher.**
 In **real mode** the **scanner** is the only remaining mock (`mocks::spawn_support`); the
 **qso** auto-sequencer, **logbook**, decode, interlock granter, and **audio-TX** are all
 real (spawned by `core::spawn`), and the clock is real wall-clock. So real mode runs live
-**end-to-end QSOs — RX and TX — on FT8**, and the Log Book and Contacts/map panels show
+**end-to-end QSOs — RX and TX — on FT8** (FT4 TX is implemented and offline-verified,
+not yet keyed on a real radio), and the Log Book and Contacts/map panels show
 **real** QSOs. Mock mode still uses `mocks::spawn` for everything (seeded **fake** QSOs,
 no keying).
 
@@ -179,11 +180,12 @@ remaining prototype shortcuts and severity-tagged known issues.
 
 Notable open items (see `TODO.md`, `docs/live_pipeline_notes.md`, `OVERVIEW.md §7`):
 
-- 🔴 **FT4 transmit is unimplemented.** RX, slot timing, and the QSO/TX path are all
-  mode-aware, but the modes encoder synthesizes **FT8 only** (`encode.rs`), so `core/tx.rs`
-  rejects a non-FT8 over ("TX synthesis not implemented yet"). Completing FT4 needs an FT4
-  tone/GFSK synth, a mode-aware `synth_message`, slot-relative TX caps (`MAX_TX`/
-  `PTT_WATCHDOG` are FT8-sized), and an FT4 CQ-first mode source. See `JOEL.md`.
+- 🟡 **FT4 transmit: implemented, on-air-unverified.** The FT4 tone/GFSK synth
+  (`encode.rs`), mode-aware `synth_message`, slot-relative TX cap (`core/tx.rs::max_tx_for`),
+  and the clock-sourced CQ-first mode (`qso/shell.rs`) are all in and tested — the synth is
+  **sample-identical to the `ft8_lib` reference** offline (`ft4_cq_1200.wav`, Pearson r = 1.0).
+  Remaining: a first on-air FT4 QSO, and `rig::actor::PTT_WATCHDOG` is still FT8-sized (15 s).
+  See `docs/live_pipeline_notes.md`.
 - 🔴 **Build the real `scanner` crate** — the last mock (`qso` and `logbook` are now real;
   `scanner` is still `mocks::spawn_support`). Mirror the `mocks::spawn` / `core::spawn`
   pattern, one topic at a time.
