@@ -501,19 +501,12 @@ pub fn decode_streaming(
             (wf.min_bin as f32 + c.freq_offset as f32 + c.freq_sub as f32 / wf.freq_osr as f32) / sp;
         let coarse_dt = (c.time_offset as f32 + c.time_sub as f32 / wf.time_osr as f32) * sp;
 
-        // DM420_COH_ONLY=1 disables the magnitude fallback — a diagnostic to see
-        // the coherent path's standalone contribution.
-        let no_fallback = std::env::var("DM420_COH_ONLY").map(|v| v != "0").unwrap_or(false);
+        // Coherent path first (FT8); magnitude path as a safety fallback so coherent
+        // can only add decodes, never regress what the magnitude path already gets.
         let decoded = demod
             .as_mut()
             .and_then(|d| decode_candidate_coherent(d, wf, c))
-            .or_else(|| {
-                if no_fallback {
-                    None
-                } else {
-                    decode_candidate(wf, c).map(|p| (p, coarse_freq, coarse_dt))
-                }
-            });
+            .or_else(|| decode_candidate(wf, c).map(|p| (p, coarse_freq, coarse_dt)));
         let Some((payload, freq_hz, dt)) = decoded else {
             continue;
         };
@@ -545,12 +538,19 @@ fn decode_candidate_coherent(
     let sp = wf.symbol_period;
     let f0 =
         (wf.min_bin as f32 + c.freq_offset as f32 + c.freq_sub as f32 / wf.freq_osr as f32) / sp;
-    // Downsampled start guess: 32 samples/symbol at 200 Hz (= NSPS/NDOWN).
-    let i0 = (c.time_offset as f32 + c.time_sub as f32 / wf.time_osr as f32) * 32.0;
+    // Downsampled start guess: 32 samples/symbol at 200 Hz (= NSPS/NDOWN). The
+    // magnitude waterfall's candidate start runs ~one symbol high relative to the
+    // coherent demod's baseband origin (its analysis frame is 2 symbols wide:
+    // nfft = block_size·FREQ_OSR = 2·NSPS, Hann-windowed), so subtract one symbol
+    // before fine sync. Measured via the DM420_TOFF sweep on the 24-slot real set:
+    // a flat optimum plateau across −40..−20 downsampled samples, centered at −32 ≡
+    // one symbol; the naive half-window geometric estimate (−16) undershoots by 2×
+    // and loses ~13 decodes.
+    const SPS2: f32 = 32.0; // downsampled samples per symbol
+    let i0 = (c.time_offset as f32 + c.time_sub as f32 / wf.time_osr as f32) * SPS2 - SPS2;
     let an = demod.analyze(f0, i0)?;
-    // DM420_NV limits how many LLR variants we try (diagnostic): 1 = nsym=1 only.
-    let nv = std::env::var("DM420_NV").ok().and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
-    for llr in an.llrs.iter().take(nv) {
+    // Try all five LLR variants (nsym=1/2/3 coherent integration) in WSJT-X pass order.
+    for llr in an.llrs.iter() {
         let (plain, errors) = bp_decode(llr, LDPC_ITERS);
         if errors == 0 {
             if let Some(p) = verify_codeword(wf.protocol, &plain) {

@@ -174,13 +174,15 @@ impl Demod {
     fn fine_sync(&mut self, f0: f32, i0_guess: f32) -> (i64, f32) {
         self.downsample(f0);
 
-        // Coarse time: ±W downsampled samples around the candidate's position.
-        let w: i64 = std::env::var("DM420_TW").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
-        let toff: i64 = std::env::var("DM420_TOFF").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-        let i0 = i0_guess.round() as i64 + toff;
+        // Coarse time: ±¼ symbol around the candidate's position. Kept tight — a wide
+        // window risks locking onto a louder neighbor's Costas on crowded bands. (The
+        // waterfall→start convention offset is applied by the caller, not here, so this
+        // search stays centered on whatever start guess it is handed.)
+        const COARSE_W: i64 = 10;
+        let i0 = i0_guess.round() as i64;
         let mut ibest = i0;
         let mut smax = f32::NEG_INFINITY;
-        for idt in (i0 - w)..=(i0 + w) {
+        for idt in (i0 - COARSE_W)..=(i0 + COARSE_W) {
             let s = self.sync8d(idt, None);
             if s > smax {
                 smax = s;
@@ -277,8 +279,8 @@ impl Demod {
         let nsync = Self::hard_sync(&cs);
         // The candidate already passed the magnitude Costas sync, so keep this gate
         // loose — CRC is the real filter; this only skips obviously-bad fits.
-        let gate: u32 = std::env::var("DM420_NSYNC").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
-        if nsync < gate {
+        const SYNC_GATE: u32 = 4;
+        if nsync < SYNC_GATE {
             return None;
         }
         let llrs = coherent_llrs(&cs);
@@ -403,19 +405,15 @@ mod tests {
         let n_data = (79.0 * 0.16 * 12000.0) as usize;
         let lead = (180000 - n_data) / 2;
         let i0_true = lead as f32 / NDOWN as f32; // downsampled samples
-        eprintln!("i0_true={i0_true:.1} ({} symbols)", i0_true / SPS2 as f32);
 
         let mut d = Demod::new();
         d.set_slot(&sig);
         let an = d.analyze(f0, i0_true).expect("analyze returns Some");
-        eprintln!("refined freq={:.2} dt={:.3}", an.freq_hz, an.dt);
 
         let mut decoded = None;
-        for (vi, llr) in an.llrs.iter().enumerate() {
-            let (plain, errors) = bp_decode(llr, 25);
-            let ok = verify_codeword(Protocol::Ft8, &plain);
-            eprintln!("  variant {vi}: bp errors={errors} verify={}", ok.is_some());
-            if let Some(p) = ok {
+        for llr in an.llrs.iter() {
+            let (plain, _errors) = bp_decode(llr, 25);
+            if let Some(p) = verify_codeword(Protocol::Ft8, &plain) {
                 decoded = Some(p);
             }
         }
