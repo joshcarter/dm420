@@ -22,9 +22,11 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 /// Auto-release TX this long after the last `SetPtt(true)` unless refreshed.
-/// Sized to outlast one full FT8/FT4 over (~13 s waveform, capped at `core::tx`'s
-/// 14 s `MAX_TX`) plus margin, so it never fires mid-over — it is the backstop for
-/// a hung app or a missed key-down, bounded to a single 15 s slot.
+/// Sized to outlast a full FT8 over (~13 s waveform, kept under `core::tx`'s
+/// `max_tx_for` backstop) plus margin, so it never fires mid-over — the backstop for
+/// a hung app or a missed key-down. NOTE: still FT8-sized (15 s = two FT4 slots); on
+/// FT4 a stuck over only bleeds past its slot on a double failure (see
+/// `docs/live_pipeline_notes.md` — make this slot-relative).
 pub const PTT_WATCHDOG: Duration = Duration::from_secs(15);
 
 /// A typed request to the rig. Mirrors the [`Rig`] surface; the Step 1.5 "full

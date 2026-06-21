@@ -5,6 +5,7 @@
 //! `u8` (0.5 dB steps, like the reference) for the sync/demod stages. Layout of
 //! `mag`: `[block][time_sub][freq_sub][bin]`, flattened.
 
+use crate::constants::FT4_XOR;
 use crate::fft::Fft;
 
 /// FT8 or FT4 — selects the symbol/slot timing throughout the pipeline.
@@ -32,6 +33,76 @@ impl Protocol {
         match self {
             Protocol::Ft8 => 8,
             Protocol::Ft4 => 4,
+        }
+    }
+
+    /// Bits carried per channel symbol — `log2(num_tones)`: 3 for FT8, 2 for FT4.
+    pub fn bits_per_symbol(self) -> usize {
+        match self {
+            Protocol::Ft8 => 3,
+            Protocol::Ft4 => 2,
+        }
+    }
+
+    /// Total channel symbols transmitted in one slot (Costas sync + data, plus the
+    /// two FT4 ramp symbols): 79 for FT8, 105 for FT4.
+    pub fn channel_symbols(self) -> usize {
+        match self {
+            Protocol::Ft8 => 79,
+            Protocol::Ft4 => 105,
+        }
+    }
+
+    /// Number of data symbols carrying the 174-bit codeword (`ND`): 58 for FT8
+    /// (×3 bits), 87 for FT4 (×2 bits).
+    pub fn data_symbols(self) -> usize {
+        match self {
+            Protocol::Ft8 => 58,
+            Protocol::Ft4 => 87,
+        }
+    }
+
+    /// Number of Costas sync blocks: 3 for FT8, 4 for FT4.
+    pub fn num_sync(self) -> usize {
+        match self {
+            Protocol::Ft8 => 3,
+            Protocol::Ft4 => 4,
+        }
+    }
+
+    /// Symbols per Costas sync block: 7 for FT8, 4 for FT4.
+    pub fn length_sync(self) -> usize {
+        match self {
+            Protocol::Ft8 => 7,
+            Protocol::Ft4 => 4,
+        }
+    }
+
+    /// Block stride between successive sync-block starts: 36 for FT8, 33 for FT4.
+    pub fn sync_offset(self) -> usize {
+        match self {
+            Protocol::Ft8 => 36,
+            Protocol::Ft4 => 33,
+        }
+    }
+
+    /// GFSK bandwidth-time product for the transmit pulse shape: 2.0 for FT8,
+    /// 1.0 for FT4.
+    pub fn gfsk_bt(self) -> f32 {
+        match self {
+            Protocol::Ft8 => 2.0,
+            Protocol::Ft4 => 1.0,
+        }
+    }
+
+    /// Payload whitening (XOR) sequence applied before the CRC, or `None` if the
+    /// mode doesn't whiten. FT4 whitens its payload with `FT4_XOR`; FT8 does not.
+    /// Encode applies this before `payload_with_crc`; decode removes it after a
+    /// valid CRC — they are exact inverses.
+    pub fn whitening(self) -> Option<&'static [u8; 10]> {
+        match self {
+            Protocol::Ft8 => None,
+            Protocol::Ft4 => Some(&FT4_XOR),
         }
     }
 }

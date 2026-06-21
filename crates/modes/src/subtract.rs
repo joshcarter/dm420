@@ -15,7 +15,8 @@
 //! symbol), so we first refine the start sample by a short search for peak signal
 //! energy.
 
-use crate::encode::{FT8_SYMBOL_PERIOD, ft8_reference_phase};
+use crate::encode::ft8_reference_phase;
+use crate::waterfall::Protocol;
 
 /// Sample offsets tried when refining the start time. The sync grid is ~half a
 /// symbol (960 samples at 12 kHz), so the true start is within ±¼ symbol of the
@@ -26,7 +27,7 @@ const TIMING_SEARCH: [i64; 9] = [-480, -360, -240, -120, 0, 120, 240, 360, 480];
 /// start `dt` seconds into the slot) from `residual` in place.
 pub fn subtract_ft8(residual: &mut [f32], payload: &[u8; 10], f0: f32, dt: f32, sample_rate: u32) {
     let phase = ft8_reference_phase(payload, f0, sample_rate);
-    let n_spsym = (0.5 + sample_rate as f32 * FT8_SYMBOL_PERIOD) as usize;
+    let n_spsym = (0.5 + sample_rate as f32 * Protocol::Ft8.symbol_period()) as usize;
     let n_sym = phase.len() / n_spsym;
 
     // Precompute the complex reference (cos/sin of the phase) once — the hot loops
@@ -126,7 +127,7 @@ mod tests {
         let before = power(&signal);
 
         // synth_ft8 centers the signal; that placement is dt = n_silence / sr.
-        let n_data = (0.5 + 79.0 * FT8_SYMBOL_PERIOD * sr as f32) as usize;
+        let n_data = (0.5 + 79.0 * Protocol::Ft8.symbol_period() * sr as f32) as usize;
         let n_silence = (signal.len() - n_data) / 2;
         let dt = n_silence as f32 / sr as f32;
 
@@ -151,7 +152,7 @@ mod tests {
         let a = synth_ft8(&pa, fa, sr);
         let b = synth_ft8(&pb, fb, sr);
 
-        let n_data = (0.5 + 79.0 * FT8_SYMBOL_PERIOD * sr as f32) as usize;
+        let n_data = (0.5 + 79.0 * Protocol::Ft8.symbol_period() * sr as f32) as usize;
         let dt = ((a.len() - n_data) / 2) as f32 / sr as f32;
 
         let mut sum: Vec<f32> = a.iter().zip(&b).map(|(x, y)| x + y).collect();

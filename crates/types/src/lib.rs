@@ -617,6 +617,10 @@ pub struct ClockStatus {
     pub slot_phase: f32,
     /// The slot the clock is currently in (mode-aware period).
     pub slot: SlotId,
+    /// The active on-air mode the clock derives its period from. Consumers (the
+    /// QSO engine) read this as the authoritative current mode — correct even
+    /// before the first decode, so an FT4 CQ-first over is synthesized as FT4.
+    pub mode: OverAirMode,
 }
 
 /// A PTT interlock grant. Flow: `Request -> Grant{token, ttl} -> PttRequest{token}
@@ -1030,6 +1034,7 @@ mod tests {
             offset_ms: -3.5,
             slot_phase: 0.42,
             slot: SlotId(7),
+            mode: OverAirMode::Ft4,
         });
         round_trip(InterlockToken(12345));
         for e in [

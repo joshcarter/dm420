@@ -98,6 +98,7 @@ async fn state_late_join() {
             offset_ms: 1.0,
             slot_phase: 0.5,
             slot: SlotId(0),
+            mode: OverAirMode::Ft8,
         },
     )
     .unwrap();
@@ -296,6 +297,7 @@ async fn record_replay_golden() {
             offset_ms: 1.0,
             slot_phase: 0.1,
             slot: SlotId(0),
+            mode: OverAirMode::Ft8,
         },
     )
     .unwrap();

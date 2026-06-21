@@ -39,6 +39,24 @@ pub fn load_wav_mono(path: &Path) -> Result<(Vec<f32>, u32), AudioError> {
     Ok((mono, spec.sample_rate))
 }
 
+/// Write mono f32 samples to an uncompressed 16-bit PCM WAV at `sample_rate` — the
+/// inverse of [`load_wav_mono`]. Used by tools that synthesize audio (e.g. the
+/// `encode_wav` example); samples are clamped to [-1, 1] by [`crate::dsp::f32_to_i16`].
+pub fn save_wav_mono(path: &Path, samples: &[f32], sample_rate: u32) -> Result<(), AudioError> {
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(path, spec)?;
+    for &s in samples {
+        writer.write_sample(crate::dsp::f32_to_i16(s))?;
+    }
+    writer.finalize()?;
+    Ok(())
+}
+
 /// A command to the output stream's audio callback.
 enum OutCmd {
     /// Play these device-rate samples from the start; `ratio` (file_rate/device_rate)
@@ -321,6 +339,22 @@ mod tests {
             }
         }
         w.finalize().unwrap();
+    }
+
+    #[test]
+    fn save_wav_mono_round_trips_through_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rt.wav");
+        // A short sine in [-1, 1].
+        let samples: Vec<f32> = (0..480).map(|i| ((i as f32) * 0.05).sin() * 0.5).collect();
+        save_wav_mono(&path, &samples, 12_000).unwrap();
+        let (loaded, rate) = load_wav_mono(&path).unwrap();
+        assert_eq!(rate, 12_000);
+        assert_eq!(loaded.len(), samples.len());
+        // 16-bit quantization: each sample survives within one quantum.
+        for (a, b) in samples.iter().zip(&loaded) {
+            assert!((a - b).abs() < 2.0 / 32_767.0, "{a} vs {b}");
+        }
     }
 
     #[test]

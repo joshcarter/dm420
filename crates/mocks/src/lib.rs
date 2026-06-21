@@ -106,6 +106,7 @@ async fn run_clock(bus: BusHandle) {
                 offset_ms: 0.0,
                 slot_phase,
                 slot,
+                mode: OverAirMode::Ft8,
             },
         );
     }
