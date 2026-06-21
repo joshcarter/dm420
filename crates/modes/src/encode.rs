@@ -73,9 +73,17 @@ fn gfsk_pulse(n_spsym: usize, bt: f32) -> Vec<f32> {
         .collect()
 }
 
-/// GFSK-synthesize `symbols` at base frequency `f0`. Returns n_sym×n_spsym
-/// samples (the modulated part only).
-fn synth_gfsk(symbols: &[u8], f0: f32, bt: f32, symbol_period: f32, sample_rate: u32) -> Vec<f32> {
+/// The per-sample GFSK phase trajectory for `symbols` at base frequency `f0` —
+/// the running integral of the pulse-shaped instantaneous frequency. `synth_gfsk`
+/// is just this with `sin` applied; signal *subtraction* needs the raw phase to
+/// build a complex reference. Returns n_sym×n_spsym values with `phi[0] = 0`.
+pub(crate) fn gfsk_phase(
+    symbols: &[u8],
+    f0: f32,
+    bt: f32,
+    symbol_period: f32,
+    sample_rate: u32,
+) -> Vec<f32> {
     let sr = sample_rate as f32;
     let n_spsym = (0.5 + sr * symbol_period) as usize;
     let n_sym = symbols.len();
@@ -98,13 +106,25 @@ fn synth_gfsk(symbols: &[u8], f0: f32, bt: f32, symbol_period: f32, sample_rate:
         dphi[j + n_sym * n_spsym] += dphi_peak * pulse[j] * symbols[n_sym - 1] as f32;
     }
 
-    let mut signal = vec![0.0f32; n_wave];
     let mut phi = 0.0f32;
-    for (k, s) in signal.iter_mut().enumerate() {
-        *s = phi.sin();
+    let mut out = vec![0.0f32; n_wave];
+    for (k, p) in out.iter_mut().enumerate() {
+        *p = phi;
         phi = (phi + dphi[k + n_spsym]) % two_pi;
     }
+    out
+}
+
+/// GFSK-synthesize `symbols` at base frequency `f0`. Returns n_sym×n_spsym
+/// samples (the modulated part only).
+fn synth_gfsk(symbols: &[u8], f0: f32, bt: f32, symbol_period: f32, sample_rate: u32) -> Vec<f32> {
+    let n_spsym = (0.5 + sample_rate as f32 * symbol_period) as usize;
+    let phi = gfsk_phase(symbols, f0, bt, symbol_period, sample_rate);
+    let n_wave = phi.len();
+    let mut signal: Vec<f32> = phi.iter().map(|p| p.sin()).collect();
+
     // Raised-cosine envelope ramp on the ends.
+    let two_pi = 2.0 * std::f32::consts::PI;
     let n_ramp = n_spsym / 8;
     for i in 0..n_ramp {
         let env = (1.0 - (two_pi * i as f32 / (2.0 * n_ramp as f32)).cos()) / 2.0;
@@ -112,6 +132,14 @@ fn synth_gfsk(symbols: &[u8], f0: f32, bt: f32, symbol_period: f32, sample_rate:
         signal[n_wave - 1 - i] *= env;
     }
     signal
+}
+
+/// The complex-reference GFSK phase for the FT8 transmission of `payload` at
+/// audio frequency `f0` — the same trajectory `synth_ft8` uses, minus the
+/// envelope ramp. Used by signal subtraction to model and remove a decode.
+pub(crate) fn ft8_reference_phase(payload: &[u8; 10], f0: f32, sample_rate: u32) -> Vec<f32> {
+    let tones = ft8_tones(payload);
+    gfsk_phase(&tones, f0, FT8_SYMBOL_BT, FT8_SYMBOL_PERIOD, sample_rate)
 }
 
 /// Synthesize a full 15-second FT8 slot for `payload` at audio frequency `f0`,

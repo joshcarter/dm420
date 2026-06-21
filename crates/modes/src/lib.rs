@@ -22,6 +22,7 @@ mod fft;
 mod ldpc;
 mod message;
 mod osd;
+mod subtract;
 mod slot;
 mod text;
 mod waterfall;

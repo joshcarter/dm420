@@ -7,6 +7,7 @@ use crate::crc;
 use crate::ldpc::{N, bp_decode};
 use crate::message::{self, CallHash, MessageType};
 use crate::osd;
+use crate::subtract;
 use std::sync::OnceLock;
 use crate::waterfall::{Monitor, Protocol, Waterfall, mag_db};
 use std::collections::HashSet;
@@ -18,6 +19,8 @@ const LDPC_ITERS: usize = 25;
 /// errors (out of 83). Real near-misses leave a handful; pure noise plateaus much
 /// higher, so this skips OSD on hopeless candidates without costing recall.
 const OSD_MAX_ERRORS: i32 = 40;
+/// FT8 decode passes with subtraction between them (1 = subtraction disabled).
+const SUBTRACT_PASSES: usize = 3;
 const TIME_OSR: usize = 2;
 const FREQ_OSR: usize = 2;
 
@@ -424,6 +427,26 @@ fn osd_enabled() -> bool {
     *EN.get_or_init(|| std::env::var("DM420_OSD").map(|v| v != "0").unwrap_or(true))
 }
 
+/// Whether multi-pass subtraction runs (default on). `DM420_SUBTRACT=0` disables
+/// it — escape hatch and the A/B switch for measuring its contribution.
+fn subtract_enabled() -> bool {
+    static EN: OnceLock<bool> = OnceLock::new();
+    *EN.get_or_init(|| std::env::var("DM420_SUBTRACT").map(|v| v != "0").unwrap_or(true))
+}
+
+/// Number of subtraction passes. `DM420_SUBTRACT_PASSES` overrides the default
+/// for tuning; the loop stops early once a pass finds nothing new.
+fn subtract_passes() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("DM420_SUBTRACT_PASSES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(SUBTRACT_PASSES)
+    })
+}
+
 /// Validate a hard-decision codeword: check the CRC-14 and, on success, return
 /// the 10-byte payload (un-whitening FT4). Returns `None` on CRC mismatch.
 fn verify_codeword(protocol: Protocol, plain: &[u8; N]) -> Option<[u8; 10]> {
@@ -468,42 +491,67 @@ pub fn decode_streaming(
     protocol: Protocol,
     mut on_decode: impl FnMut(Decode),
 ) {
-    let mut mon = Monitor::new(sample_rate, protocol, TIME_OSR, FREQ_OSR, 200.0, 3000.0);
-    let bs = mon.block_size;
-    let mut pos = 0;
-    while pos + bs <= samples.len() {
-        mon.process(&samples[pos..pos + bs]);
-        pos += bs;
-    }
-
-    let wf = &mon.wf;
-    let noise = noise_floor(wf);
-    let cands = find_candidates(wf); // already sorted strongest-first by score
+    // Multi-pass subtraction (FT8 only for now): decode a pass, subtract every
+    // decode's waveform from the audio, rebuild the waterfall on the residual, and
+    // decode again — recovering signals that a louder neighbor was masking. The
+    // residual carries across passes, so each signal is subtracted once.
+    let passes = if protocol == Protocol::Ft8 && subtract_enabled() {
+        subtract_passes()
+    } else {
+        1
+    };
+    let mut residual = samples.to_vec();
     let mut hash = CallHash::new();
     let mut seen: HashSet<[u8; 10]> = HashSet::new();
-    let sp = wf.symbol_period;
-    for c in &cands {
-        let Some(payload) = decode_candidate(wf, c) else {
-            continue;
-        };
-        if !seen.insert(payload) {
-            continue;
+
+    for pass in 0..passes {
+        let mut mon = Monitor::new(sample_rate, protocol, TIME_OSR, FREQ_OSR, 200.0, 3000.0);
+        let bs = mon.block_size;
+        let mut pos = 0;
+        while pos + bs <= residual.len() {
+            mon.process(&residual[pos..pos + bs]);
+            pos += bs;
         }
-        let Some((text, msg_type)) = message::decode(&payload, &mut hash) else {
-            continue;
-        };
-        let freq_hz =
-            (wf.min_bin as f32 + c.freq_offset as f32 + c.freq_sub as f32 / wf.freq_osr as f32)
-                / sp;
-        let dt = (c.time_offset as f32 + c.time_sub as f32 / wf.time_osr as f32) * sp;
-        on_decode(Decode {
-            score: c.score,
-            snr_db: estimate_snr(wf, c, noise),
-            dt,
-            freq_hz,
-            message: text,
-            msg_type,
-        });
+
+        let wf = &mon.wf;
+        let noise = noise_floor(wf);
+        let cands = find_candidates(wf); // already sorted strongest-first by score
+        let sp = wf.symbol_period;
+
+        // (payload, freq, dt) for each signal newly decoded this pass — used to
+        // subtract them before the next pass.
+        let mut decoded: Vec<([u8; 10], f32, f32)> = Vec::new();
+        for c in &cands {
+            let Some(payload) = decode_candidate(wf, c) else {
+                continue;
+            };
+            if !seen.insert(payload) {
+                continue; // already found (and subtracted) — don't emit or re-subtract
+            }
+            let freq_hz =
+                (wf.min_bin as f32 + c.freq_offset as f32 + c.freq_sub as f32 / wf.freq_osr as f32)
+                    / sp;
+            let dt = (c.time_offset as f32 + c.time_sub as f32 / wf.time_osr as f32) * sp;
+            decoded.push((payload, freq_hz, dt));
+            if let Some((text, msg_type)) = message::decode(&payload, &mut hash) {
+                on_decode(Decode {
+                    score: c.score,
+                    snr_db: estimate_snr(wf, c, noise),
+                    dt,
+                    freq_hz,
+                    message: text,
+                    msg_type,
+                });
+            }
+        }
+
+        // Nothing new, or this was the last pass: stop before subtracting.
+        if decoded.is_empty() || pass + 1 == passes {
+            break;
+        }
+        for (payload, f0, dt) in &decoded {
+            subtract::subtract_ft8(&mut residual, payload, *f0, *dt, sample_rate);
+        }
     }
 }
 
