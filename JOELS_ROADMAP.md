@@ -183,16 +183,7 @@ Other notes:
   in **Later**, which folds in the logbook and band scanner. This item stays scoped to the
   audio offset on the current band/mode.
 
-### 11. Unkey the transmitter on app close — *particularly critical (safety)*
-On exit the app must drop PTT / stop TX, so quitting mid-over can't leave the rig keyed
-and transmitting. Today the macOS exit path calls `std::process::exit` from `App::ui` on
-the close request (the winit/AppKit teardown workaround), which can bypass normal Drop /
-shutdown — so any in-flight TX (PTT held, audio-TX over playing) may not be released. Make
-close first command PTT off / abort any active over (and ideally wait for the release ack)
-before exiting. A safety blocker: a stuck-keyed QRP rig jams the frequency and can damage
-the finals. **Joel — on `main`.**
-
-### 12. CQ answered with a *report* (not a grid) is ignored — *particularly critical*
+### 11. CQ answered with a *report* (not a grid) is ignored — *particularly critical*
 **A station that answers our CQ with a signal report instead of a grid is dropped — we
 just keep calling CQ.** Costs contacts directly; common on FT8 (and in contest/POTA
 styles), so it's a real Field Day liability. **Not fixed on this branch on purpose**
@@ -274,7 +265,7 @@ go `InExchange` and the next TX is `K1ABC W9XYZ R-08` (Tx3) → feed their `Sign
 - **Field Day mode.** This fix is Standard-only (matches the Grid arm). A plain-report
   opener while *we* are in Field Day is a separate, rarer gap — left out here.
 
-### 13. Send box doesn't update live during a QSO — only after the over finishes
+### 12. Send box doesn't update live during a QSO — only after the over finishes
 **Symptom (observed on air).** During a contact the bottom **Send box** doesn't refresh to
 show the current/next message until *after* the transmission completes. While keyed you
 can't see what's actually going out or what's queued to go next — you want eyes on both.
@@ -424,11 +415,20 @@ archive, and shared logbook exist.
 
 ## Resolved (for context — no longer roadmap)
 
-These were `OVERVIEW.md §7` open decisions, now settled: decoder strategy (Rust
-`ft8_lib` port, with shelling out to `jt9` as the documented fallback if full parity is
-required) · audio/serial crates (`cpal` / `serialport`) · network protocol (mDNS + UDP
-gossip, eventual consistency) · map base data (bundled coastline mesh + land-snapping) ·
-FFT migration to `realfft` in `modes`.
+**Shipped from the Now list:**
+- **Unkey the transmitter on app close** (was Now-#11, *safety-critical*) — done in `d1abdf3`
+  (`main`, cherry-picked onto `band-scanner`). Both quit paths now drop the rig's PTT before
+  the hard `std::process::exit`: the red close button (`close_requested` in `App::ui`) and the
+  ⌘Q / normal-termination path (`on_exit`, which macOS uses instead — it never delivers
+  `close_requested`). `BusView::unkey_for_shutdown` blocks on a `RigCommand::PttRequest { on:
+  false }` (key-down needs no interlock token); real mode only, 1 s bound so an absent rig
+  can't hang the quit. Removes the dependence on the rig's ~15 s PTT watchdog as the only
+  backstop against a mid-over quit leaving the transmitter keyed.
+
+**Settled `OVERVIEW.md §7` design decisions:** decoder strategy (Rust `ft8_lib` port, with
+shelling out to `jt9` as the documented fallback if full parity is required) · audio/serial
+crates (`cpal` / `serialport`) · network protocol (mDNS + UDP gossip, eventual consistency) ·
+map base data (bundled coastline mesh + land-snapping) · FFT migration to `realfft` in `modes`.
 
 ---
 

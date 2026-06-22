@@ -205,8 +205,10 @@ Running notes, gotchas, and reminders. Newest at the top.
     should key, send FT8, and a second decoder (WSJT-X) should copy it. Watch the
     TX offset and slot timing (the synth sits ~1.18 s into the slot — within decode
     tolerance, but verify).
-  - **Safety is layered:** rig-actor TX gate (`allow_transmit`) + 10 s PTT watchdog +
-    single-holder interlock token. Leave `DM420_ALLOW_TX` unset for normal RX use.
+  - **Safety is layered:** rig-actor TX gate (`allow_transmit`) + PTT watchdog (~15 s) +
+    single-holder interlock token + **unkey-on-exit** (both quit paths drop PTT before
+    `process::exit` via `BusView::unkey_for_shutdown`). Leave `DM420_ALLOW_TX` unset for
+    normal RX use.
   - **Still ahead:** Step 3 (feed `tx_report` back so the engine reacts to TX
     denials/failures), Step 4 (real TX offset window + `/f` retune in real mode),
     and a first on-air FT4 QSO (the FT4 TX synth is now implemented — sample-identical

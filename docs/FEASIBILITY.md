@@ -114,5 +114,10 @@ is effectively a smooth gradient.
   was never registered. It's an upstream AppKit/winit bug, not our code, and fires *after* the
   window is already gone. Worked around in `App::ui` by checking `close_requested()` and
   calling `std::process::exit(0)`, so the process exits before AppKit runs the faulty teardown.
+  Two exit paths share this: the red close button (`close_requested()` in `App::ui`) and ⌘Q /
+  normal termination (`on_exit`, which macOS delivers *instead* of a `close_requested` frame).
+  **Both first call `BusView::unkey_for_shutdown` to drop the rig's PTT before the hard exit**,
+  so quitting mid-over can't leave the transmitter keyed — the bypassed Drop would otherwise
+  rely on the rig's ~15 s PTT watchdog as the only backstop.
 - Click the **DARK/LIGHT** chip in the header to flip palettes at runtime; click the footer
   squares to toggle them.

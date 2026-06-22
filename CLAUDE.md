@@ -165,7 +165,12 @@ DM420_MOCK=1 cargo run -p gui                                   # no hardware (m
 - **`origin: Mine | Peer(id)`** must survive through log/map — *heard ≠ worked*, and the
   UI must visually distinguish my data from peers'.
 - **macOS exit-crash workaround** (winit/AppKit teardown) — see `FEASIBILITY.md` reader
-  notes; carry it forward (`App::ui` calls `std::process::exit` on close request).
+  notes; carry it forward. Both quit paths hard-exit via `std::process::exit`: the close
+  button (`close_requested` in `App::ui`) and ⌘Q (`on_exit`, which macOS delivers *instead*).
+- **Unkey on exit (safety):** both quit paths first call `BusView::unkey_for_shutdown` to drop
+  the rig's PTT before the hard `process::exit`, so a mid-over quit can't leave the transmitter
+  keyed (the exit bypasses Drop; the rig's PTT watchdog is only a ~15 s backstop). Real mode
+  only, 1 s bound. Keep this in any new exit path you add.
 - **`unsafe` is forbidden** in `bus`/`core` (`#![forbid(unsafe_code)]`).
 - `eframe` is immediate-mode: never block the UI thread; all I/O lives behind the bus +
   `BusView` pumps. CPU-heavy decode runs off-thread in `core::decode`.

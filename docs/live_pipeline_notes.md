@@ -86,7 +86,11 @@ Severity: 🔴 correctness/blocker · 🟡 should-fix · 🟢 polish.
   queue.
 - 🟡 **No clean shutdown.** `spawn_live` loops forever on a detached thread; the
   `CaptureStream` is only dropped at process exit. Fine today, but there's no way
-  to stop/restart capture (needed for device/source switching).
+  to stop/restart capture (needed for device/source switching). **Exception (handled):**
+  the GUI explicitly drops the rig's **PTT** before exit on both quit paths
+  (`BusView::unkey_for_shutdown`, called from `App::ui`'s `close_requested` and `on_exit`),
+  so a mid-over quit can't leave the transmitter keyed even though the rest of teardown is
+  still abrupt.
 - 🟢 **WAV-replay path is inconsistent with live.** `spawn_wav` paces on
   `REPLAY_INTERVAL` (not real slot timing), stamps decodes with `now_ms()` (so
   horizontal placement differs from live), and produces **no spectrogram**.
