@@ -194,6 +194,14 @@ impl Waterfall {
         // begins a slash command; Backspace/Escape edit/abort it; Enter activates
         // (run the command, else toggle arm). Digit keys [1..9, 0] fire the CQ
         // shortcut for the ranked station at that slot when disarmed.
+        // Digit shortcuts are suppressed while a QSO is in progress or the TX
+        // hold is active — assignments keep tracking, but keys don't fire.
+        let shortcuts_active = self.tx_hold.is_none()
+            && ctx
+                .bus
+                .qso_state()
+                .is_none_or(|s| matches!(s.phase, QsoPhase::Idle));
+
         let mut activate = false;
         if ctx.active {
             let events = ctx.ui.input(|i| i.events.clone());
@@ -205,6 +213,7 @@ impl Waterfall {
                 if let egui::Event::Key { key, pressed: true, modifiers, .. } = ev
                     && !modifiers.any()
                     && !self.send.entering
+                    && shortcuts_active
                     && let Some(idx) = digit_key_index(*key)
                 {
                     digit_consumed = true;
@@ -889,17 +898,13 @@ impl Panel for Waterfall {
                     let recent_decodes = ctx.bus.recent_decodes();
                     if current_slot_ms != self.last_assigned_slot_ms {
                         self.last_assigned_slot_ms = current_slot_ms;
-                        if armed {
-                            self.cq_assignments.clear();
-                        } else {
-                            update_cq_assignments(
-                                &mut self.cq_assignments,
-                                &recent_decodes,
-                                &worked,
-                                current_slot_ms,
-                                slot_ms,
-                            );
-                        }
+                        update_cq_assignments(
+                            &mut self.cq_assignments,
+                            &recent_decodes,
+                            &worked,
+                            current_slot_ms,
+                            slot_ms,
+                        );
                     }
                     // Rebuild the per-frame shortcuts vec from the stable assignment
                     // map, picking the highest-SNR decode for each assigned callsign.
@@ -1765,7 +1770,10 @@ fn draw_waterslide(
             let rank = decode_station(d)
                 .and_then(|(c, _)| cq_assignments.get(&c.to_ascii_uppercase()))
                 .map(|&(idx, _)| idx);
-            if let Some(rank) = rank {
+            if let Some(rank) = rank
+                && !tx_armed
+                && !tx_transmitting
+            {
                 let digit = if rank == 9 { '0' } else { (b'1' + rank as u8) as char };
                 let half = (snr_pt * 0.65).max(6.0);
                 let badge = Rect::from_center_size(
