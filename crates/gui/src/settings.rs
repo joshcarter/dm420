@@ -233,6 +233,7 @@ impl Settings {
             decode,
             serial: Some(self.serial.clone()),
             logbook: Some(logbook_path()),
+            decode_archive: read_archive_config(&config_path()),
             tx_output: self.audio_output.clone(),
             tx_gain: self.tx_gain,
         }
@@ -250,6 +251,16 @@ fn logbook_path() -> PathBuf {
         return PathBuf::from(home).join(".dm420").join("logbook.json");
     }
     PathBuf::from("dm420-logbook.json")
+}
+
+/// Read the raw decode/transmit archive path from the config file's
+/// `[archive] decodes` key. Absent, blank, or no file ⇒ `None` (capture disabled —
+/// the default). The path is used verbatim (no default location): the operator opts
+/// in by naming an explicit file, the same "you name it" stance as `DM420_LOGBOOK`.
+/// Config-only by design — there is intentionally no env-var override.
+fn read_archive_config(path: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(path).ok()?;
+    parse_table_value(&text, "archive", "decodes").map(PathBuf::from)
 }
 
 /// True if the var is set to a non-empty value other than `"0"`.
@@ -705,7 +716,11 @@ fn default_station_toml(call: &str, grid: &str) -> String {
          # No built-in default: DM420 won't call CQ or answer until a callsign is set.\n\n\
          [station]\n\
          callsign = \"{call}\"\n\
-         grid = \"{grid}\"\n"
+         grid = \"{grid}\"\n\n\
+         # Raw decode/transmit archive (diagnostics): set `decodes` to a file path to\n\
+         # append every heard + sent FT8/FT4 message as JSONL. Blank = disabled (default).\n\
+         [archive]\n\
+         decodes = \"\"\n"
     )
 }
 

@@ -924,6 +924,7 @@ mod tests {
                 slot: SlotId(slot),
                 dt: 0.0,
                 message: msg,
+                raw: String::new(),
             },
         }
     }

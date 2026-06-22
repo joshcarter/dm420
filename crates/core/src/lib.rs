@@ -161,6 +161,10 @@ pub struct CoreConfig {
     /// logbook producer, so the log stays in-memory only (mock mode supplies its
     /// own fake logbook).
     pub logbook: Option<PathBuf>,
+    /// Where to append the raw decode/transmit archive (JSONL, every heard + sent
+    /// message). `None` ⇒ no archive producer — the default; opt in via the config
+    /// TOML's `[archive] decodes`. See the `archive` crate.
+    pub decode_archive: Option<PathBuf>,
     /// Initial TX audio output device; `None` = system default. Live-editable
     /// afterward via [`CoreControl::tx`].
     pub tx_output: Option<String>,
@@ -178,6 +182,7 @@ impl Default for CoreConfig {
             decode: DecodeSource::None,
             serial: None,
             logbook: None,
+            decode_archive: None,
             tx_output: None,
             tx_gain: DEFAULT_TX_GAIN,
         }
@@ -199,6 +204,7 @@ pub fn spawn(bus: &BusHandle, cfg: CoreConfig) -> CoreControl {
         decode,
         serial,
         logbook,
+        decode_archive,
         tx_output,
         tx_gain,
     } = cfg;
@@ -235,6 +241,15 @@ pub fn spawn(bus: &BusHandle, cfg: CoreConfig) -> CoreControl {
         let rig = Arc::new(RigControl::new(serial));
         rig_adapter::spawn(bus, radio.clone(), allow_transmit, rig.clone(), granter.clone());
         control.rig = Some(rig);
+    }
+
+    // The raw decode/transmit archive: append every heard + sent message to a JSONL
+    // file for offline diagnostics. Opt-in (config TOML `[archive] decodes`); `None`
+    // ⇒ no producer. Subscribe-only and off the operating path, so it can't affect
+    // RX/TX. Spawned here while `radio` is still owned (the decode match below
+    // consumes it).
+    if let Some(path) = decode_archive {
+        archive::spawn(bus, radio.clone(), path);
     }
 
     // The active mode for the slot clock below: live capture follows it through

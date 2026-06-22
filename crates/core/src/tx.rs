@@ -73,6 +73,22 @@ pub fn spawn(bus: &BusHandle, radio: t::RadioId, tx: Arc<crate::control::TxContr
             }
         };
         while let Some((req, responder)) = server.next().await {
+            // Snapshot the loggable shape of this over before `req` is consumed by
+            // `transmit`, to mirror it (with the outcome) onto `tx_log` for the raw
+            // diagnostic archive. Only slotted FT8/FT4 overs are recorded; the PSK
+            // stream variants are architecture-only in v1.
+            let tx_log = if let t::TxRequest::SlottedMessage {
+                mode,
+                offset,
+                slot,
+                message,
+                ..
+            } = &req
+            {
+                Some((*mode, *offset, *slot, message.clone(), t::Timestamp(now_ms())))
+            } else {
+                None
+            };
             let want = tx.snapshot(); // live-editable output device (None = default)
             let reopen = match &out {
                 Some(o) => o.requested() != want.as_deref() || o.is_dead(),
@@ -96,6 +112,23 @@ pub fn spawn(bus: &BusHandle, radio: t::RadioId, tx: Arc<crate::control::TxContr
                 t::TxOutcome::Denied(d) => {
                     tracing::warn!(?slot, denial = ?d, "audio-tx: over denied")
                 }
+            }
+            // Mirror the over (with its real outcome) onto `tx_log` for the archive.
+            // Off the operating path — nothing in the QSO/UI flow consumes this topic;
+            // it exists only for the diagnostic decode/transmit archive.
+            if let Some((mode, offset, tx_slot, message, t)) = tx_log {
+                let _ = bus.publish(
+                    &Topic::TxLog(radio.clone()),
+                    t::TxLogEntry {
+                        radio: radio.clone(),
+                        mode,
+                        slot: tx_slot,
+                        offset,
+                        message,
+                        outcome: outcome.clone(),
+                        t,
+                    },
+                );
             }
             let _ = bus.publish(
                 &Topic::TxReport(radio.clone()),

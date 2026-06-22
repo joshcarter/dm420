@@ -25,6 +25,7 @@ modes = { path = "crates/modes" }
 qso = { path = "crates/qso" }
 callbook = { path = "crates/callbook" }
 logbook = { path = "crates/logbook" }
+archive = { path = "crates/archive" }
 scanner = { path = "crates/scanner" }
 net = { path = "crates/net" }
 mocks = { path = "crates/mocks" }

@@ -24,3 +24,13 @@ output = ""   # TX output device (the rig's data-in)
 # set (standard EnvFilter syntax, e.g. RUST_LOG=core::tx=debug,info).
 [logging]
 level = "info"
+
+# Raw decode/transmit archive (diagnostics / analysis). When `decodes` points to a
+# file, DM420 appends one JSON object per line for EVERY heard and sent FT8/FT4
+# message: UTC capture time, dial frequency + audio offset, SNR, mode, the parsed
+# message + raw decoder text, and (for sent overs) the TX outcome. Blank or unset = disabled — nothing
+# is written. That's the default. The capture is NOT grouped by QSO; it's raw data
+# for offline analysis. Tail it live with `tail -f`. Put it wherever you like; next
+# to logbook.json is the convention.
+[archive]
+decodes = ""   # set to enable, e.g. "/Users/youruser/.dm420/decodes.jsonl"

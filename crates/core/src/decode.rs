@@ -192,6 +192,7 @@ fn publish_one(
             slot,
             dt: d.dt,
             message: parse_message(&d.message),
+            raw: d.message,
         },
     };
     let _ = bus.publish(&Topic::Decodes(radio.clone()), msg);

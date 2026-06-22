@@ -251,6 +251,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "archive"
+version = "0.1.0"
+dependencies = [
+ "bus",
+ "chrono",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "types",
+]
+
+[[package]]
 name = "arrayref"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -775,6 +788,7 @@ dependencies = [
 name = "core"
 version = "0.1.0"
 dependencies = [
+ "archive",
  "audio",
  "bus",
  "dsp",

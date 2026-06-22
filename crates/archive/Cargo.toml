@@ -1,0 +1,16 @@
+[package]
+name = "archive"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Raw decode/transmit archive: append-only JSONL capture of every heard + sent FT8/FT4 message for offline diagnostics and analysis."
+
+[dependencies]
+bus.workspace = true
+types.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true

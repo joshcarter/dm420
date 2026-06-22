@@ -257,6 +257,7 @@ async fn run_decodes(bus: BusHandle) {
                         contest: None,
                         grid: Some(GridSquare(grid.into())),
                     },
+                    raw: format!("CQ {call} {grid}"),
                 },
             },
         );

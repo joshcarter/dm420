@@ -181,6 +181,11 @@ pub enum DecodeContent {
         slot: SlotId,
         dt: f32,
         message: ParsedMessage,
+        /// The decoder's raw, undecoded message text (e.g. `"CQ W1ABC FN42"`),
+        /// kept verbatim alongside the parse so the two can be compared when a
+        /// parse looks wrong. `message` is produced from this same string by
+        /// `parse_message`; the decode archive persists both.
+        raw: String,
     },
     /// PSK31/RTTY: free-running text (architecture only in v1).
     Streaming { text: String },
@@ -471,6 +476,29 @@ pub enum TxOutcome {
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TxAck {
     Accepted,
+}
+
+/// `radio/{id}/tx_log` (StreamLossless) — a record of every over the audio-TX
+/// path attempted, for the raw diagnostic archive (the `archive` crate).
+/// Deliberately **not** on `Decodes` (the live QSO engine consumes that) and
+/// richer than [`TxReport`] (which is State/last-value and carries no message
+/// text): this keeps the full intended message plus the `outcome`, so even
+/// interlock-denied / failed attempts are captured. Never read by the operating
+/// path — capture-only.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct TxLogEntry {
+    pub radio: RadioId,
+    pub mode: OverAirMode,
+    /// The slot the over was scheduled to.
+    pub slot: SlotId,
+    /// Audio offset the over was sent at (the dial/VFO is on `RigState`).
+    pub offset: OffsetHz,
+    /// The message we intended to send (on-air text + structured parse).
+    pub message: OutgoingMessage,
+    /// What actually happened: sent / interlock-denied / failed.
+    pub outcome: TxOutcome,
+    /// Wall-clock (epoch ms) when the over was attempted (≈ slot boundary).
+    pub t: Timestamp,
 }
 
 // =====================================================================
@@ -773,6 +801,7 @@ mod tests {
                     contest: Some(ContestTag::FieldDay),
                     grid: Some(GridSquare("DN70".into())),
                 },
+                raw: "CQ N0JDC DN70".into(),
             },
         }
     }
@@ -835,6 +864,26 @@ mod tests {
             bin_hz: 6.25,
             mags: vec![0, 64, 128, 255],
             source: SignalSource::Received,
+        });
+    }
+
+    #[test]
+    fn tx_log_round_trip() {
+        round_trip(TxLogEntry {
+            radio: RadioId("k1".into()),
+            mode: OverAirMode::Ft8,
+            slot: SlotId(42),
+            offset: OffsetHz(1500.0),
+            message: OutgoingMessage {
+                text: "CQ W4LL EM74".into(),
+                structured: ParsedMessage::Cq {
+                    caller: Callsign("W4LL".into()),
+                    contest: None,
+                    grid: Some(GridSquare("EM74".into())),
+                },
+            },
+            outcome: TxOutcome::Sent,
+            t: Timestamp(1_700_000_000_000),
         });
     }
 

@@ -68,12 +68,14 @@ subscriber must never stall a publisher.**
 | `gui` | ✅ active dev | the app |
 | `qso` | ✅ implemented | contact auto-sequencer (CQ→report→RR73→73, incl. Field Day); tracks mode from decodes and drives the real TX path (`engine.rs`/`shell.rs`/`message.rs`, ~1.8k lines) |
 | `logbook` | ✅ implemented | JSON-persistent log store: logs on RR73, replays history on startup; ADIF + peer-merge still pending |
+| `archive` | ✅ implemented | raw decode/transmit archive: append-only JSONL of every heard + sent message (off by default; opt in via `[archive] decodes`). Diagnostics/analysis; not QSO-grouped |
 | `callbook` | ✅ implemented | offline call-sign → country/ISO prefix resolver (Tier-1 of the Call Sign panel); pure, no I/O. Online name enrichment (Tier-2) not built |
 | `scanner` | 🪧 **stub** | band-scanner strategy — not built; currently mocked |
 
 In **real mode** the **scanner** is the only remaining mock (`mocks::spawn_support`); the
-**qso** auto-sequencer, **logbook**, decode, interlock granter, and **audio-TX** are all
-real (spawned by `core::spawn`), and the clock is real wall-clock. So real mode runs live
+**qso** auto-sequencer, **logbook**, decode, interlock granter, **audio-TX**, and the
+opt-in **decode archive** (`archive` crate) are all real (spawned by `core::spawn`), and
+the clock is real wall-clock. So real mode runs live
 **end-to-end QSOs — RX and TX — on FT8** (FT4 TX is implemented and offline-verified,
 not yet keyed on a real radio), and the Log Book and Contacts/map panels show
 **real** QSOs. Mock mode still uses `mocks::spawn` for everything (seeded **fake** QSOs,

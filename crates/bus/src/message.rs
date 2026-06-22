@@ -35,6 +35,7 @@ bus_message!(SpectrumRow, StreamLossy);
 bus_message!(Decode, StreamLossless);
 bus_message!(EnrichedDecode, StreamLossless);
 bus_message!(LogEntry, StreamLossless);
+bus_message!(TxLogEntry, StreamLossless);
 
 // --- State ---
 bus_message!(RigState, State);

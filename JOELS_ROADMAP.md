@@ -44,23 +44,25 @@ Implications to design in:
 - **SNR floor filter** so the report surfaces only workable signals.
 - **Unworked-aware**, per band *and* per mode (ties into item 3).
 
-### 2. Decode archive — persist *every* decoded message to a database
-Capture every decoded message (not just completed QSOs) into a queryable database. Uses:
+### 2. Decode archive — persist *every* heard and sent message
+**Raw capture is shipped** — the `archive` crate. When `[archive] decodes` names a file
+(off by default), DM420 appends one JSONL row per heard **and** sent FT8/FT4 message: UTC
+capture time, dial freq + audio offset, SNR, mode, the parsed message **and** raw decoder text, direction, and
+(for sent overs) the TX outcome. Not grouped by QSO — raw data for offline analysis.
+Heard rides `radio/{id}/decodes`; sent rides the new `radio/{id}/tx_log` (published by
+`core::tx`, deliberately off the `decodes` topic the live QSO engine consumes).
+
+Still to build *on top of* that raw firehose:
 - **Data analysis** — band / mode / time / SNR / station trends; propagation; what's
   actually workable right now.
 - **Logbook recovery** — rebuild or repair the logbook from raw decode history if a log
   is lost or corrupted (complements the JSON logbook and the planned peer-merge).
 - **Whole-QSO view** — reconstruct and view an *entire* QSO (every over from both
   stations), not just the single logged contact row.
-
-Implementation notes:
-- Decodes already flow on the bus (`Decode` / `radio/{id}/decodes_enriched`). Add a
-  persistence service that subscribes and appends — mirror the `logbook` crate's
-  spawn pattern (`core::spawn`).
-- Store enough to reconstruct a QSO: UTC, dial + audio frequency, SNR, mode, raw text,
-  parsed message, and `origin: Mine | Peer(id)`.
-- **SQLite** is the natural store for queryable analysis + recovery (vs. the current
-  append-only JSON logbook); it becomes the substrate for the whole-QSO view UI.
+- **Queryable store** — **SQLite** is the natural step up from the append-only JSONL for
+  queryable analysis + recovery, and the substrate for the whole-QSO view UI.
+- **`origin: Mine | Peer(id)`** per row — not stamped yet (the archive is local-only
+  today); add it once peer decodes are gossiped (Network Step 4).
 
 ### 3. Field Day log reset + per-band/per-mode "unworked" tracking
 When Field Day starts, one click resets the logbook so everyone is "unworked" again.
@@ -167,7 +169,7 @@ The shared piece — an **occupancy map**:
   instead of each rebuilding it. Same `SpectrumRow.t` timestamping discipline as the
   drift fix (#6).
 - **Kept separate from the decode archive (#2) on purpose** — the archive is long-running
-  and persistent (SQLite, query/recovery); the occupancy map is short-term and ephemeral.
+  and persistent (append-only JSONL today, SQLite later for query/recovery); the occupancy map is short-term and ephemeral.
   Folding them together would mix concerns; they merely both read the decode/spectrum
   streams.
 

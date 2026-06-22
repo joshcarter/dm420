@@ -24,6 +24,7 @@ fn decode(id: &RadioId, n: u64) -> Decode {
             slot: SlotId(n),
             dt: 0.1,
             message: ParsedMessage::Free(format!("msg{n}")),
+            raw: format!("msg{n}"),
         },
     }
 }

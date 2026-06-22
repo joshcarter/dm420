@@ -73,6 +73,7 @@ async fn main() {
                     contest: None,
                     grid: Some(GridSquare("DN70".into())),
                 },
+                raw: format!("CQ {call} DN70"),
             },
         };
         bus.publish(&Topic::Decodes(id.clone()), d)

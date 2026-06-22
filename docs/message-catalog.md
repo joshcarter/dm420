@@ -75,8 +75,10 @@ pub struct Decode {
 
 // The family split that makes PSK31 a sibling, not a rewrite.
 pub enum DecodeContent {
-    Slotted { slot: SlotId, dt: f32, message: ParsedMessage }, // FT8/FT4
-    Streaming { text: String },                                // PSK31/RTTY (arch only)
+    // `message` is the parse; `raw` is the decoder's verbatim text (e.g. "CQ W1ABC
+    // FN42") kept alongside so the two can be compared (the decode archive saves both).
+    Slotted { slot: SlotId, dt: f32, message: ParsedMessage, raw: String }, // FT8/FT4
+    Streaming { text: String },                                             // PSK31/RTTY (arch only)
 }
 
 // [Joel owns] — final variant taxonomy follows ft8_lib + the Field Day message set.
@@ -215,6 +217,16 @@ pub enum TxRequest {
 // PTT failure) instead of assuming the transmission happened.
 pub struct TxReport { pub radio: RadioId, pub slot: Option<SlotId>, pub outcome: TxOutcome }
 pub enum TxOutcome { Sent, Denied(InterlockError), Failed(String) }
+
+// radio/{id}/tx_log (StreamLossless) — a raw record of every attempted over, for the
+// diagnostic archive (the `archive` crate). NOT on `decodes` (the live QSO engine
+// consumes that) and richer than `tx_report` (keeps the full message + outcome, so
+// even interlock-denied / failed attempts are captured). Capture-only — nothing in
+// the operating path reads it.
+pub struct TxLogEntry {
+    pub radio: RadioId, pub mode: OverAirMode, pub slot: SlotId, pub offset: OffsetHz,
+    pub message: OutgoingMessage, pub outcome: TxOutcome, pub t: Timestamp,
+}
 ```
 
 ## 7. Logbook  —  `logbook/entries` (StreamLossless + gossiped)
@@ -296,6 +308,7 @@ pub enum InterlockError { Denied, Expired, NotHolder }
 | `session/{id}/command` | UI → session svc | `SessionCommand` | Command |
 | `radio/{id}/audio_tx` | qso/mode → rig mgr | `TxRequest` | Command/in-proc |
 | `radio/{id}/tx_report` | rig mgr | `TxReport` | State |
+| `radio/{id}/tx_log` | rig mgr (audio-tx) | `TxLogEntry` | StreamLossless |
 | `selection/{id}/active` | UI → all | `Selection` | State |
 | `qso/{id}/command` | UI → qso engine | `QsoCommand` | Command |
 | `qso/{id}/state` | qso engine | `QsoState` | State (+history) |

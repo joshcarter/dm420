@@ -93,6 +93,7 @@ fn publish_envelope(bus: &BusHandle, env: &Envelope) -> Result<(), BusError> {
         TopicKind::RigState => pub_as!(RigState),
         TopicKind::Operating => pub_as!(OperatingState),
         TopicKind::TxReport => pub_as!(TxReport),
+        TopicKind::TxLog => pub_as!(TxLogEntry),
         TopicKind::Selection => pub_as!(Selection),
         TopicKind::QsoState => pub_as!(QsoState),
         TopicKind::LogbookEntries => pub_as!(LogEntry),
