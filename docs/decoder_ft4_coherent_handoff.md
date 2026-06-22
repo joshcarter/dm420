@@ -1,5 +1,15 @@
 # FT4 coherent decode — handoff for the next session
 
+> **STATUS: DONE** (commits `fc5b620` Phases 1-3 + `53adefb` Phase 4, on `main`).
+> FT4 decode is now coherent + multi-pass, matching the FT8 architecture. On the
+> expanded 47-slot corpus (`sample_data/wsjtx_ft4`, denom 319): magnitude 240/gap
+> 25% → coherent 269/gap 16% → **coherent + subtraction 288 / gap 10%** — better
+> than FT8's 16%. FT8 unchanged at 787/16% (no regression). `ours-only` 32, all
+> clean. Implemented as a **sibling module `cohere_ft4.rs`** (not a cohere.rs
+> generalization — the FT4 DSP diverges enough that a sibling kept the FT8 path
+> byte-identical). FT4 i0 offset measured via `DM420_FT4_TOFF` sweep → baked −14.
+> New `DM420_COHERENT=0` A/B knob. The original plan follows for reference.
+
 **Goal:** bring the FT4 decoder up to the FT8 decoder's sensitivity by porting the
 same coherent front-end + multi-pass subtraction that took FT8 from gap 50% → 16%.
 FT4 decode is currently **magnitude-only, single-pass** (no coherent demod, no
