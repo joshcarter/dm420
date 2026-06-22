@@ -799,20 +799,26 @@ impl Waterfall {
             return;
         }
 
-        // Wheel zoom, anchored so the Hz under the cursor stays put. Bottom of the
-        // pane is `view_lo`, top is `view_lo + span`, so `frac` runs 0 (bottom) → 1
-        // (top). Scrolling up (positive) shrinks the span = zoom in.
-        let scroll = if resp.hovered() {
-            ui.input(|i| i.smooth_scroll_delta.y)
+        // Zoom, anchored so the Hz under the cursor stays put. Bottom of the pane
+        // is `view_lo`, top is `view_lo + span`, so `frac` runs 0 (bottom) → 1
+        // (top). Two input channels feed it: scroll-wheel / two-finger scroll
+        // (`smooth_scroll_delta.y`, additive — scrolling up shrinks the span) and
+        // touchpad pinch / ctrl+scroll (`zoom_delta`, a multiplicative factor where
+        // >1 is pinch-out = zoom in). Reading both makes the gesture work on a
+        // trackpad as well as a mouse.
+        let (scroll, zoom) = if resp.hovered() {
+            ui.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta()))
         } else {
-            0.0
+            (0.0, 1.0)
         };
-        if scroll != 0.0
+        if (scroll != 0.0 || zoom != 1.0)
             && let Some(p) = resp.hover_pos()
         {
             let frac = ((body.bottom() - p.y) / body.height().max(1.0)).clamp(0.0, 1.0);
             let cursor_hz = self.view_lo_hz + frac * self.view_span_hz;
-            let factor = (1.0 - scroll / WS_ZOOM_DIV).clamp(0.2, 5.0);
+            // Combine: scroll trims the span linearly, pinch scales it (divide by
+            // `zoom` so pinch-out shrinks the span = zooms in).
+            let factor = ((1.0 - scroll / WS_ZOOM_DIV) / zoom).clamp(0.2, 5.0);
             self.view_span_hz = (self.view_span_hz * factor).clamp(WS_MIN_SPAN_HZ, WS_MAX_HZ);
             self.view_lo_hz = cursor_hz - frac * self.view_span_hz;
         }
