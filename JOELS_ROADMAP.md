@@ -10,9 +10,8 @@ time.* Everything in **Now** serves that. **ARRL Field Day 2026 is June 27–28*
 "Now" is this-weekend-critical; "Next" is the weeks after; "Later" is the longer arc
 (SDR, new modes, sensitivity parity, product polish).
 
-**Severity tags** (text, not colored dots — legible regardless of color vision):
-**[BLOCKER]** correctness/blocker · **[SHOULD-FIX]** worth fixing soon · **[POLISH]**
-nice-to-have · **[DECISION]** open design decision.
+Items live in **Now / Next / Later** and nothing else — the bucket *is* the priority.
+Where something is unusually critical, that's called out in prose, not with a tag.
 
 ---
 
@@ -21,7 +20,7 @@ nice-to-have · **[DECISION]** open design decision.
 The mission is throughput: find workable stations across bands/modes fast, work them,
 don't double-work them, capture everything, and share the log across operating positions.
 
-### 1. [BLOCKER] Build the real `scanner` crate — *the headline Field Day feature*
+### 1. Build the real `scanner` crate — *the headline Field Day feature*
 The band scanner is the last remaining mock (`mocks::spawn_support`); `qso` and
 `logbook` are now real. It is the single biggest lever on "work many stations fast,"
 because it's how an operator discovers where the workable, **unworked** Field Day
@@ -63,25 +62,25 @@ Implementation notes:
 - **SQLite** is the natural store for queryable analysis + recovery (vs. the current
   append-only JSON logbook); it becomes the substrate for the whole-QSO view UI.
 
-### 3. [SHOULD-FIX] Field Day log reset + per-band/per-mode "unworked" tracking
+### 3. Field Day log reset + per-band/per-mode "unworked" tracking
 When Field Day starts, one click resets the logbook so everyone is "unworked" again.
 "Unworked" is **per band** (and, with item 1, effectively per mode) — the same call on
 another band is a new contact. Suggested UX (from `TODO.md`): an unlocked-mode "reset"
 button on the Log Book that moves the old log to a new filename. This is what makes the
 scanner's "unworked stations" count meaningful during the event.
 
-### 4. [SHOULD-FIX] First on-air FT4 QSO (verify the implemented TX path)
+### 4. First on-air FT4 QSO (verify the implemented TX path)
 FT4 transmit is built and **sample-identical to the `ft8_lib` reference offline**
 (`ft4_cq_1200.wav`, Pearson r = 1.0) but **never keyed on a real radio**. Field Day
 wants both modes. Remaining (from `live_pipeline_notes.md`):
 - Confirm a first on-air FT4 QSO; watch `core::tx`'s `into_slot_ms` — FT4's DT window is
   tighter than FT8, so verify tones land in tolerance after key + audio-buffer latency.
-- [SHOULD-FIX] `rig::actor::PTT_WATCHDOG` is still FT8-sized (15 s = two FT4 slots); make
+- `rig::actor::PTT_WATCHDOG` is still FT8-sized (15 s = two FT4 slots); make
   it slot-relative (derive from mode).
-- [SHOULD-FIX] Promote the FT4 encode-reference check to a committed test so an encode
+- Promote the FT4 encode-reference check to a committed test so an encode
   regression can't pass silently.
 
-### 5. [SHOULD-FIX] Shared logbook across operating positions (Network Step 2)
+### 5. Shared logbook across operating positions (Network Step 2)
 Multi-op Field Day means several positions converging one log. Transport/discovery
 (Step 1) is **done**; Step 2 (gossip completed contacts → every op's logbook converges)
 is "the headline win" of the network plan. See `TODO_NETWORK.md` Step 2 for the full
@@ -90,19 +89,99 @@ distinction in UI). **Prereqs:** the two-host smoke test (Josh, laptop + Pi) and
 "decisions to settle before Step 2" (wire encoding, `seq` persistence, LAN-trust
 security posture).
 
-### 6. [BLOCKER] Spectrogram ↔ decode-text drift
+### 6. Spectrogram ↔ decode-text drift
 Decode text is placed by wall-clock age; the spectrogram scrolls by accumulated frame
 `dt` and ignores `SpectrumRow.t`. They desync over time / on dropped frames. Fix: place
-spectrogram columns by their timestamp (resync to wall clock). A blocker because it
-undermines the core operating display you stare at all day.
+spectrogram columns by their timestamp (resync to wall clock). **Particularly critical:**
+it undermines the core operating display you stare at all day.
 
-### 7. [SHOULD-FIX] Real-mode band-scan panel + armed-state operating affordances
+### 7. Real-mode band-scan panel + armed-state operating affordances
 Quick operating-surface fixes from `TODO.md` that matter mid-contest:
 - Make the band-scan panel blank in real mode (until item 1 lands) instead of showing
   mock data.
 - Panel corner accents turn blue when armed; better behavior when you select another
   channel while armed; consider auto-arm when selecting a channel's traffic.
 - Sent text should be accent2 and is not rendering at the correct vertical height.
+
+### 8. Waterfall pauses when DM420 is tabbed away (likely a bug)
+When the app loses focus / is in the background, the waterslide appears to stop
+advancing; it resumes on refocus. Almost certainly **not** intended — you want to keep
+watching the band while another window is on top. Likely a render-throttle issue, not a
+data-loss one: decode/RX runs off-thread on the bus, so the *pipeline* keeps going; it's
+the egui repaint that stalls when the window is unfocused/occluded (eframe only redraws
+on events or an explicit repaint request). The waterfall panel already asks for ~30 fps
+via `request_repaint_after(33ms)` (`gui/src/panels/waterfall.rs:736`) and bus pumps call
+`request_repaint()` on new data (`gui/src/bus_view.rs`), but winit/macOS may not honor
+those for a backgrounded window. Investigate: confirm whether decodes/timestamps keep
+flowing while tabbed away (data fine, display frozen) vs. the pipeline itself pausing;
+then decide whether to drive continuous repaint while unfocused (and whether the
+spectrogram correctly catches up on refocus — ties into the #6 drift fix).
+
+### 9. Investigate QSO correctness
+QSOs may be "a bit off" — needs closer observation on-air before we can pin it down.
+This is an **investigation** item, not yet a defined fix. Watch the auto-sequencer
+(`qso` engine/shell) against real exchanges and capture concrete symptoms (wrong/over-
+repeated overs, mistimed TX, premature or missed RR73/73, bad exchange parsing, logging
+the wrong call/report). Cross-check against `docs/qso_flow.md`,
+`docs/wsjtx_qso_sequencing.md`, and the known shortcuts in `docs/live_pipeline_notes.md`
+(e.g. `build_log` still stamps placeholder band/freq/mode — `qso/shell.rs:286`). Promote
+each confirmed symptom into its own concrete fix item here as it's nailed down. Related:
+the "wait-for-CQ vs answer-immediately" design call in **Next**.
+
+### 10. Jump to the optimum CQ calling frequency (clear-lane finder)
+When you start a CQ (especially when *running* a frequency for Field Day throughput),
+move to the **audio offset** where you'll be heard cleanest and least likely to collide,
+instead of landing on the default ~1500 Hz pileup. **Opinionated, not advisory:** it
+doesn't present choices — one action just jumps your TX offset to the single best lane
+(briefly flash where it moved you so it isn't jarring). It sets the **outgoing TX offset
+only, never the dial** (CLAUDE.md guardrail — keep dial/center distinct from TX offset),
+scoped to the *current* band/mode. The raw material already flows on the bus:
+`SpectrumRow` energy per FFT bin and the placed `Decode` centers.
+
+Score each candidate lane on:
+- **Clearness over time** — integrate per-bin energy across the last N slots via a
+  decaying histogram, not just the latest slot (a lane between someone's overs looks
+  falsely empty for one slot). Lowest sustained energy wins.
+- **Mode-width clear lane** — the empty lane must fit the mode plus a guard: ~50 Hz for
+  FT8 (8 × 6.25 Hz), ~90 Hz for FT4 (4 × ~20.8 Hz). Require clearance on *both* sides so
+  a neighbor's skirts don't clip you.
+- **Margin from active decoders** — stay clear of the audio centers of currently-decoded
+  signals (a station there may answer or come back); penalize proximity.
+- **Bias toward passband center** — the rig's SSB filter/TX audio is flattest mid-band
+  (~1300–1800 Hz) and rolls off at the skirts; below ~300 Hz / above ~2700 Hz part of the
+  50–90 Hz signal falls outside a ~2.8–3.0 kHz filter and is attenuated on TX *and* RX.
+  This one term does triple duty: it's the "FT8/FT4 performs best here" weighting, it
+  keeps you in the window listeners actually watch (so the heard-vs-clear tension mostly
+  resolves itself), and it naturally keeps you within the TX-offset limits. Still
+  **hard-clamp** to the real limits as a safety — today a 1000–2000 Hz window (see the
+  split-audio item in **Next**), which the picker must respect, so settle those limits as
+  part of this.
+- **Birdie / carrier rejection** — exclude bins with persistent narrowband energy that
+  never produces a decode (rig spurs, power-line carriers, the DC region).
+
+The shared piece — an **occupancy map**:
+- A short-term, **in-memory** structure (the decaying per-bin energy histogram above),
+  continuously updated as we keep receiving `SpectrumRow`s — a live picture of "what's
+  busy right now," not a log. Natural to expose as a bus snapshot (a State topic) so the
+  lane finder, the `scanner` (#1), and a future band-activity view all read the same map
+  instead of each rebuilding it. Same `SpectrumRow.t` timestamping discipline as the
+  drift fix (#6).
+- **Kept separate from the decode archive (#2) on purpose** — the archive is long-running
+  and persistent (SQLite, query/recovery); the occupancy map is short-term and ephemeral.
+  Folding them together would mix concerns; they merely both read the decode/spectrum
+  streams.
+
+Other notes:
+- **Auto-CQ hook** — let the `qso` auto-sequencer invoke the picker when it starts an
+  unattended CQ run; exclude peer-`working` offsets later (Network Step 3).
+- **Deliberately out of scope (for now):** no multi-option suggestion (be opinionated);
+  no re-evaluate-while-calling / auto-hop if you get stepped on mid-run; no per-region
+  noise-floor estimate (the floor is ~uniform across the passband, so it wouldn't change
+  the pick).
+- **Cross-band / cross-mode is *not* here** — switching bands, toggling FT4↔FT8, and
+  moving to those calling frequencies belongs to the strategic "where to call CQ" advisor
+  in **Later**, which folds in the logbook and band scanner. This item stays scoped to the
+  audio offset on the current band/mode.
 
 ---
 
@@ -119,7 +198,7 @@ Quick operating-surface fixes from `TODO.md` that matter mid-contest:
   figure out how to tell when two stations are working at different offsets.
 
 ### QSO sequencing
-- **[DECISION] Answering model: "wait-for-CQ" vs "answer-immediately."** Arming to a
+- **Answering model: "wait-for-CQ" vs "answer-immediately" (open design decision).** Arming to a
   clicked CQ never fires if that station doesn't call CQ again (`qso::engine`
   `commit_from_armed`). WSJT-X answers the clicked CQ immediately. Likely make it a
   toggle, default answer-immediately. A `docs/qso_flow.md` design decision (see
@@ -139,12 +218,12 @@ Quick operating-surface fixes from `TODO.md` that matter mid-contest:
   peer distinguished. Feeds the map and band-scan panels.
 
 ### Decode pipeline robustness (`live_pipeline_notes.md`)
-- [SHOULD-FIX] Bounded decode worker (today each slot spawns a fresh thread — no
+- Bounded decode worker (today each slot spawns a fresh thread — no
   backpressure if a decode outlives its slot).
-- [SHOULD-FIX] Clean shutdown / restart of capture (needed for device + source switching).
-- [SHOULD-FIX] Clock-drift detection/warning (slot alignment leans on NTP; no warning if
+- Clean shutdown / restart of capture (needed for device + source switching).
+- Clock-drift detection/warning (slot alignment leans on NTP; no warning if
   off).
-- [SHOULD-FIX] Faithful spectrum stream — drain a per-frame ring placing each column by
+- Faithful spectrum stream — drain a per-frame ring placing each column by
   its `t` (also fixes the drift in Now-#6); reference-level / AGC brightness control
   instead of the fixed `COL_DB_FLOOR`/`COL_DB_CEIL` guesses.
 - Stamp real band/freq/mode in `build_log` (`qso/shell.rs:286`, currently placeholder
@@ -164,6 +243,18 @@ FT8 is at gap ~35% (matched 606) after the coherent front-end; FT4 coherent hand
 ---
 
 ## Later — longer arc & lower-urgency
+
+### Strategic "where to call CQ" advisor
+A higher-level decision aid that extends the clear-lane finder (Now-#10) from "best audio
+offset on the current band" to "**which band and mode** to call CQ on — and the main
+calling frequency there — to maximize Field Day contacts." Folds in multiple signals:
+the **logbook** (which bands/modes still hold many unworked stations vs. where you're
+saturated), the **band scanner** (#1 — where workable, unworked FD stations are actually
+being heard right now, with SNR), recent **occupancy** (Now-#10's map), and
+propagation / time-of-day. The lane finder becomes the final step once the advisor has
+chosen band+mode: switch band, toggle FT4/FT8, jump to the calling frequency, then pick
+the clear audio lane. Strategic and data-hungry, so it lands after the scanner, decode
+archive, and shared logbook exist.
 
 ### Interop & data
 - **ADIF import/export** (logbook crate; `OVERVIEW.md §7`, `docs/log_book.md`) — the
@@ -189,9 +280,9 @@ FT8 is at gap ~35% (matched 606) after the coherent front-end; FT4 coherent hand
   state; deferred, narrow payoff.
 
 ### Polish & nice-to-haves (`TODO.md`, `joels-notes.md`)
-- [POLISH] Cache `martian_cmap()` (rebuilt every paint); move `dsp::fft` to `realfft` (the
+- Cache `martian_cmap()` (rebuilt every paint); move `dsp::fft` to `realfft` (the
   decoder FFT already did, ~10× faster).
-- [POLISH] WAV-replay path consistency with live (timing, timestamps, no spectrogram today).
+- WAV-replay path consistency with live (timing, timestamps, no spectrogram today).
 - "Radio configuration check" easter egg (`/checkrig`) — read the rig over CAT and print
   a pass/fail setup checklist (`EX` menu reads).
 - Shared multi-operator notebook panel (freeform text).
