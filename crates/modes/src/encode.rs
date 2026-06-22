@@ -197,6 +197,22 @@ pub(crate) fn ft8_reference_phase(payload: &[u8; 10], f0: f32, sample_rate: u32)
     )
 }
 
+/// The complex-reference GFSK phase for the FT4 transmission of `payload` at
+/// audio frequency `f0` — the FT4 sibling of [`ft8_reference_phase`]. The 105-tone
+/// sequence leads with a ramp symbol, so its first Costas symbol sits one symbol
+/// (`n_spsym`) into the returned phase; signal subtraction accounts for that when
+/// it aligns the reference to the decode's start.
+pub(crate) fn ft4_reference_phase(payload: &[u8; 10], f0: f32, sample_rate: u32) -> Vec<f32> {
+    let tones = ft4_tones(payload);
+    gfsk_phase(
+        &tones,
+        f0,
+        Protocol::Ft4.gfsk_bt(),
+        Protocol::Ft4.symbol_period(),
+        sample_rate,
+    )
+}
+
 /// Synthesize a full slot of audio for `payload` in `protocol` at audio frequency
 /// `f0`, with the signal centered (silence padded) like a real transmission. The
 /// per-mode timing/shape comes from [`Protocol`]; the GFSK kernel is shared.

@@ -500,11 +500,11 @@ pub fn decode_streaming(
     protocol: Protocol,
     mut on_decode: impl FnMut(Decode),
 ) {
-    // Multi-pass subtraction (FT8 only for now): decode a pass, subtract every
-    // decode's waveform from the audio, rebuild the waterfall on the residual, and
-    // decode again — recovering signals that a louder neighbor was masking. The
-    // residual carries across passes, so each signal is subtracted once.
-    let passes = if protocol == Protocol::Ft8 && subtract_enabled() {
+    // Multi-pass subtraction (FT8 and FT4): decode a pass, subtract every decode's
+    // waveform from the audio, rebuild the waterfall on the residual, and decode
+    // again — recovering signals that a louder neighbor was masking. The residual
+    // carries across passes, so each signal is subtracted once.
+    let passes = if subtract_enabled() {
         subtract_passes()
     } else {
         1
@@ -588,7 +588,10 @@ pub fn decode_streaming(
             break;
         }
         for (payload, f0, dt) in &decoded {
-            subtract::subtract_ft8(&mut residual, payload, *f0, *dt, sample_rate);
+            match protocol {
+                Protocol::Ft8 => subtract::subtract_ft8(&mut residual, payload, *f0, *dt, sample_rate),
+                Protocol::Ft4 => subtract::subtract_ft4(&mut residual, payload, *f0, *dt, sample_rate),
+            }
         }
     }
 }
