@@ -1,6 +1,8 @@
 # Proposal: a more robust QSO auto-sequencer (grammar + no-stall)
 
-**Status:** proposal · **Owner:** (Joel/Josh) · **Crate:** `qso` (`crates/qso/src/engine.rs`)
+**Status:** ✅ **P1–P4 implemented** on branch `qso-engine-analysis` (all tests +
+`clippy -D warnings` green) · **Owner:** Joel/Josh · **Crates:** `qso`
+(`crates/qso/src/engine.rs`), `core::parse`
 **Driving goal:** survive Field Day — never sit on a dead frequency repeating an over,
 never ignore a station that is trying to work us.
 
@@ -32,6 +34,34 @@ The fixes are small and local — they live almost entirely in three functions o
 Lower-value ideas (compound/hashed-call support, a table-driven refactor, multi-caller
 pick) are collected in **§6 Suggestions** so they don't distract from the two things that
 matter: **understand the grammar, and don't stall.**
+
+---
+
+## Status — what shipped (2026-06-22)
+
+All four core fixes are implemented on `qso-engine-analysis` and covered by new
+regression tests; the existing happy-path tests still pass unchanged.
+
+| # | Fix | Landed as |
+|---|---|---|
+| **P1** | Give up after N unanswered overs (emit `TimedOut`); release the terminal `RR73` | `Active::overs_since_progress` + give-up branch in `tick_active`; one-shot `Engine::timed_out` surfaced by `snapshot`/cleared by `step` |
+| **P2** | Any directed sign-off (`RRR`/`RR73`/`73`) completes the QSO, both sides | unified `Signoff` arm in `advance_active` (replaced the three token-gated arms; `is_final` removed) |
+| **P3** | Accept a report-opener to our CQ (Standard only) | new arm in `commit_from_cq` |
+| **P4** | Parse `R <grid>` instead of dropping it to `Free` | one arm in `core::parse::parse_directed` |
+
+**Two deltas from the original spec, both deliberate:**
+
+- **N = 3, not 4.** `TX_CAP_DEFAULT = 3` (Joel's call; ~90 s of no-progress overs
+  before falling back). Paired with `TX_CAP_AFTER_LOG = 2` for the already-logged
+  terminal-`RR73` case — that QSO already counts for us, so extra `RR73`s only help
+  *them* log us. Rationale in §P1.
+- **P4 reuses `ExchangePayload::Grid`** rather than adding a `RogerGrid` variant: a new
+  variant would cascade into the exhaustive `ExchangePayload` matches in `waterfall.rs`
+  / `bus_view.rs`, so it isn't the "two-line" change advertised. We fold `R <grid>` →
+  `Grid` and drop the (un-sequenced) roger bit.
+
+`QsoPhase::Complete` is still unused — wiring a "successfully completed" phase is
+cosmetic and out of scope here; the give-up path now exercises `TimedOut`.
 
 ---
 
@@ -176,14 +206,13 @@ overs_since_progress: u8,
 - **Reset to 0** wherever a decode advances the contact (every arm in `commit_from_*`,
   `resume_from`, and `advance_active` that assigns `a.next = Some(…)`).
 - **Increment** in `tick_active`, just before transmitting `next`.
-- **Trip** when `overs_since_progress >= cap`: instead of transmitting, fire the
-  give-up — publish `QsoPhase::TimedOut` for one snapshot, then
-  `Finish::ResumeCq` if `role == CallingCq` (or if we were running CQ), else `Idle`
-  (re-arm to `target` if we have one). This reuses the existing `Finish` plumbing.
+- **Trip** when `overs_since_progress >= cap`: instead of transmitting, give up — resume
+  CQ if `role == CallingCq`, else go `Idle` (the `Answering` case; we don't re-arm a
+  silent target). A genuine (unlogged) timeout sets the one-shot `Engine::timed_out`, so
+  the give-up slot publishes `QsoPhase::TimedOut` once before the fall-back state shows.
 
 ```rust
-// cap is mode-aware: FT8 slot = 15 s, FT4 = 7.5 s.
-const TX_CAP_DEFAULT: u8 = 4;   // ~60 s FT8 / ~30 s FT4 before falling back
+const TX_CAP_DEFAULT: u8 = 3;   // ~3 no-progress overs (~90 s FT8 / ~45 s FT4)
 const TX_CAP_AFTER_LOG: u8 = 2; // once logged (terminal RR73), bail sooner
 ```
 
@@ -199,9 +228,10 @@ count — either is fine; the counter is more uniform.)
 - `cq_side_releases_rr73_after_log`: drive a standard CQ-side QSO to the RR73 (logged);
   feed no `73`; assert we resume CQ within `TX_CAP_AFTER_LOG` slots instead of looping.
 
-**Open knobs (call them, then close them):** N default (4 proposed), whether `Answering`
-times out to `Idle` vs re-`Armed`, and whether to surface "timed out → resumed CQ" in the
-waterslide tag. Recommend: N=4, `Answering`→`Idle`, show a brief `TIMEOUT ▸ {call}` tag.
+**Knobs (resolved):** `TX_CAP_DEFAULT = 3` (Joel's call), `Answering` times out to `Idle`
+(no re-arm of a silent target), and the give-up emits `TimedOut` once. A *lingering*
+`TIMEOUT ▸ {call}` waterslide tag is deferred — the phase currently flashes for one slot,
+then the fall-back state shows (`waterfall.rs` already renders unknown phases as `▸ {call}`).
 
 ### P2 — Accept any directed sign-off as completion  ⟶ fixes A2
 
@@ -216,8 +246,9 @@ ends the QSO**, on whichever side we're on. Concretely, in `advance_active`:
 
 This collapses A2 and the `RRR`-as-final gap into one consistent rule and matches WSJT-X
 (`message_is_73` treats `RR73` as a `73`; receiving any roger/73 at/after the report
-exchange completes the QSO). The `is_roger`/`is_final` helpers stay for the *log-trigger
-vs courtesy-73* distinction, but they no longer gate *whether we recognize completion*.
+exchange completes the QSO). `is_final` is **removed** (it only gated the old CQ-side arm);
+`is_roger` stays — it now only chooses the *reply* (a courtesy `73` on the FD CQ side) and
+the resume-role inference, never *whether* we recognize completion.
 
 **Tests:**
 - `answering_completes_on_bare_73`: standard answering flow, but partner closes with
@@ -262,19 +293,21 @@ it.)*
 
 ### P4 — One cheap parser arm: roger + grid  ⟶ fixes A4 (the `R GRID` case)
 
-In `parse_directed` (`crates/core/src/parse.rs:76`), add before the FD arms:
+In `parse_directed` (`crates/core/src/parse.rs`), an arm before the FD arms folds
+`R <grid>` into a plain `Grid` (we don't sequence on the roger bit):
 
 ```rust
 ["R", g] if is_grid(g) => ParsedMessage::Exchange {
     to, from,
-    payload: ExchangePayload::RogerGrid(GridSquare((*g).to_string())),
+    payload: ExchangePayload::Grid(GridSquare((*g).to_string())),
 },
 ```
 
-This needs a new `ExchangePayload::RogerGrid` (or reuse `Grid` with a `rogered` flag).
-Low urgency (20 instances, VHF/rover idiom), but it's a two-line parser change and stops a
-real template from vanishing into `Free`. The engine can treat `RogerGrid` like a grid for
-sequencing.
+We **reuse `ExchangePayload::Grid`** rather than add a `RogerGrid` variant — a new variant
+would cascade into the exhaustive `ExchangePayload` matches in `waterfall.rs` /
+`bus_view.rs`, so it isn't the two-line change first advertised. Low urgency (20 instances,
+VHF/rover idiom); the win is that a real template no longer vanishes into `Free`, and the
+engine treats it as a grid opener.
 
 ---
 
@@ -285,9 +318,9 @@ sequencing.
   it already parses* and *stop when the other guy stops* — exactly the two complaints.
 - **It's data-driven.** Every change maps to something we actually heard on the air
   (Appendix B), not a hypothetical.
-- **It moves the `Complete`/`TimedOut` states from dead code to load-bearing**, which the
-  networking layer also wants (`TODO_NETWORK.md:86` maps `TimedOut → None` for working-
-  intent gossip).
+- **It moves `TimedOut` from dead code to load-bearing** (the give-up path now emits it),
+  which the networking layer also wants (`TODO_NETWORK.md:86` maps `TimedOut → None` for
+  working-intent gossip). `Complete` stays unused — out of scope here.
 
 ---
 
@@ -331,7 +364,7 @@ captured, not so they bloat the core work.
 
 ---
 
-## 7. Testing plan (new regressions, all in `crates/qso/src/engine.rs` `mod tests`)
+## 7. Tests (added and passing — `crates/qso/src/engine.rs` `mod tests`, plus `core::parse`)
 
 | Test | Pins |
 |---|---|
@@ -340,10 +373,11 @@ captured, not so they bloat the core work.
 | `cq_side_completes_on_rrr` | P2 |
 | `times_out_after_n_unanswered_overs` | P1 / B1 |
 | `cq_side_releases_rr73_after_log` | P1 / B2 |
-| `parse_roger_grid` (in `core::parse` tests) | P4 / A4 |
+| `roger_grid_folds_into_grid` (in `core::parse` tests) | P4 / A4 |
 
-The existing `standard_answering_full_flow` / `standard_calling_cq_full_flow` must keep
-passing unchanged — they pin the happy path these changes must not regress.
+The existing `standard_answering_full_flow` / `standard_calling_cq_full_flow` still pass
+unchanged — they pin the happy path these changes must not regress. Full workspace
+`cargo test` and `cargo clippy --workspace --all-targets -- -D warnings` are green.
 
 ---
 

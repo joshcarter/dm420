@@ -136,11 +136,29 @@ struct Active {
     rcvd_report: Option<i8>,
     /// Their Field Day exchange.
     rcvd_fd: Option<(String, Section)>,
+    /// TX slots we've sent the current `next` with no received content advancing
+    /// the contact. Reset to 0 on every advance; when it reaches the give-up cap
+    /// (`TX_CAP_DEFAULT`, or `TX_CAP_AFTER_LOG` once logged) we stop and fall back
+    /// instead of repeating forever (P1 — `docs/qso_engine_improvements.md`).
+    overs_since_progress: u8,
 }
 
 /// Unanswered CQs at one offset before auto-QSY moves us to a clearer one. After
 /// this many CQs with no reply, the next CQ goes out on `Engine::next_cq_offset`.
 const CQ_HOP_AFTER: u8 = 3;
+
+/// Consecutive no-progress overs we send the *same* in-exchange message before
+/// giving up on a committed contact (P1). One over ≈ two T/R slots (~30 s FT8 /
+/// ~15 s FT4); the counter resets on any received content that advances the QSO,
+/// so this is a run of *unanswered* overs. 3 trades a marginal late-completing
+/// contact for getting back on CQ — the right call for Field Day rate.
+const TX_CAP_DEFAULT: u8 = 3;
+
+/// Tighter cap once the contact is already logged — the Standard CQ-side terminal
+/// `RR73`, re-sent while waiting for a courtesy `73` that usually never comes. The
+/// QSO already counts for us, so extra `RR73`s only help *them* log us: send a
+/// couple for insurance, then resume CQ.
+const TX_CAP_AFTER_LOG: u8 = 2;
 
 /// The QSO engine for one radio.
 pub struct Engine {
@@ -154,6 +172,10 @@ pub struct Engine {
     auto_hop: bool,
     /// The clearest CQ offset the UI's lane finder last suggested — the hop target.
     next_cq_offset: Option<OffsetHz>,
+    /// One-shot: set to the partner we just gave up on, so the give-up slot
+    /// publishes `QsoPhase::TimedOut` once (then `step` clears it and we're already
+    /// back in `Calling`/`Idle`). Only set on a genuine timeout, not a clean finish.
+    timed_out: Option<Callsign>,
 }
 
 impl Engine {
@@ -167,6 +189,7 @@ impl Engine {
             state: State::Idle,
             auto_hop: false,
             next_cq_offset: None,
+            timed_out: None,
         }
     }
 
@@ -204,11 +227,11 @@ impl Engine {
                 log = out.1;
             }
         }
-        Step {
-            state: self.snapshot(),
-            tx,
-            log,
-        }
+        let state = self.snapshot();
+        // The `TimedOut` phase is a one-shot: it's been published in `state`, so
+        // clear it — the next snapshot shows the real fall-back state we're now in.
+        self.timed_out = None;
+        Step { state, tx, log }
     }
 
     // ----------------------------------------------------------------- commands
@@ -308,6 +331,7 @@ impl Engine {
                     partner_snr: snr,
                     rcvd_report: None,
                     rcvd_fd: None,
+                    overs_since_progress: 0,
                 }));
             }
             // The target answered someone else — we lost the race; stay armed and
@@ -348,6 +372,37 @@ impl Engine {
                     partner_snr: snr,
                     rcvd_report: None,
                     rcvd_fd: None,
+                    overs_since_progress: 0,
+                }));
+                None
+            }
+            // Standard (P3): a caller skipped the grid and answered with a bare
+            // signal report (the Tx2-style "skip-Tx1" opening, common in pile-ups
+            // and POTA). Roger it and send our report (Tx3) — WSJT-X's jump-ahead.
+            // We complete when they roger us (their `RR73`, via `advance_active`).
+            // Field Day stays exclusive (no report openers — see A3 of the doc).
+            ParsedMessage::Exchange {
+                to,
+                from,
+                payload: ExchangePayload::Report(r),
+            } if to == &self.me.call && !self.me.is_field_day() => {
+                let reply = message::roger_report(&self.me, from, snr);
+                self.state = State::Active(Box::new(Active {
+                    role: Role::CallingCq,
+                    partner: from.clone(),
+                    target: None,
+                    offset,
+                    tx_parity: parity,
+                    next: Some(reply),
+                    finish_after_tx: None,
+                    log_on_tx: false,
+                    logged: false,
+                    step: 2,
+                    partner_grid: None,
+                    partner_snr: snr,
+                    rcvd_report: Some(*r),
+                    rcvd_fd: None,
+                    overs_since_progress: 0,
                 }));
                 None
             }
@@ -379,6 +434,7 @@ impl Engine {
                     partner_snr: snr,
                     rcvd_report: None,
                     rcvd_fd: Some((class.clone(), section.clone())),
+                    overs_since_progress: 0,
                 }));
                 None
             }
@@ -478,6 +534,7 @@ impl Engine {
             partner_snr: snr,
             rcvd_report: None,
             rcvd_fd: None,
+            overs_since_progress: 0,
         }));
 
         match &msg {
@@ -541,7 +598,7 @@ impl Engine {
 
         let me_fd = self.me.is_field_day();
         match (role, me_fd, msg) {
-            // ---------- Standard, answering side ----------
+            // ---------- Standard, answering side: their report → roger+report ----------
             (
                 Role::Answering,
                 false,
@@ -555,23 +612,12 @@ impl Engine {
                     a.rcvd_report = Some(*r);
                     a.next = Some(reply);
                     a.step = 2;
+                    a.overs_since_progress = 0;
                 }
                 None
             }
-            (Role::Answering, false, ParsedMessage::Signoff { kind, .. }) if is_roger(*kind) => {
-                // Their RR73 — log now (RR73 received), then send a single 73.
-                let done = self.completed();
-                let s73 = message::seven3(&self.me, &partner);
-                if let State::Active(a) = &mut self.state {
-                    a.next = Some(s73);
-                    a.finish_after_tx = Some(Finish::Idle);
-                    a.logged = true;
-                    a.step = 3;
-                }
-                Some(done)
-            }
 
-            // ---------- Field Day, answering side ----------
+            // ---------- Field Day, answering side: their R+exchange → RR73 ----------
             (
                 Role::Answering,
                 true,
@@ -593,11 +639,12 @@ impl Engine {
                     a.finish_after_tx = Some(Finish::Idle);
                     a.log_on_tx = true;
                     a.step = 2;
+                    a.overs_since_progress = 0;
                 }
                 None
             }
 
-            // ---------- Standard, CQ side ----------
+            // ---------- Standard, CQ side: their R-report → RR73 (log on send) ----------
             (
                 Role::CallingCq,
                 false,
@@ -606,35 +653,42 @@ impl Engine {
                     ..
                 },
             ) => {
-                // Their R-report — send RR73, logging when it goes out (RR73 sent).
                 let rr = message::rr73(&self.me, &partner);
                 if let State::Active(a) = &mut self.state {
                     a.rcvd_report = Some(*r);
                     a.next = Some(rr);
                     a.log_on_tx = true;
                     a.step = 2;
+                    a.overs_since_progress = 0;
                 }
                 None
             }
-            (Role::CallingCq, false, ParsedMessage::Signoff { kind, .. }) if is_final(*kind) => {
-                // Their 73 — the QSO is done; resume CQ on the same offset.
-                let done = (!logged).then(|| self.completed());
-                self.resume_cq();
-                done
-            }
 
-            // ---------- Field Day, CQ side ----------
-            (Role::CallingCq, true, ParsedMessage::Signoff { kind, .. }) if is_roger(*kind) => {
-                // Their RR73 — log now (RR73 received), send a single 73, resume CQ.
-                let done = self.completed();
-                let s73 = message::seven3(&self.me, &partner);
-                if let State::Active(a) = &mut self.state {
-                    a.next = Some(s73);
-                    a.finish_after_tx = Some(Finish::ResumeCq);
-                    a.logged = true;
-                    a.step = 3;
+            // ---------- Any directed sign-off (RRR / RR73 / 73) completes it ----------
+            // P2: a partner who sends us *any* sign-off is done. Bare `73` is the most
+            // common ending on the air, and RRR/RR73/73 are interchangeable here —
+            // gating on one specific token is what used to leave us repeating an over
+            // forever. The answering side (and the FD CQ side, on their RR73) sends a
+            // courtesy `73`; the Standard CQ side has already logged on RR73-sent and
+            // just resumes CQ.
+            (_, _, ParsedMessage::Signoff { kind, .. }) => {
+                let done = (!logged).then(|| self.completed());
+                let courtesy = matches!(role, Role::Answering) || (me_fd && is_roger(*kind));
+                if courtesy {
+                    let s73 = message::seven3(&self.me, &partner);
+                    let resume = matches!(role, Role::CallingCq);
+                    if let State::Active(a) = &mut self.state {
+                        a.next = Some(s73);
+                        a.finish_after_tx =
+                            Some(if resume { Finish::ResumeCq } else { Finish::Idle });
+                        a.logged = true;
+                        a.step = 3;
+                        a.overs_since_progress = 0;
+                    }
+                } else {
+                    self.resume_cq();
                 }
-                Some(done)
+                done
             }
 
             _ => None,
@@ -741,41 +795,99 @@ impl Engine {
         slot: SlotId,
         parity: u8,
     ) -> (Option<TxIntent>, Option<CompletedQso>) {
-        // Snapshot what we need; the borrow ends before the `&mut self` calls.
-        let (offset, message, do_log, finish) = match &self.state {
-            State::Active(a) if parity == a.tx_parity => match &a.next {
-                Some(m) => (
-                    a.offset,
-                    m.clone(),
-                    a.log_on_tx && !a.logged,
-                    a.finish_after_tx,
-                ),
-                None => return (None, None),
+        // Decide the slot's action without holding a borrow across `&mut self`.
+        enum Act {
+            Send,
+            GiveUp {
+                logged: bool,
+                role: Role,
+                partner: Callsign,
             },
-            _ => return (None, None),
+        }
+        let act = match &self.state {
+            State::Active(a) if parity == a.tx_parity && a.next.is_some() => {
+                let cap = if a.logged {
+                    TX_CAP_AFTER_LOG
+                } else {
+                    TX_CAP_DEFAULT
+                };
+                if a.overs_since_progress >= cap {
+                    Act::GiveUp {
+                        logged: a.logged,
+                        role: a.role,
+                        partner: a.partner.clone(),
+                    }
+                } else {
+                    Act::Send
+                }
+            }
+            _ => return (None, None), // not our slot, or nothing queued
         };
-        let tx = TxIntent {
-            offset,
-            slot,
-            message,
-        };
-        // "Log on send" trigger (RR73 sent).
-        let mut log = None;
-        if do_log {
-            log = Some(self.completed());
-            if let State::Active(a) = &mut self.state {
-                a.logged = true;
-                a.log_on_tx = false;
+
+        match act {
+            // Out of patience: stop hammering and fall back. A still-unlogged contact
+            // is a genuine timeout, surfaced once as `TimedOut`; an already-logged one
+            // (the terminal `RR73`) just ends quietly. Either way we free the slot —
+            // back to CQ if we were running, else idle.
+            Act::GiveUp {
+                logged,
+                role,
+                partner,
+            } => {
+                if logged {
+                    tracing::info!(?partner, "qso engine: logged contact done — releasing the over");
+                } else {
+                    tracing::info!(?partner, cap = TX_CAP_DEFAULT, "qso engine: gave up — no progress");
+                    self.timed_out = Some(partner);
+                }
+                match role {
+                    Role::CallingCq => self.resume_cq(),
+                    Role::Answering => self.state = State::Idle,
+                }
+                (None, None)
+            }
+            Act::Send => {
+                // Snapshot what we need; the borrow ends before the `&mut self` calls.
+                let (offset, message, do_log, finish) = match &self.state {
+                    State::Active(a) => match &a.next {
+                        Some(m) => (
+                            a.offset,
+                            m.clone(),
+                            a.log_on_tx && !a.logged,
+                            a.finish_after_tx,
+                        ),
+                        None => return (None, None),
+                    },
+                    _ => return (None, None),
+                };
+                // Count this over against the give-up cap; any advancing decode resets it.
+                if let State::Active(a) = &mut self.state {
+                    a.overs_since_progress = a.overs_since_progress.saturating_add(1);
+                }
+                let tx = TxIntent {
+                    offset,
+                    slot,
+                    message,
+                };
+                // "Log on send" trigger (RR73 sent).
+                let mut log = None;
+                if do_log {
+                    log = Some(self.completed());
+                    if let State::Active(a) = &mut self.state {
+                        a.logged = true;
+                        a.log_on_tx = false;
+                    }
+                }
+                // Apply any queued transition now that the message is on the air.
+                if let Some(finish) = finish {
+                    match finish {
+                        Finish::Idle => self.state = State::Idle,
+                        Finish::ResumeCq => self.resume_cq(),
+                    }
+                }
+                (Some(tx), log)
             }
         }
-        // Apply any queued transition now that the message is on the air.
-        if let Some(finish) = finish {
-            match finish {
-                Finish::Idle => self.state = State::Idle,
-                Finish::ResumeCq => self.resume_cq(),
-            }
-        }
-        (Some(tx), log)
     }
 
     // ----------------------------------------------------------------- helpers
@@ -829,6 +941,21 @@ impl Engine {
 
     /// Project the internal state onto the published [`QsoState`].
     fn snapshot(&self) -> QsoState {
+        // One-shot: the slot we gave up on publishes `TimedOut` once (then `step`
+        // clears the flag and the next snapshot shows the real fall-back state).
+        if let Some(call) = &self.timed_out {
+            return QsoState {
+                radio: self.radio.clone(),
+                phase: QsoPhase::TimedOut,
+                partner: Some(call.clone()),
+                next_tx: None,
+                tx_offset: match &self.state {
+                    State::Calling { offset, .. } => Some(*offset),
+                    State::Active(a) => Some(a.offset),
+                    _ => None,
+                },
+            };
+        }
         let (phase, partner, next_tx) = match &self.state {
             State::Idle => (QsoPhase::Idle, None, None),
             State::Armed { target, .. } => (
@@ -875,14 +1002,11 @@ fn addressed(msg: &ParsedMessage) -> Option<(&Callsign, &Callsign)> {
     }
 }
 
-/// `RR73`/`RRR` — a roger that completes the report exchange.
+/// `RR73`/`RRR` — a roger that completes the report exchange. (Used to choose the
+/// reply on the FD CQ side / the resume-role inference; P2 made *recognition* of a
+/// sign-off token-agnostic, so any `Signoff` now completes a contact regardless.)
 fn is_roger(kind: Signoff) -> bool {
     matches!(kind, Signoff::Rr73 | Signoff::Rrr)
-}
-
-/// `73`/`RR73` — counts as a final sign-off (WSJT-X's `message_is_73`).
-fn is_final(kind: Signoff) -> bool {
-    matches!(kind, Signoff::Seven3 | Signoff::Rr73)
 }
 
 #[cfg(test)]
@@ -1033,6 +1157,128 @@ mod tests {
             7,
             -8,
         )));
+        assert_eq!(e.state().phase, QsoPhase::Calling);
+    }
+
+    #[test]
+    fn calling_cq_caller_answers_with_report_not_grid() {
+        // P3: a caller skips the grid and answers our CQ with a bare report. We must
+        // not keep calling CQ — jump straight to the roger+report (Tx3).
+        let mut e = engine(ContestProfile::Standard);
+        e.step(Event::Command(QsoCommand::CallCq));
+        assert_eq!(tx_text(&mut e, 2).as_deref(), Some("CQ W9XYZ EM48"));
+        let s = e.step(Event::Decode(decode(
+            exch(ME, HIM, ExchangePayload::Report(0)),
+            3,
+            -8,
+        )));
+        assert!(matches!(s.state.phase, QsoPhase::InExchange { .. }));
+        assert_eq!(tx_text(&mut e, 4).as_deref(), Some("K1ABC W9XYZ R-08"));
+        // Their RR73 closes it: log on receive (our report sent, their report rcvd).
+        let s = e.step(Event::Decode(decode(signoff(ME, HIM, Signoff::Rr73), 5, -8)));
+        let log = s.log.expect("log when they roger our report");
+        assert_eq!(log.exchange_sent, "-08");
+        assert_eq!(log.exchange_rcvd, "+00");
+        assert_eq!(e.state().phase, QsoPhase::Calling);
+    }
+
+    #[test]
+    fn answering_completes_on_bare_73() {
+        // P2: the partner closes with a *bare* 73 (not RR73) — the most common ending
+        // on the air. We must still log and finish, not keep re-sending our R-report.
+        let mut e = engine(ContestProfile::Standard);
+        e.step(Event::Command(start_target()));
+        e.step(Event::Decode(decode(cq_from(HIM, false), 4, -5)));
+        assert_eq!(tx_text(&mut e, 5).as_deref(), Some("K1ABC W9XYZ EM48"));
+        e.step(Event::Decode(decode(
+            exch(ME, HIM, ExchangePayload::Report(-12)),
+            6,
+            -5,
+        )));
+        assert_eq!(tx_text(&mut e, 7).as_deref(), Some("K1ABC W9XYZ R-05"));
+        let s = e.step(Event::Decode(decode(signoff(ME, HIM, Signoff::Seven3), 8, -5)));
+        let log = s.log.expect("a bare 73 completes the QSO");
+        assert_eq!(log.call, call(HIM));
+        assert_eq!(tx_text(&mut e, 9).as_deref(), Some("K1ABC W9XYZ 73"));
+        assert_eq!(e.state().phase, QsoPhase::Idle);
+    }
+
+    #[test]
+    fn cq_side_completes_on_rrr() {
+        // P2: on the CQ side the partner acks with RRR (not 73). The old `is_final`
+        // gate excluded RRR and we'd hang; now any sign-off finishes the contact.
+        let mut e = engine(ContestProfile::Standard);
+        e.step(Event::Command(QsoCommand::CallCq));
+        assert_eq!(tx_text(&mut e, 2).as_deref(), Some("CQ W9XYZ EM48"));
+        e.step(Event::Decode(decode(
+            exch(ME, HIM, ExchangePayload::Grid(GridSquare("FN42".into()))),
+            3,
+            -8,
+        )));
+        assert_eq!(tx_text(&mut e, 4).as_deref(), Some("K1ABC W9XYZ -08"));
+        e.step(Event::Decode(decode(
+            exch(ME, HIM, ExchangePayload::RogerReport(-3)),
+            5,
+            -8,
+        )));
+        let s = e.step(Event::Tick { slot: SlotId(6) });
+        assert_eq!(s.tx.unwrap().message.text, "K1ABC W9XYZ RR73");
+        s.log.expect("log on RR73 sent");
+        e.step(Event::Decode(decode(signoff(ME, HIM, Signoff::Rrr), 7, -8)));
+        assert_eq!(e.state().phase, QsoPhase::Calling);
+    }
+
+    #[test]
+    fn times_out_after_n_unanswered_overs() {
+        // P1: a committed contact whose partner goes silent must give up after
+        // TX_CAP_DEFAULT overs and fall back to CQ — not repeat the over forever.
+        let mut e = engine(ContestProfile::Standard);
+        e.step(Event::Command(QsoCommand::CallCq));
+        assert_eq!(tx_text(&mut e, 0).as_deref(), Some("CQ W9XYZ EM48"));
+        // A caller answers with a grid; we start sending our report, then they vanish.
+        e.step(Event::Decode(decode(
+            exch(ME, HIM, ExchangePayload::Grid(GridSquare("FN42".into()))),
+            1,
+            -8,
+        )));
+        // We re-send the report on each of our (even) slots, three times…
+        assert_eq!(tx_text(&mut e, 2).as_deref(), Some("K1ABC W9XYZ -08"));
+        assert_eq!(tx_text(&mut e, 4).as_deref(), Some("K1ABC W9XYZ -08"));
+        assert_eq!(tx_text(&mut e, 6).as_deref(), Some("K1ABC W9XYZ -08"));
+        // …then give up: this slot publishes TimedOut and transmits nothing,
+        let s = e.step(Event::Tick { slot: SlotId(8) });
+        assert_eq!(s.tx, None);
+        assert_eq!(s.state.phase, QsoPhase::TimedOut);
+        assert_eq!(s.state.partner, Some(call(HIM)));
+        // and we're back to calling CQ.
+        assert_eq!(e.state().phase, QsoPhase::Calling);
+    }
+
+    #[test]
+    fn cq_side_releases_rr73_after_log() {
+        // P1/B2: once we've logged on RR73-sent, a silent partner must not pin us on
+        // RR73 forever — we send it TX_CAP_AFTER_LOG times then resume CQ.
+        let mut e = engine(ContestProfile::Standard);
+        e.step(Event::Command(QsoCommand::CallCq));
+        assert_eq!(tx_text(&mut e, 0).as_deref(), Some("CQ W9XYZ EM48"));
+        e.step(Event::Decode(decode(
+            exch(ME, HIM, ExchangePayload::Grid(GridSquare("FN42".into()))),
+            1,
+            -8,
+        )));
+        assert_eq!(tx_text(&mut e, 2).as_deref(), Some("K1ABC W9XYZ -08"));
+        e.step(Event::Decode(decode(
+            exch(ME, HIM, ExchangePayload::RogerReport(-3)),
+            3,
+            -8,
+        )));
+        // RR73 #1 (logs on send), then RR73 #2, then we release and resume CQ.
+        let s = e.step(Event::Tick { slot: SlotId(4) });
+        assert_eq!(s.tx.unwrap().message.text, "K1ABC W9XYZ RR73");
+        s.log.expect("log on RR73 sent");
+        assert_eq!(tx_text(&mut e, 6).as_deref(), Some("K1ABC W9XYZ RR73"));
+        let s = e.step(Event::Tick { slot: SlotId(8) });
+        assert_eq!(s.tx, None, "stop re-sending RR73 once logged");
         assert_eq!(e.state().phase, QsoPhase::Calling);
     }
 

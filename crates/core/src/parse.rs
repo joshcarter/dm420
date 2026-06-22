@@ -78,6 +78,14 @@ fn parse_directed(to: &str, from: &str, rest: &[&str], text: &str) -> ParsedMess
             from,
             payload: ExchangePayload::Report(report(tok).unwrap()),
         },
+        // Roger + grid ("R FN42") — a rover/VHF idiom (`R1` bit + grid). We don't
+        // sequence on the roger, so fold it into a plain grid instead of dropping it
+        // to `Free`. (P4 — see docs/qso_engine_improvements.md.)
+        ["R", g] if is_grid(g) => ParsedMessage::Exchange {
+            to,
+            from,
+            payload: ExchangePayload::Grid(GridSquare((*g).to_string())),
+        },
         // ARRL Field Day exchange, rogered form: "R 3A CO" — both rogers the
         // partner's exchange and sends ours (the FD analogue of `R-09`).
         ["R", class, section] if is_fd_class(class) => ParsedMessage::Exchange {
@@ -224,6 +232,19 @@ mod tests {
             parse_message("K1ABC W9XYZ R 3A CO"),
             ParsedMessage::Exchange {
                 payload: ExchangePayload::FieldDay { rogered: true, .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn roger_grid_folds_into_grid() {
+        // "R <grid>" (roger + grid, a rover/VHF idiom) parses as a grid exchange
+        // rather than vanishing into Free; the roger bit isn't sequenced on.
+        assert!(matches!(
+            parse_message("K1ABC W9XYZ R FN42"),
+            ParsedMessage::Exchange {
+                payload: ExchangePayload::Grid(_),
                 ..
             }
         ));
