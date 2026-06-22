@@ -183,6 +183,15 @@ Other notes:
   in **Later**, which folds in the logbook and band scanner. This item stays scoped to the
   audio offset on the current band/mode.
 
+### 11. Unkey the transmitter on app close — *particularly critical (safety)*
+On exit the app must drop PTT / stop TX, so quitting mid-over can't leave the rig keyed
+and transmitting. Today the macOS exit path calls `std::process::exit` from `App::ui` on
+the close request (the winit/AppKit teardown workaround), which can bypass normal Drop /
+shutdown — so any in-flight TX (PTT held, audio-TX over playing) may not be released. Make
+close first command PTT off / abort any active over (and ideally wait for the release ack)
+before exiting. A safety blocker: a stuck-keyed QRP rig jams the frequency and can damage
+the finals. **Joel — on `main`.**
+
 ---
 
 ## Next — operating polish & multi-op depth (weeks after)
@@ -208,6 +217,14 @@ Other notes:
   W1ABC's CQ / nothing-heard). The engine already logs these transitions.
 - **Multi-caller auto-pick** lands in `qso::engine` (`engine.rs:14`); when it does,
   exclude network-worked and peer-`working` stations (Network Step 3 hook).
+- **Retry/timeout limit for a stuck contact (Josh + Joel design call).** Once committed
+  to a partner (`State::Active`), the engine repeats its over every TX slot *forever* if
+  the partner stops responding — we just sit there retrying. Cap the retries: after N
+  unanswered overs, give up and fall back (`Finish::ResumeCq` if we were running, else
+  `Idle`) — the `QsoPhase::TimedOut` variant already exists for this but isn't wired.
+  Open questions: N (likely 3–5, mode-aware), whether to resume CQ vs. idle, and whether
+  to surface the timeout in the UI. Pairs with the auto-QSY CQ logic (same "no response"
+  detection, different state — Active vs. Calling).
 
 ### Network sharing (`TODO_NETWORK.md` Steps 3–4)
 - **Step 3 — working-intent ("don't compete"):** publish what you're working so peers
