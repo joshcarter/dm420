@@ -616,6 +616,38 @@ impl BusView {
         });
     }
 
+    /// Drop the rig's PTT immediately, **blocking** until the rig acknowledges (or a
+    /// short timeout). Called from the app's close path so quitting mid-over can't
+    /// leave the transmitter keyed — the rig's PTT watchdog is only a ~15 s backstop,
+    /// and our exit (`std::process::exit`) bypasses normal teardown. Unlike
+    /// [`set_freq`] this *blocks* rather than spawns: the caller exits the process
+    /// right after, so the key-down has to land first. Releasing TX needs no live
+    /// interlock token (the rig adapter always allows key-down), so a bare
+    /// `PttRequest { on: false }` does it. Real mode only — in mock there's no rig
+    /// server to answer, and the 1 s bound keeps a wedged/absent rig from hanging the
+    /// quit.
+    pub fn unkey_for_shutdown(&self) {
+        if !self.real {
+            return;
+        }
+        let bus = self.bus.clone();
+        let res = self._rt.block_on(async move {
+            bus.request::<RigCommand, app_core::CommandResult>(
+                &Topic::RigCommand(mocks::radio_id()),
+                RigCommand::PttRequest {
+                    on: false,
+                    token: InterlockToken(0),
+                },
+                Duration::from_secs(1),
+            )
+            .await
+        });
+        match res {
+            Ok(_) => tracing::info!("shutdown: dropped PTT before exit"),
+            Err(e) => tracing::warn!(error = ?e, "shutdown: PTT key-down on exit failed"),
+        }
+    }
+
     /// Publish the current selection (outgoing offset + optional target) onto the
     /// `selection/{id}/active` State topic.
     fn publish_selection(&self, offset_hz: f32, target: Option<DecodeRef>) {
