@@ -274,6 +274,37 @@ go `InExchange` and the next TX is `K1ABC W9XYZ R-08` (Tx3) → feed their `Sign
 - **Field Day mode.** This fix is Standard-only (matches the Grid arm). A plain-report
   opener while *we* are in Field Day is a separate, rarer gap — left out here.
 
+### 13. Send box doesn't update live during a QSO — only after the over finishes
+**Symptom (observed on air).** During a contact the bottom **Send box** doesn't refresh to
+show the current/next message until *after* the transmission completes. While keyed you
+can't see what's actually going out or what's queued to go next — you want eyes on both.
+
+**Where.** `crates/gui/src/panels/waterfall.rs` → `draw_send_row`, the `tx_hold` / `next_tx`
+/ `display` block (the part that latches `tx_hold` for the whole over, then picks the box
+text with `self.tx_hold.clone().or(next_tx)`).
+
+**Likely cause** (confirm with a live repro). On the first frame of an over the box latches
+the on-air message into `self.tx_hold` and holds it for the entire ~13 s over (until
+`tx_spectrum` columns stop arriving). The `display` precedence prefers `tx_hold` **over**
+the live `next_tx`, so while keyed the box is pinned to the latched text and ignores any
+newer `next_tx` the engine has already queued (e.g. after a decode advanced the contact).
+It only catches up once the over ends and `tx_hold` clears — hence "updates only after the
+transmission is sent." (Between overs, when not keyed, `tx_hold` is `None` and the box does
+track `next_tx` live.)
+
+**What we want.** Always surface *what's going out now* and *what's queued next*. Options:
+- Show the live `next_tx` as the primary text, and mark "on air" with the existing state
+  tint / a small indicator while keyed — rather than pinning the box text to `tx_hold`.
+- Or split the box: `Sending: <on-air>` while keyed **plus** `Next: <next_tx>`, so both
+  are visible at once.
+
+**Watch out for.** `tx_hold` exists for a real reason — the engine can step to idle (the
+final `73`/`RR73`) before the own-TX waterfall column reaches the GUI, so without the latch
+the just-sent text would vanish mid-over. Any fix must keep the on-air message visible for
+the whole over *while also* showing the queued next message (see the `tx_hold` comment in
+`draw_send_row`). Not safety-critical, but a daily-driver clarity bug — you fly blind on TX
+content mid-QSO.
+
 ---
 
 ## Next — operating polish & multi-op depth (weeks after)
