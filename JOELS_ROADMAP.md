@@ -192,6 +192,88 @@ close first command PTT off / abort any active over (and ideally wait for the re
 before exiting. A safety blocker: a stuck-keyed QRP rig jams the frequency and can damage
 the finals. **Joel — on `main`.**
 
+### 12. CQ answered with a *report* (not a grid) is ignored — *particularly critical*
+**A station that answers our CQ with a signal report instead of a grid is dropped — we
+just keep calling CQ.** Costs contacts directly; common on FT8 (and in contest/POTA
+styles), so it's a real Field Day liability. **Not fixed on this branch on purpose**
+(keeps `lane-finder` to the QSY work); a fix + regression test were drafted and reverted.
+Do it on `main`.
+
+**How we found it (on air, 2026-06-22).** W4LL was calling CQ on a fixed offset (2460 Hz,
+auto-QSY off). KC8PFF answered, and the engine called CQ again instead of replying — from
+`dm420.log`:
+
+| time | slot | event |
+|---|---|---|
+| 13:37:00 | 028 | we TX `CQ W4LL EM74` |
+| 13:37:28 | 029 | decode `W4LL KC8PFF +00` — KC8PFF answering us **with a report** |
+| 13:37:30 | 030 | we TX `CQ W4LL EM74` again ❌ (should be `KC8PFF W4LL …`) |
+| 13:37:58 | 031 | decode `W4LL KC8PFF +00` — KC8PFF repeats |
+| 13:38:00 | 032 | we TX `CQ W4LL EM74` again ❌ |
+
+It is **not** auto-QSY and **not** a decode/tick race: auto-QSY was off, the offset never
+moved, and the reply was decoded ~28 s before the next CQ went out. The engine simply
+didn't recognise the message as an answer.
+
+**Root cause.** `crates/qso/src/engine.rs` → `commit_from_cq` (the "we're calling CQ, did
+someone answer?" handler) only matches two openers: a **grid** (`ExchangePayload::Grid`,
+Standard) and the **Field Day exchange** (`ExchangePayload::FieldDay`). A **report**
+opener (`ExchangePayload::Report`, e.g. `+00`) hits the catch-all `_ => None`, so the
+engine stays in `State::Calling` and `tick_calling` re-sends CQ. Answering a CQ with a
+report (skipping the grid) is legal FT8 — WSJT-X jumps straight to Tx3 (the roger-report)
+when it happens.
+
+**How to fix.** Add a Report-opener arm to `commit_from_cq`, right after the Grid arm
+(Standard mode — guard `to == &self.me.call && !self.me.is_field_day()`). Commit to
+`State::Active` as `Role::CallingCq` and reply with the **roger-report (Tx3)** — roger
+their report of us and send ours — exactly mirroring the existing Grid arm but skipping
+the grid step:
+
+```rust
+// Standard: a caller skipped the grid and answered our CQ straight with a
+// signal report (e.g. "W4LL KC8PFF +00"). Like WSJT-X, jump to the roger-report
+// (Tx3). `r` is their report of us; `snr` is our report of them.
+ParsedMessage::Exchange { to, from, payload: ExchangePayload::Report(r) }
+    if to == &self.me.call && !self.me.is_field_day() =>
+{
+    let reply = message::roger_report(&self.me, from, snr); // "<from> <me> R<snr>"
+    self.state = State::Active(Box::new(Active {
+        role: Role::CallingCq,
+        partner: from.clone(),
+        target: None,
+        offset,
+        tx_parity: parity,
+        next: Some(reply),
+        finish_after_tx: None,
+        log_on_tx: false,
+        logged: false,
+        step: 2,
+        partner_grid: None,
+        partner_snr: snr,        // our report of them → log's exchange_sent
+        rcvd_report: Some(*r),   // their report of us → log's exchange_rcvd
+        rcvd_fd: None,
+    }));
+    None
+}
+```
+
+No other code needs to change: after we send the roger-report, the partner's `RR73`/`73`
+is already handled by the existing `(Role::CallingCq, _, Signoff)` arm in `advance_active`,
+which logs the contact (`completed()`) and calls `resume_cq()`.
+
+**Regression test to add** (`engine.rs` tests, mirroring `standard_calling_cq_full_flow`):
+call CQ → feed a decode `exch(ME, HIM, ExchangePayload::Report(0))` at snr −8 → assert we
+go `InExchange` and the next TX is `K1ABC W9XYZ R-08` (Tx3) → feed their `Signoff::Rr73`
+→ assert we log (`exchange_sent == "-08"`, `exchange_rcvd == "+00"`) and return to
+`Calling`. Suggested name: `calling_cq_caller_answers_with_report_not_grid`.
+
+**Edge cases to decide while fixing** (see `docs/qso_flow.md`, `docs/wsjtx_qso_sequencing.md`):
+- **R-report opener.** A caller answering straight with `R+00`
+  (`ExchangePayload::RogerReport`) still falls through the same way. Consider committing on
+  it too (reply `RR73`, log on send) for maximum forgiveness.
+- **Field Day mode.** This fix is Standard-only (matches the Grid arm). A plain-report
+  opener while *we* are in Field Day is a separate, rarer gap — left out here.
+
 ---
 
 ## Next — operating polish & multi-op depth (weeks after)
