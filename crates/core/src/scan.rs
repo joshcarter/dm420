@@ -12,15 +12,17 @@
 //! holding the in-process [`Granter`] token. Both handles live here. The *pure*
 //! sweep logic stays in the `scanner` crate so it's testable without hardware.
 //!
-//! **Decode attribution is by timestamp.** A decode arrives a slot or two after its
-//! audio (the decoder runs once the slot ends), so by the time it lands the sweep
-//! may have hopped. We record when we tuned each band (`tunes`) and credit each
-//! decode to the band that was on the air at the decode's own `t` (its slot start).
-//! Decodes older than the first tune — e.g. traffic on the band the operator was on
-//! before the scan — are dropped, not mis-credited. The `prev_slot` resync is a
-//! separate concern: it keeps the *dwell* from counting the partial slot in progress
-//! right after a retune.
+//! **Decode attribution.** A decode arrives a slot or two after its audio (the
+//! decoder runs once the slot ends), so by the time it lands the sweep may have
+//! hopped. The decode carries the grid-aligned id of the slot it decoded, and the
+//! shell records, per slot id, which band that slot was received on — crucially
+//! **after** `on_slot` runs, so the slot that *starts at a hop boundary* is credited
+//! to the band we just tuned to, not the one we left. The partial slot in progress
+//! when a scan first starts is the resync seed and is never recorded, so pre-scan
+//! traffic on the band the operator was on is dropped, not mis-credited. A decode
+//! whose slot we never recorded is dropped.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,6 +33,10 @@ use scanner::{Phase, Scanner, Step};
 
 use crate::control::AudioControl;
 use crate::interlock::Granter;
+
+/// How many recent slot→band entries to keep. Decodes lag their slot by only a slot
+/// or two, so a small window is plenty.
+const SLOT_BAND_KEEP: u64 = 16;
 
 /// Launch the band-scanner service onto `bus`. `audio` is the live-capture mode
 /// handle (`None` for WAV/no-capture: the survey still sweeps bands but can't switch
@@ -79,18 +85,17 @@ async fn run(bus: BusHandle, radio: t::RadioId, audio: Option<Arc<AudioControl>>
     };
 
     let mut engine = Scanner::new();
-    // The PTT token held while scanning (blocks the QSO engine from keying), and the
-    // operating state to put back on cancel.
+    // The PTT token held while scanning, and the operating state to restore on cancel.
     let mut token: Option<t::InterlockToken> = None;
     let mut saved: Option<(t::AbsHz, Protocol)> = None;
     let mut latest_vfo: Option<t::AbsHz> = None;
-    // Slot resync for the *dwell* (not attribution): `None` seeds without counting,
-    // so the partial slot in progress right after a retune isn't counted toward the
-    // 2-slot dwell.
+    // The band/mode currently tuned, and which band each recent slot was received on.
+    let mut active_band: Option<t::Band> = None;
+    let mut active_mode: Option<t::OverAirMode> = None;
+    let mut slot_band: HashMap<t::SlotId, t::Band> = HashMap::new();
+    // Slot resync: `None` seeds without counting/recording, so the partial slot in
+    // progress right after a (re)tune isn't counted toward the dwell or attributed.
     let mut prev_slot: Option<t::SlotId> = None;
-    // When (epoch ms) we tuned each band, newest last. A decode is credited to the
-    // band whose tune is the latest at or before the decode's own timestamp.
-    let mut tunes: Vec<(i64, t::Band)> = Vec::new();
 
     publish_state(&bus, &engine, None);
     tracing::info!("scanner: service ready (idle)");
@@ -106,9 +111,10 @@ async fn run(bus: BusHandle, radio: t::RadioId, audio: Option<Arc<AudioControl>>
                         saved = latest_vfo.map(|vfo| (vfo, cur_proto));
                         token = acquire(&granter);
                         if let Some((mode, band)) = engine.start(&stops, dwell_slots) {
-                            tunes.clear();
-                            tunes.push((now_ms(), band));
-                            prev_slot = None; // resync onto the first stop
+                            active_band = Some(band);
+                            active_mode = Some(mode);
+                            slot_band.clear();
+                            prev_slot = None; // skip the partial slot we tuned into
                             apply_stop(&bus, &radio, audio.as_deref(), mode, band).await;
                             publish_snapshot(&bus, &engine); // a fresh scan → zeroed counts
                             publish_state(&bus, &engine, None);
@@ -122,18 +128,21 @@ async fn run(bus: BusHandle, radio: t::RadioId, audio: Option<Arc<AudioControl>>
                         if engine.phase() == Phase::Scanning {
                             let changed = engine.update_stops(&stops);
                             if engine.phase() != Phase::Scanning {
-                                // Everything toggled off — wind the scan down like Cancel.
+                                // Everything toggled off — wind down like Cancel.
                                 restore(&bus, &radio, audio.as_deref(), saved.take()).await;
                                 if let Some(tok) = token.take() { granter.release(tok); }
-                                tunes.clear();
+                                active_band = None;
+                                active_mode = None;
+                                slot_band.clear();
                                 prev_slot = None;
                                 publish_state(&bus, &engine, Some(now_ms()));
                             } else {
                                 if changed {
                                     // The dwelled stop was removed — retune to the new one.
                                     if let Some((mode, band)) = engine.current() {
-                                        tunes.push((now_ms(), band));
-                                        prune_tunes(&mut tunes);
+                                        if active_mode != Some(mode) { slot_band.clear(); }
+                                        active_band = Some(band);
+                                        active_mode = Some(mode);
                                         apply_stop(&bus, &radio, audio.as_deref(), mode, band).await;
                                         prev_slot = None;
                                     }
@@ -147,7 +156,9 @@ async fn run(bus: BusHandle, radio: t::RadioId, audio: Option<Arc<AudioControl>>
                         engine.cancel();
                         restore(&bus, &radio, audio.as_deref(), saved.take()).await;
                         if let Some(tok) = token.take() { granter.release(tok); }
-                        tunes.clear();
+                        active_band = None;
+                        active_mode = None;
+                        slot_band.clear();
                         prev_slot = None;
                         publish_state(&bus, &engine, Some(now_ms()));
                         tracing::info!("scanner: survey cancelled");
@@ -161,21 +172,30 @@ async fn run(bus: BusHandle, radio: t::RadioId, audio: Option<Arc<AudioControl>>
                     prev_slot = Some(cs.slot);
                     continue;
                 }
-                // Seed `prev_slot` on the first message without firing (we may be
-                // mid-slot, and a resync sets it to `None`), then tick on each change.
-                // This governs the dwell only; attribution is by timestamp below.
+                // Seed `prev_slot` on the first message without firing (resync sets it
+                // to `None`), then act on each slot change. The seed slot — the partial
+                // one in progress right after a (re)tune — is never recorded.
                 let boundary = prev_slot.is_some_and(|p| p != cs.slot);
                 prev_slot = Some(cs.slot);
                 if !boundary {
-                    continue; // the partial slot after a retune isn't counted toward the dwell
+                    continue;
                 }
                 // Keep TX blocked: extend the grant before the ~20 s TTL lapses.
                 if let Some(tok) = token { granter.refresh(tok); }
                 if let Step::Hop { mode, band } = engine.on_slot() {
-                    tunes.push((now_ms(), band));
-                    prune_tunes(&mut tunes);
+                    if active_mode != Some(mode) {
+                        slot_band.clear(); // slot numbering changes with the mode
+                    }
+                    active_band = Some(band);
+                    active_mode = Some(mode);
                     apply_stop(&bus, &radio, audio.as_deref(), mode, band).await;
-                    prev_slot = None; // skip the partial slot after the retune
+                    prev_slot = None; // resync onto the new stop
+                }
+                // Record AFTER on_slot: the slot starting at a hop boundary is on the
+                // band we just tuned to, so it must get `active_band`'s *new* value.
+                if let Some(b) = active_band {
+                    slot_band.insert(cs.slot, b);
+                    slot_band.retain(|s, _| s.0 + SLOT_BAND_KEEP >= cs.slot.0);
                 }
                 publish_snapshot(&bus, &engine);
                 publish_state(&bus, &engine, None);
@@ -183,12 +203,11 @@ async fn run(bus: BusHandle, radio: t::RadioId, audio: Option<Arc<AudioControl>>
             r = decodes.recv() => {
                 let Ok(d) = r else { continue };
                 let mode = d.mode;
-                let ts = d.t.0;
-                if let t::DecodeContent::Slotted { message, .. } = &d.content {
-                    // Credit to the band tuned when this decode's audio was on the air.
-                    // A decode older than the first tune (pre-scan traffic on the band
-                    // we tuned away from) has no match and is dropped, not mis-credited.
-                    if let Some(band) = band_at(&tunes, ts) {
+                if let t::DecodeContent::Slotted { slot, message, .. } = &d.content {
+                    // Credit to the band recorded for this exact slot id. Slots we never
+                    // recorded (the partial (re)tune slot, or pre-scan traffic on the
+                    // band we tuned away from) are dropped, not mis-credited.
+                    if let Some(band) = slot_band.get(slot).copied() {
                         engine.on_decode(band, mode, message);
                         publish_snapshot(&bus, &engine);
                     }
@@ -217,22 +236,6 @@ fn acquire(granter: &Granter) -> Option<t::InterlockToken> {
             tracing::warn!(?other, "scanner: could not hold TX interlock; TX block is best-effort");
             None
         }
-    }
-}
-
-/// The band tuned when audio captured at `ts` (epoch ms) was on the air: the most
-/// recent tune at or before `ts`. `None` if `ts` predates the scan's first tune.
-fn band_at(tunes: &[(i64, t::Band)], ts: i64) -> Option<t::Band> {
-    tunes.iter().rev().find(|(tm, _)| *tm <= ts).map(|(_, b)| *b)
-}
-
-/// Keep the tune history bounded; decodes lag their audio by only a slot or two, so
-/// the relevant tune is always recent.
-fn prune_tunes(tunes: &mut Vec<(i64, t::Band)>) {
-    const KEEP: usize = 64;
-    if tunes.len() > KEEP {
-        let drop = tunes.len() - KEEP;
-        tunes.drain(0..drop);
     }
 }
 
