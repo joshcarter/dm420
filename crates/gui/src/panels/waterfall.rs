@@ -945,6 +945,8 @@ impl Panel for Waterfall {
                         ws_secs,
                         app_core::slot_period(protocol) as f32,
                         op_accent,
+                        op_armed,
+                        op_transmitting,
                         now_frac,
                         self.view_lo_hz,
                         self.view_span_hz,
@@ -1077,7 +1079,9 @@ const WS_DECODE_WIDE_FRAC: f32 = 2.0 / 3.0;
 /// nominal bandwidth) and its bracketing rules. Real signals smear a little
 /// taller than the nominal width on the spectrogram, so the rules sit just
 /// outside the shading rather than clipping the trace.
-const WS_RULE_GAP: f32 = 3.0;
+const WS_RULE_GAP: f32 = 5.0;
+const WS_HATCH_GAP: f32 = 7.0;
+const WS_HATCH_STRIP_H: f32 = 6.0;
 
 /// Gap (px) between a decode row's status icon and its signal-report field.
 const WS_ICON_GAP: f32 = 4.0;
@@ -1418,6 +1422,58 @@ fn is_cq(d: &Decode) -> bool {
 ///
 /// `click` is the pointer position of a click this frame (if any); a click on a
 /// decoded line selects that station (snapping to its *true* audio offset, never
+fn draw_hatch(painter: &egui::Painter, strip: Rect, color: Color32) {
+    let p = painter.with_clip_rect(strip);
+    let h = strip.height().max(1.0);
+    let stroke = egui::Stroke::new(1.5, color);
+    let mut x = strip.left() - h;
+    while x < strip.right() {
+        p.line_segment(
+            [Pos2::new(x, strip.bottom()), Pos2::new(x + h, strip.top())],
+            stroke,
+        );
+        x += 7.0;
+    }
+}
+
+fn draw_tx_hatch_row(
+    painter: &egui::Painter,
+    x_left: f32,
+    x_right: f32,
+    y_center: f32,
+    label: &str,
+    font: egui::FontId,
+    color: Color32,
+) {
+    let half_h = WS_HATCH_STRIP_H * 0.5;
+    let label_gap = 6.0;
+    let label_w = measure(painter, label, font.clone());
+    let cx = (x_left + x_right) * 0.5;
+    painter.text(Pos2::new(cx, y_center), Align2::CENTER_CENTER, label, font, color);
+    let hatch_right = cx - label_w * 0.5 - label_gap;
+    let hatch_left = cx + label_w * 0.5 + label_gap;
+    if hatch_right > x_left + 2.0 {
+        draw_hatch(
+            painter,
+            Rect::from_min_max(
+                Pos2::new(x_left, y_center - half_h),
+                Pos2::new(hatch_right, y_center + half_h),
+            ),
+            color,
+        );
+    }
+    if hatch_left < x_right - 2.0 {
+        draw_hatch(
+            painter,
+            Rect::from_min_max(
+                Pos2::new(hatch_left, y_center - half_h),
+                Pos2::new(x_right, y_center + half_h),
+            ),
+            color,
+        );
+    }
+}
+
 /// the de-collided text position), anything else a bare TX offset — returned as
 /// the new [`RealSel`]. `tx_off` is the current outgoing offset (marked as the TX
 /// lane), `sel_call`/`tag` highlight + label the selected station's lane, and
@@ -1448,6 +1504,10 @@ fn draw_waterslide(
     // The operating-state accent (amber idle / accent2 armed / accent3 keyed),
     // resolved by the caller. Tints the NOW divider and the TX lane.
     accent: Color32,
+    // Whether the QSO engine is armed (TX queued) or actively transmitting.
+    // Controls the TX lane indicator style (rules vs. hatch rows).
+    tx_armed: bool,
+    tx_transmitting: bool,
     // NOW-line position as a fraction of the panel width (0.5 = centered 1:1,
     // ~0.667 = the wide-decode 2:1 split). Both sides span `history_secs`, so the
     // right (spectrogram) side gets its own pixels-per-second when it's narrower.
@@ -1792,24 +1852,66 @@ fn draw_waterslide(
             .max(rect.top())
             .min(bottom - 3.0); // floor at 3px so it stays visible
         let band = Rect::from_min_max(Pos2::new(rect.left(), top), Pos2::new(rect.right(), bottom));
-        painter.rect_filled(band, 0.0, lane.gamma_multiply(0.10));
-        let rule_top = band.top() - WS_RULE_GAP;
-        let rule_bottom = band.bottom() + WS_RULE_GAP;
-        painter.line_segment(
-            [Pos2::new(band.left(), rule_top), Pos2::new(band.right(), rule_top)],
-            egui::Stroke::new(1.5, lane),
+        painter.rect_filled(band, 0.0, lane.gamma_multiply(0.22));
+        painter.rect_stroke(
+            band,
+            0.0,
+            egui::Stroke::new(1.0, lane.gamma_multiply(0.50)),
+            egui::StrokeKind::Inside,
         );
-        painter.line_segment(
-            [Pos2::new(band.left(), rule_bottom), Pos2::new(band.right(), rule_bottom)],
-            egui::Stroke::new(1.5, lane),
-        );
-        painter.text(
-            Pos2::new(rect.left() + 4.0, rule_top - 1.0),
-            Align2::LEFT_BOTTOM,
-            tx_label,
-            snr_font,
-            lane,
-        );
+        if tx_armed || tx_transmitting {
+            let state_label = if tx_transmitting {
+                tracked("TRANSMITTING")
+            } else {
+                tracked("ARMED")
+            };
+            let top_row_y = band.top() - WS_HATCH_GAP;
+            let bot_row_y = band.bottom() + WS_HATCH_GAP;
+            let hatch_font = heading_bold(snr_pt);
+            draw_tx_hatch_row(
+                &painter,
+                rect.left(),
+                rect.right(),
+                top_row_y,
+                &state_label,
+                hatch_font.clone(),
+                lane,
+            );
+            draw_tx_hatch_row(
+                &painter,
+                rect.left(),
+                rect.right(),
+                bot_row_y,
+                &state_label,
+                hatch_font,
+                lane,
+            );
+            painter.text(
+                Pos2::new(rect.left() + 4.0, top_row_y - WS_HATCH_STRIP_H * 0.5 - 1.0),
+                Align2::LEFT_BOTTOM,
+                tx_label,
+                snr_font,
+                lane,
+            );
+        } else {
+            let rule_top = band.top() - WS_RULE_GAP;
+            let rule_bottom = band.bottom() + WS_RULE_GAP;
+            painter.line_segment(
+                [Pos2::new(band.left(), rule_top), Pos2::new(band.right(), rule_top)],
+                egui::Stroke::new(1.5, lane),
+            );
+            painter.line_segment(
+                [Pos2::new(band.left(), rule_bottom), Pos2::new(band.right(), rule_bottom)],
+                egui::Stroke::new(1.5, lane),
+            );
+            painter.text(
+                Pos2::new(rect.left() + 4.0, rule_top - 1.0),
+                Align2::LEFT_BOTTOM,
+                tx_label,
+                snr_font,
+                lane,
+            );
+        }
     }
 
     // Resolve a click into a new selection: a decoded station (captured in the

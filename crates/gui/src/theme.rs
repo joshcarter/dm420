@@ -112,8 +112,8 @@ pub const GRAPHITE: Palette = Palette {
     legend: rgb(0xF6, 0xE6, 0xCF),
     sub: rgba(202, 180, 150, 184), // 0.72
     accent: rgb(0xF7, 0x92, 0x0F),
-    accent2: rgb(0x3A, 0xD0, 0xE0), // bright cyan, reads against the dark face
-    accent3: rgb(0x3A, 0xD0, 0xE0), // TODO: same as accent2 for now — TX/keyed state, dark face
+    accent2: rgb(0xF5, 0xDD, 0x2A), // yellow — armed state on the dark face
+    accent3: rgb(0x4C, 0xC9, 0xFF), // blue-cyan — TX/keyed state on the dark face
     screen_bg: rgb(0x08, 0x06, 0x04),
     ring: rgba(247, 146, 15, 102), // 0.40
     body: rgb(0xF4, 0xEE, 0xE6),
