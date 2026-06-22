@@ -621,11 +621,29 @@ impl Panel for Waterfall {
             ],
             "sw_mode",
         );
-        if mode_clicks[0] {
-            ctx.bus.set_protocol(Protocol::Ft8);
-        }
-        if mode_clicks[1] {
-            ctx.bus.set_protocol(Protocol::Ft4);
+        // When the mode actually changes, also retune to the calling frequency for
+        // the new mode on the current band (FT8 and FT4 use different dial freqs).
+        let new_mode_if_changed = if mode_clicks[0] && proto != Protocol::Ft8 {
+            Some((Protocol::Ft8, OverAirMode::Ft8))
+        } else if mode_clicks[1] && proto != Protocol::Ft4 {
+            Some((Protocol::Ft4, OverAirMode::Ft4))
+        } else {
+            None
+        };
+        if let Some((new_proto, new_mode)) = new_mode_if_changed {
+            ctx.bus.set_protocol(new_proto);
+            let vfo_hz = self
+                .vfo_override_hz
+                .or_else(|| ctx.bus.rig_state().map(|r| r.vfo.0));
+            if let Some(band) = vfo_hz.and_then(band_for_hz) {
+                if let Some(hz) = crate::send::calling_freq_hz(band, new_mode) {
+                    if ctx.bus.is_real() {
+                        ctx.bus.set_freq(hz);
+                    } else {
+                        self.vfo_override_hz = Some(hz);
+                    }
+                }
+            }
         }
 
         // Tuned-frequency readout (FREQ chip), centered in the header bar like the
@@ -892,7 +910,7 @@ impl Panel for Waterfall {
                     // slot boundary (drop aged/worked, fill freed slots with new
                     // top-SNR candidates); within a slot they are frozen so number
                     // badges don't shuffle on every frame.
-                    let slot_ms = app_core::slot_period(protocol) as i64 * 1_000;
+                    let slot_ms = (app_core::slot_period(protocol) * 1_000.0) as i64;
                     let current_slot_ms =
                         if slot_ms > 0 { (now_ms / slot_ms) * slot_ms } else { now_ms };
                     let recent_decodes = ctx.bus.recent_decodes();
@@ -1699,7 +1717,18 @@ fn draw_waterslide(
             (Some((c, _)), Some(mine)) => c.eq_ignore_ascii_case(mine),
             _ => false,
         };
-        let msg_col = if is_own_tx {
+        // A decode addressed *to* our callsign — someone answering our CQ or sending
+        // us an exchange/signoff — also reads in accent3 so it catches the eye.
+        let is_addressed_to_me = match (&d.content, my_call) {
+            (DecodeContent::Slotted { message, .. }, Some(mine)) => match message {
+                ParsedMessage::Exchange { to, .. } | ParsedMessage::Signoff { to, .. } => {
+                    to.0.eq_ignore_ascii_case(mine)
+                }
+                _ => false,
+            },
+            _ => false,
+        };
+        let msg_col = if is_own_tx || is_addressed_to_me {
             pal.accent3
         } else if is_sel {
             pal.accent2
