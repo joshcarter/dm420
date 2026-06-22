@@ -3,7 +3,7 @@
 
 use eframe::egui;
 use egui::{Align2, Color32, ColorImage, Pos2, Rect, TextureHandle, TextureOptions};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use types::{
     Band, Decode, DecodeContent, ExchangePayload, HealthState, OverAirMode, ParsedMessage,
@@ -106,6 +106,19 @@ pub struct Waterfall {
     /// `next_tx` or gone idle (the final 73/RR73 keeps showing while it plays out).
     /// `None` when we're not transmitting. See `draw_send_row`.
     tx_hold: Option<String>,
+    /// Stable digit assignments: callsign (upper-cased) → (digit index 0..9,
+    /// slot-boundary ms when assigned). Updated once per slot boundary; held
+    /// across frames so numbers don't shuffle within a slot. The timestamp lets
+    /// the retain logic drop entries purely by age, independent of whether the
+    /// station's decode is still in `recent_decodes()`.
+    cq_assignments: HashMap<String, (usize, i64)>,
+    /// Slot-boundary timestamp (ms since epoch) when `cq_assignments` was last
+    /// updated. A change here triggers the drop-and-fill logic.
+    last_assigned_slot_ms: i64,
+    /// Per-frame resolved shortcuts: index = digit assignment, value = the best
+    /// current `Decode` for that callsign (or `None` if no recent decode).
+    /// Always exactly 10 elements; rebuilt each frame from `cq_assignments`.
+    cq_shortcuts: Vec<Option<Decode>>,
     /// The engine's `next_tx` text observed on the previous frame, so when an over
     /// starts we can latch the message being sent even though the engine may have
     /// already stepped to idle by the time the own-TX waterfall reaches the GUI.
@@ -143,6 +156,9 @@ impl Waterfall {
                 resume: None,
             },
             tx_hold: None,
+            cq_assignments: HashMap::new(),
+            last_assigned_slot_ms: 0,
+            cq_shortcuts: vec![None; 10],
             last_next_tx: None,
             wide_decode: crate::settings::read_waterslide_wide(),
             view_lo_hz: 0.0,
@@ -176,13 +192,36 @@ impl Waterfall {
 
         // Keyboard: only the active panel acts on typed input / Enter. `/` or `:`
         // begins a slash command; Backspace/Escape edit/abort it; Enter activates
-        // (run the command, else toggle arm). Anything else is ignored.
+        // (run the command, else toggle arm). Digit keys [1..9, 0] fire the CQ
+        // shortcut for the ranked station at that slot when disarmed.
         let mut activate = false;
         if ctx.active {
             let events = ctx.ui.input(|i| i.events.clone());
+            // Track whether a digit was consumed as a shortcut so its companion
+            // Event::Text doesn't also flow into the slash-command buffer.
+            let mut digit_consumed = false;
             for ev in &events {
+                // Digit shortcut: no modifiers, not mid-command, not armed.
+                if let egui::Event::Key { key, pressed: true, modifiers, .. } = ev
+                    && !modifiers.any()
+                    && !self.send.entering
+                    && let Some(idx) = digit_key_index(*key)
+                {
+                    digit_consumed = true;
+                    if let Some(d) = self.cq_shortcuts[idx].clone()
+                        && let Some((call, slot)) = decode_station(&d)
+                    {
+                        self.real_sel = RealSel {
+                            offset: d.offset.0,
+                            target: Some((call.clone(), slot)),
+                            resume: None,
+                        };
+                        ctx.bus.answer_station(d.offset.0, call, slot);
+                    }
+                    continue;
+                }
                 match ev {
-                    egui::Event::Text(t) => self.send.type_text(t),
+                    egui::Event::Text(t) if !digit_consumed => self.send.type_text(t),
                     egui::Event::Key {
                         key: egui::Key::Enter,
                         pressed: true,
@@ -839,17 +878,68 @@ impl Panel for Waterfall {
                         .qso_state()
                         .and_then(|q| q.tx_offset)
                         .map_or(self.real_sel.offset, |o| o.0);
+
+                    // Slot-locked CQ shortcuts. Assignments are updated once per
+                    // slot boundary (drop aged/worked, fill freed slots with new
+                    // top-SNR candidates); within a slot they are frozen so number
+                    // badges don't shuffle on every frame.
+                    let slot_ms = app_core::slot_period(protocol) as i64 * 1_000;
+                    let current_slot_ms =
+                        if slot_ms > 0 { (now_ms / slot_ms) * slot_ms } else { now_ms };
+                    let recent_decodes = ctx.bus.recent_decodes();
+                    if current_slot_ms != self.last_assigned_slot_ms {
+                        self.last_assigned_slot_ms = current_slot_ms;
+                        if armed {
+                            self.cq_assignments.clear();
+                        } else {
+                            update_cq_assignments(
+                                &mut self.cq_assignments,
+                                &recent_decodes,
+                                &worked,
+                                current_slot_ms,
+                                slot_ms,
+                            );
+                        }
+                    }
+                    // Rebuild the per-frame shortcuts vec from the stable assignment
+                    // map, picking the highest-SNR decode for each assigned callsign.
+                    self.cq_shortcuts = {
+                        let mut slots: Vec<Option<Decode>> = vec![None; 10];
+                        for d in &recent_decodes {
+                            if !is_cq(d) {
+                                continue;
+                            }
+                            let Some((call, _)) = decode_station(d) else {
+                                continue;
+                            };
+                            let Some((idx, _)) =
+                                self.cq_assignments.get(&call.to_ascii_uppercase()).copied()
+                            else {
+                                continue;
+                            };
+                            let better = slots[idx]
+                                .as_ref()
+                                .map(|s| d.snr_db > s.snr_db)
+                                .unwrap_or(true);
+                            if better {
+                                slots[idx] = Some(d.clone());
+                            }
+                        }
+                        slots
+                    };
+
                     if let Some(sel) = draw_waterslide(
                         painter,
                         body,
                         pal,
-                        &ctx.bus.recent_decodes(),
+                        &recent_decodes,
                         now_ms,
                         click,
                         tx_off,
                         sel_call.as_deref(),
                         (!ctx.call.trim().is_empty()).then(|| ctx.call.trim()),
                         &worked,
+                        &self.cq_assignments,
                         tag.as_deref(),
                         bandwidth_hz,
                         ws_secs,
@@ -1235,6 +1325,80 @@ pub(crate) fn band_for_hz(hz: u64) -> Option<Band> {
     })
 }
 
+/// Update CQ shortcut assignments at a slot boundary.
+///
+/// 1. Drop any callsign that is now worked or was assigned more than 2 slot
+///    periods ago. Age is checked against the stored assignment timestamp, so
+///    this is independent of whether the decode is still in `recent_decodes()`.
+/// 2. Fill freed digit slots (lowest index first) with the top-SNR unassigned
+///    callers from the most recent complete slot in `decodes`.
+fn update_cq_assignments(
+    assignments: &mut HashMap<String, (usize, i64)>,
+    decodes: &[Decode],
+    worked: &HashSet<String>,
+    current_slot_ms: i64,
+    slot_ms: i64,
+) {
+    // Drop worked stations or those assigned more than 2 slot periods ago.
+    // Using current_slot_ms (boundary-aligned) rather than wall-clock time
+    // ensures exact integer arithmetic against the boundary-aligned d.t.0 values.
+    let age_limit = current_slot_ms - slot_ms * 2;
+    assignments.retain(|call, &mut (_, assigned_at)| {
+        !worked.contains(call) && assigned_at >= age_limit
+    });
+
+    // Collect free digit slots (ascending order = lowest index wins).
+    let used: HashSet<usize> = assignments.values().map(|&(idx, _)| idx).collect();
+    let free: Vec<usize> = (0..10).filter(|i| !used.contains(i)).collect();
+    if free.is_empty() {
+        return;
+    }
+
+    // Candidates: unworked, unassigned CQ callers from the most recent
+    // complete slot, ranked by SNR, one entry per callsign (best decode).
+    let fill_cutoff = current_slot_ms - slot_ms;
+    let mut all: Vec<&Decode> = decodes
+        .iter()
+        .filter(|d| is_cq(d) && d.t.0 >= fill_cutoff)
+        .collect();
+    all.sort_by_key(|d| std::cmp::Reverse(d.snr_db));
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut candidates: Vec<String> = Vec::new();
+    for d in all {
+        let Some((call, _)) = decode_station(d) else {
+            continue;
+        };
+        let upper = call.to_ascii_uppercase();
+        if worked.contains(&upper) || assignments.contains_key(&upper) {
+            continue;
+        }
+        if seen.insert(upper.clone()) {
+            candidates.push(upper);
+        }
+    }
+
+    for (call, &idx) in candidates.iter().zip(free.iter()) {
+        assignments.insert(call.clone(), (idx, current_slot_ms));
+    }
+}
+
+/// Map a top-row digit key to a 0-based shortcut index: '1'→0 … '9'→8, '0'→9.
+fn digit_key_index(key: egui::Key) -> Option<usize> {
+    match key {
+        egui::Key::Num1 => Some(0),
+        egui::Key::Num2 => Some(1),
+        egui::Key::Num3 => Some(2),
+        egui::Key::Num4 => Some(3),
+        egui::Key::Num5 => Some(4),
+        egui::Key::Num6 => Some(5),
+        egui::Key::Num7 => Some(6),
+        egui::Key::Num8 => Some(7),
+        egui::Key::Num9 => Some(8),
+        egui::Key::Num0 => Some(9),
+        _ => None,
+    }
+}
+
 /// Whether a decode is a CQ call (the message type the waterslide bolds when the
 /// caller is still unworked).
 fn is_cq(d: &Decode) -> bool {
@@ -1274,6 +1438,9 @@ fn draw_waterslide(
     // Calls already logged on the current band (upper-cased). Decodes from these
     // stations get a "+" status icon; an unworked CQ caller gets a filled circle.
     worked: &HashSet<String>,
+    // Stable digit assignments: callsign (upper) → (digit index 0..9, assigned
+    // slot ms). A CQ station present here gets a reverse-video digit badge.
+    cq_assignments: &HashMap<String, (usize, i64)>,
     tag: Option<&str>,
     bandwidth_hz: f32,
     history_secs: f32,
@@ -1510,8 +1677,9 @@ fn draw_waterslide(
         // Status icon, left of the report and sized to read in sunlight: a
         // right-facing triangle (accent2) marks the selected station; a plus
         // (accent) flags a station already worked on this band; a filled circle
-        // (accent) flags an unworked station calling CQ — the one to work. Worked
-        // outranks CQ so a station we've logged never reads as "answer me".
+        // (accent) flags an unworked CQ caller; a reverse-video digit badge
+        // replaces the circle for stations assigned to a number-key shortcut.
+        // Worked outranks CQ so a logged station never reads as "answer me".
         let worked_here = station
             .as_ref()
             .is_some_and(|(c, _)| worked.contains(&c.to_ascii_uppercase()));
@@ -1533,7 +1701,28 @@ fn draw_waterslide(
             painter.line_segment([Pos2::new(c.x - icon_r, c.y), Pos2::new(c.x + icon_r, c.y)], stroke);
             painter.line_segment([Pos2::new(c.x, c.y - icon_r), Pos2::new(c.x, c.y + icon_r)], stroke);
         } else if is_cq(d) {
-            painter.circle_filled(Pos2::new(icon_cx, p.final_y), icon_r, pal.accent);
+            // Check if this CQ caller has a number-key shortcut assigned.
+            let rank = decode_station(d)
+                .and_then(|(c, _)| cq_assignments.get(&c.to_ascii_uppercase()))
+                .map(|&(idx, _)| idx);
+            if let Some(rank) = rank {
+                let digit = if rank == 9 { '0' } else { (b'1' + rank as u8) as char };
+                let half = (snr_pt * 0.65).max(6.0);
+                let badge = Rect::from_center_size(
+                    Pos2::new(icon_cx, p.final_y),
+                    egui::vec2(half * 2.0, half * 2.0),
+                );
+                painter.rect_filled(badge, corner_radius(1), pal.accent);
+                painter.text(
+                    Pos2::new(icon_cx, p.final_y),
+                    Align2::CENTER_CENTER,
+                    digit.to_string(),
+                    heading_bold((snr_pt * 0.9).max(MIN_FONT_PT + 1.0)),
+                    pal.screen_bg,
+                );
+            } else {
+                painter.circle_filled(Pos2::new(icon_cx, p.final_y), icon_r, pal.accent);
+            }
         }
         // Bumped off its lane: draw a faint leader just left of the text from the
         // true audio centre to the shifted text so the eye still maps the row to

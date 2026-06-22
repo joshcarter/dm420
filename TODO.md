@@ -1,18 +1,14 @@
 # Next
 
-Make band scan panel blank for real mode
+Audio option: RX clipping indicator
 
-Make panel corner accents blue when armed
+Need an option for calling a specific station.
 
-Better behavior if you select another channel while armed
+When a station answers my CQ, highlight them on the map
 
-Auto-arm when selecting a channel's traffic?
+Does not seem to handle a station answering on another offset
 
-Map scroll/zoom/reset
 
-Sent text should be accent2
-
-Sent text not rendering at correct vertical height
 
 # Split audio offset
 
@@ -22,21 +18,16 @@ How can we tell if two stations are communicating at different offsets?
 
 # Soon
 
-Evaluate different color schemes, especially for light mode.
+I'm not sure what to do when a station I'm trying to work goes and chases other stations. Cancel? Or just wait? Wait on same offset?
 
 Review if hashed callsigns are properly implemented.
-
-Map screen: highlight with crosshairs the station you're armed to work.
 
 Need to determine actual limits of audio offset for
 transmit--currently a hard window, something like 1000-2000Hz.
 
-Note when tracking unworked stations: when Field Day starts we need a
-way to quickly reset the log book and mark all stations as unworked
-again. Also, "unworked" is specific to each band. Same station on a
-different band counts as a different contact. Maybe when UI is
-unlocked, have a "reset" button on the log book which moves the old
-log book to a new file name.
+
+
+# Field Day Specific
 
 Map panel: Field Day station positions — DONE (heard + worked). A Field Day
 responder sends only its ARRL *section* (e.g. `WI`), not a grid. The map now
@@ -50,12 +41,22 @@ is relocated to the nearest land within its region, tested against the same
 land/lake mesh the map draws. Applies to grids and sections alike; resolved
 positions are memoized so a spot stays put across redraws.
 
-# Next
+Log Book should show station class/section instead of signal report.
+
+Note when tracking unworked stations: when Field Day starts we need a
+way to quickly reset the log book and mark all stations as unworked
+again. Also, "unworked" is specific to each band. Same station on a
+different band counts as a different contact. Maybe when UI is
+unlocked, have a "reset" button on the log book which moves the old
+log book to a new file name.
+
+# Optional
 
 Unlocked view should show the keyboard shortcut for each panel.
 
+Summary of slash commands on unlocked panel.
 
-# Optional
+Auto-arm when selecting a channel's traffic?
 
 Shared multi-operator notebook panel. Freeform text box.
 
