@@ -60,6 +60,7 @@ pub fn spawn(bus: &BusHandle, audio: Option<Arc<AudioControl>>, fallback: Protoc
                     offset_ms: 0.0,
                     slot_phase,
                     slot,
+                    mode: crate::decode::over_air(proto),
                 },
             );
         }

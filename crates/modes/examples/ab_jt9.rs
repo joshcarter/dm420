@@ -17,9 +17,11 @@
 //!   cargo run -p modes --example ab_jt9 -- ~/Library/Application\ Support/WSJT-X/save/*.wav
 //!   cargo run -p modes --example ab_jt9 -- /path/to/save_dir          # scans *.wav
 //!
-//! The `jt9` invocation is configurable for version drift:
-//!   JT9_BIN=jt9            path to the binary (default `jt9`, found on PATH)
-//!   JT9_ARGS="--ft8 -d 3"  args inserted before the WAV path (default shown)
+//! Mode + the `jt9` invocation are configurable:
+//!   AB_MODE=ft8|ft4        which decoder to run, ours + jt9 (default `ft8`)
+//!   JT9_BIN=jt9            path to the binary (default `jt9`, found on PATH;
+//!                          on macOS: /Applications/wsjtx.app/Contents/MacOS/jt9)
+//!   JT9_ARGS="--ft8 -d 3"  args inserted before the WAV path (default tracks AB_MODE)
 
 use modes::{Protocol, decode};
 use std::collections::BTreeSet;
@@ -45,9 +47,21 @@ fn main() {
         std::process::exit(2);
     }
 
+    // AB_MODE selects the protocol for *both* decoders (default FT8). jt9's mode flag
+    // tracks it unless JT9_ARGS is set explicitly.
+    let mode = std::env::var("AB_MODE").unwrap_or_else(|_| "ft8".into());
+    let (protocol, jt9_mode_flag) = match mode.to_ascii_lowercase().as_str() {
+        "ft4" => (Protocol::Ft4, "--ft4"),
+        "ft8" => (Protocol::Ft8, "--ft8"),
+        other => {
+            eprintln!("⚠ unknown AB_MODE={other:?} — expected ft8 or ft4");
+            std::process::exit(2);
+        }
+    };
+
     let jt9_bin = std::env::var("JT9_BIN").unwrap_or_else(|_| "jt9".into());
     let jt9_args: Vec<String> = std::env::var("JT9_ARGS")
-        .unwrap_or_else(|_| "--ft8 -d 3".into())
+        .unwrap_or_else(|_| format!("{jt9_mode_flag} -d 3"))
         .split_whitespace()
         .map(str::to_owned)
         .collect();
@@ -63,7 +77,7 @@ fn main() {
         }
 
         let ours = normalize_rows(
-            decode(&sig, sr, Protocol::Ft8)
+            decode(&sig, sr, protocol)
                 .into_iter()
                 .map(|d| Row { msg: d.message, snr: d.snr_db, freq: d.freq_hz }),
         );
@@ -160,7 +174,12 @@ fn run_jt9(bin: &str, args: &[String], wav: &Path) -> Result<Vec<Row>, String> {
 fn parse_jt9(stdout: &str) -> Vec<Row> {
     let mut rows = Vec::new();
     for line in stdout.lines() {
-        let Some((pre, rest)) = line.split_once('~') else {
+        // jt9 decode lines are `HHMMSS SNR DT FREQ <marker> MESSAGE`, where the
+        // single-char sync marker is `~` for FT8 and `+` for FT4. Split on whichever
+        // is present (FT8 lines always carry `~`, so they're unaffected; FT4 lines
+        // have no `~`, so they fall through to `+`, which is the marker and always
+        // precedes the message — even when the message itself contains a `+report`).
+        let Some((pre, rest)) = line.split_once('~').or_else(|| line.split_once('+')) else {
             continue;
         };
         let msg = rest.trim();

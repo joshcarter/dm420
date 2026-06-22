@@ -121,11 +121,11 @@ async fn run(
 
     // The clock's last-seen slot id; a change marks a T/R boundary (the tick).
     let mut prev_slot: Option<SlotId> = None;
-    // The active on-air mode, tracked from inbound decodes (each carries the mode
-    // the decoder used). Drives the `mode` we hand the audio-TX codec so it never
-    // synthesizes the wrong protocol into a slot. Defaults to FT8 until the first
-    // decode (the answering flow always hears the partner first, so by the time we
-    // transmit a reply this reflects the real mode).
+    // The active on-air mode we hand the audio-TX codec so it never synthesizes the
+    // wrong protocol into a slot. Sourced from the clock's `ClockStatus.mode` (the
+    // live configured protocol), which arrives within one tick (~50 ms) of startup —
+    // so it's correct even for an FT4 CQ-first over, before any decode is heard. This
+    // FT8 initial value only stands until that first clock tick.
     let mut mode = OverAirMode::Ft8;
     // Seed the per-contact sequence from the wall clock so `QsoId { origin, seq }`
     // stays unique *across sessions*. A plain 0 restart reused 1, 2, 3… every run,
@@ -145,10 +145,7 @@ async fn run(
                 step
             }
             r = decodes.recv() => match r {
-                Ok(d) => {
-                    mode = d.mode;
-                    engine.step(Event::Decode(d))
-                }
+                Ok(d) => engine.step(Event::Decode(d)),
                 Err(_) => continue,
             },
             r = selection.recv() => match r {
@@ -157,6 +154,10 @@ async fn run(
             },
             r = clock.recv() => match r {
                 Ok(cs) => {
+                    // The clock is the authoritative mode source (derived from the
+                    // live configured protocol), so `mode` is correct even before the
+                    // first decode — an FT4 CQ-first over synthesizes as FT4, not FT8.
+                    mode = cs.mode;
                     // A slot boundary is a change in the clock's authoritative slot
                     // id. Seed `prev_slot` on the first message without firing (we
                     // may be mid-slot), then tick on every change after.

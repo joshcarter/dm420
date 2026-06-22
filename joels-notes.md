@@ -209,7 +209,8 @@ Running notes, gotchas, and reminders. Newest at the top.
     single-holder interlock token. Leave `DM420_ALLOW_TX` unset for normal RX use.
   - **Still ahead:** Step 3 (feed `tx_report` back so the engine reacts to TX
     denials/failures), Step 4 (real TX offset window + `/f` retune in real mode),
-    and FT4 TX synthesis (FT8 only today).
+    and a first on-air FT4 QSO (the FT4 TX synth is now implemented — sample-identical
+    to the ft8_lib reference offline).
 
 - **Station call + grid: no default; TOML config, set via file or UI, persisted — done:**
   no built-in default — a silent one risks transmitting as the wrong station (the old

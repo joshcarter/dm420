@@ -13,7 +13,8 @@
 //! real recordings) is the absolute calibration; treat these dB as internally
 //! consistent, not gospel.
 //!
-//! FT8 only: `synth_message` synthesizes FT8 (4-GFSK FT4 has no exported synth).
+//! FT8 only by design: this harness plants FT8 scenes (it passes `Protocol::Ft8`
+//! to `synth_message`/`decode`). FT4 synth now exists, so an FT4 variant is possible.
 //!
 //! Run:
 //!   cargo run -p modes --example crowd_recall -- --n 40 --snr-min -18 --snr-max 0
@@ -161,7 +162,7 @@ fn run_synthetic(args: &Args) {
     let mut rng = Rng::new(args.seed);
 
     // Reference transmit power of a unit-amplitude synthesized signal.
-    let p_unit = signal_power(&synth_message("CQ K1ABC FN42", 1500.0, SR).unwrap());
+    let p_unit = signal_power(&synth_message("CQ K1ABC FN42", Protocol::Ft8, 1500.0, SR).unwrap());
     // White-noise power that lands in the 2500 Hz FT8 reference band.
     let noise_2500 = args.noise_var * REF_BW / (SR as f32 / 2.0);
 
@@ -194,7 +195,7 @@ fn run_synthetic(args: &Args) {
     let mut plants: Vec<Plant> = Vec::new();
     for (i, &f) in freq.iter().enumerate() {
         let msg = format!("CQ {} {}", gen_call(i), gen_grid(i));
-        let Some(sig) = synth_message(&msg, f, SR) else {
+        let Some(sig) = synth_message(&msg, Protocol::Ft8, f, SR) else {
             continue; // unencodable — skip; recall is scored against placed plants
         };
         let snr = snr_of(i);

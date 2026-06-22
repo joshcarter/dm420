@@ -15,18 +15,51 @@
 //! symbol), so we first refine the start sample by a short search for peak signal
 //! energy.
 
-use crate::encode::{FT8_SYMBOL_PERIOD, ft8_reference_phase};
+use crate::encode::{ft4_reference_phase, ft8_reference_phase};
+use crate::waterfall::Protocol;
 
-/// Sample offsets tried when refining the start time. The sync grid is ~half a
+/// Sample offsets tried when refining the FT8 start time. The sync grid is ~half a
 /// symbol (960 samples at 12 kHz), so the true start is within ±¼ symbol of the
 /// candidate; ±480 in steps of 120 covers that.
-const TIMING_SEARCH: [i64; 9] = [-480, -360, -240, -120, 0, 120, 240, 360, 480];
+const TIMING_SEARCH_FT8: [i64; 9] = [-480, -360, -240, -120, 0, 120, 240, 360, 480];
+
+/// FT4 equivalent: one FT4 symbol is 576 samples at 12 kHz, so ±288 in steps of 72
+/// covers the same ±¼-symbol uncertainty.
+const TIMING_SEARCH_FT4: [i64; 9] = [-288, -216, -144, -72, 0, 72, 144, 216, 288];
 
 /// Estimate and subtract the FT8 signal `payload` (audio frequency `f0`, approx
 /// start `dt` seconds into the slot) from `residual` in place.
 pub fn subtract_ft8(residual: &mut [f32], payload: &[u8; 10], f0: f32, dt: f32, sample_rate: u32) {
     let phase = ft8_reference_phase(payload, f0, sample_rate);
-    let n_spsym = (0.5 + sample_rate as f32 * FT8_SYMBOL_PERIOD) as usize;
+    let n_spsym = (0.5 + sample_rate as f32 * Protocol::Ft8.symbol_period()) as usize;
+    // FT8 has no ramp symbol: the reference's symbol 0 is the first Costas, so it
+    // aligns directly with `dt`.
+    let nominal = (dt * sample_rate as f32).round() as i64;
+    subtract_signal(residual, &phase, n_spsym, nominal, &TIMING_SEARCH_FT8);
+}
+
+/// Estimate and subtract the FT4 signal `payload` from `residual` in place. The
+/// FT4 sibling of [`subtract_ft8`]: `dt` marks the first Costas symbol, but the
+/// 105-tone reference leads with a ramp symbol, so the reference start sits one
+/// symbol earlier (cf. `subtractft4.f90`'s `nstart = dt*12000 - NSPS`).
+pub fn subtract_ft4(residual: &mut [f32], payload: &[u8; 10], f0: f32, dt: f32, sample_rate: u32) {
+    let phase = ft4_reference_phase(payload, f0, sample_rate);
+    let n_spsym = (0.5 + sample_rate as f32 * Protocol::Ft4.symbol_period()) as usize;
+    let nominal = (dt * sample_rate as f32).round() as i64 - n_spsym as i64;
+    subtract_signal(residual, &phase, n_spsym, nominal, &TIMING_SEARCH_FT4);
+}
+
+/// Per-symbol complex-amplitude fit and subtraction of a GFSK reference `phase`
+/// from `residual`, refining the start sample around `nominal` over `timing`.
+/// Shared by the FT8 and FT4 paths (they differ only in reference phase, symbol
+/// length, and timing-search step).
+fn subtract_signal(
+    residual: &mut [f32],
+    phase: &[f32],
+    n_spsym: usize,
+    nominal: i64,
+    timing: &[i64],
+) {
     let n_sym = phase.len() / n_spsym;
 
     // Precompute the complex reference (cos/sin of the phase) once — the hot loops
@@ -34,8 +67,7 @@ pub fn subtract_ft8(residual: &mut [f32], payload: &[u8; 10], f0: f32, dt: f32, 
     let cos_t: Vec<f32> = phase.iter().map(|p| p.cos()).collect();
     let sin_t: Vec<f32> = phase.iter().map(|p| p.sin()).collect();
 
-    let nominal = (dt * sample_rate as f32).round() as i64;
-    let start = TIMING_SEARCH
+    let start = timing
         .iter()
         .map(|&sh| (corr_energy(residual, &cos_t, &sin_t, nominal + sh, n_spsym, n_sym), sh))
         .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
@@ -126,7 +158,7 @@ mod tests {
         let before = power(&signal);
 
         // synth_ft8 centers the signal; that placement is dt = n_silence / sr.
-        let n_data = (0.5 + 79.0 * FT8_SYMBOL_PERIOD * sr as f32) as usize;
+        let n_data = (0.5 + 79.0 * Protocol::Ft8.symbol_period() * sr as f32) as usize;
         let n_silence = (signal.len() - n_data) / 2;
         let dt = n_silence as f32 / sr as f32;
 
@@ -151,7 +183,7 @@ mod tests {
         let a = synth_ft8(&pa, fa, sr);
         let b = synth_ft8(&pb, fb, sr);
 
-        let n_data = (0.5 + 79.0 * FT8_SYMBOL_PERIOD * sr as f32) as usize;
+        let n_data = (0.5 + 79.0 * Protocol::Ft8.symbol_period() * sr as f32) as usize;
         let dt = ((a.len() - n_data) / 2) as f32 / sr as f32;
 
         let mut sum: Vec<f32> = a.iter().zip(&b).map(|(x, y)| x + y).collect();

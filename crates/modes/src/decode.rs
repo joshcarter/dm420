@@ -3,7 +3,8 @@
 //! and FT4. Output is a list of [`Decode`]s per slot.
 
 use crate::cohere;
-use crate::constants::{FT4_COSTAS, FT4_GRAY, FT4_XOR, FT8_COSTAS, FT8_GRAY};
+use crate::cohere_ft4;
+use crate::constants::{FT4_COSTAS, FT4_GRAY, FT8_COSTAS, FT8_GRAY};
 use crate::crc;
 use crate::ldpc::{N, bp_decode};
 use crate::message::{self, CallHash, MessageType};
@@ -25,16 +26,9 @@ const SUBTRACT_PASSES: usize = 3;
 const TIME_OSR: usize = 2;
 const FREQ_OSR: usize = 2;
 
-// FT8 sync geometry.
-const FT8_NUM_SYNC: usize = 3;
-const FT8_LENGTH_SYNC: usize = 7;
-const FT8_SYNC_OFFSET: usize = 36;
-const FT8_ND: usize = 58;
-// FT4 sync geometry.
-const FT4_NUM_SYNC: usize = 4;
-const FT4_LENGTH_SYNC: usize = 4;
-const FT4_SYNC_OFFSET: usize = 33;
-const FT4_ND: usize = 87;
+// Sync geometry (Costas block count / length / stride), the data-symbol count,
+// and the total channel-symbol count now live on `Protocol` (see `waterfall.rs`)
+// so encode and decode read them from one place.
 
 /// One decoded transmission within a slot.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -111,12 +105,15 @@ fn mag_at(wf: &Waterfall, c: &Candidate, block_abs: i32, tone: i32) -> u8 {
 // The loop index also drives block/time math, so the range loops are intentional.
 #[allow(clippy::needless_range_loop)]
 fn ft8_sync_score(wf: &Waterfall, c: &Candidate) -> i32 {
+    let num_sync = wf.protocol.num_sync();
+    let length_sync = wf.protocol.length_sync();
+    let sync_offset = wf.protocol.sync_offset();
     let mut score = 0i32;
     let mut num = 0i32;
     let nb = wf.num_blocks as i32;
-    for m in 0..FT8_NUM_SYNC {
-        for k in 0..FT8_LENGTH_SYNC {
-            let block = (FT8_SYNC_OFFSET * m + k) as i32;
+    for m in 0..num_sync {
+        for k in 0..length_sync {
+            let block = (sync_offset * m + k) as i32;
             let block_abs = c.time_offset + block;
             if block_abs < 0 {
                 continue;
@@ -138,7 +135,7 @@ fn ft8_sync_score(wf: &Waterfall, c: &Candidate) -> i32 {
                 score += here - mag_at(wf, c, block_abs - 1, sm) as i32;
                 num += 1;
             }
-            if (k + 1) < FT8_LENGTH_SYNC && (block_abs + 1) < nb {
+            if (k + 1) < length_sync && (block_abs + 1) < nb {
                 score += here - mag_at(wf, c, block_abs + 1, sm) as i32;
                 num += 1;
             }
@@ -149,12 +146,15 @@ fn ft8_sync_score(wf: &Waterfall, c: &Candidate) -> i32 {
 
 #[allow(clippy::needless_range_loop)]
 fn ft4_sync_score(wf: &Waterfall, c: &Candidate) -> i32 {
+    let num_sync = wf.protocol.num_sync();
+    let length_sync = wf.protocol.length_sync();
+    let sync_offset = wf.protocol.sync_offset();
     let mut score = 0i32;
     let mut num = 0i32;
     let nb = wf.num_blocks as i32;
-    for m in 0..FT4_NUM_SYNC {
-        for k in 0..FT4_LENGTH_SYNC {
-            let block = (1 + FT4_SYNC_OFFSET * m + k) as i32;
+    for m in 0..num_sync {
+        for k in 0..length_sync {
+            let block = (1 + sync_offset * m + k) as i32;
             let block_abs = c.time_offset + block;
             if block_abs < 0 {
                 continue;
@@ -176,7 +176,7 @@ fn ft4_sync_score(wf: &Waterfall, c: &Candidate) -> i32 {
                 score += here - mag_at(wf, c, block_abs - 1, sm) as i32;
                 num += 1;
             }
-            if (k + 1) < FT4_LENGTH_SYNC && (block_abs + 1) < nb {
+            if (k + 1) < length_sync && (block_abs + 1) < nb {
                 score += here - mag_at(wf, c, block_abs + 1, sm) as i32;
                 num += 1;
             }
@@ -229,11 +229,9 @@ fn estimate_snr(wf: &Waterfall, c: &Candidate, noise: f64) -> f32 {
         return 49.0;
     }
     let nb = wf.num_blocks as i32;
-    let (num_sync, len_sync, sync_offset) = if wf.protocol == Protocol::Ft4 {
-        (FT4_NUM_SYNC, FT4_LENGTH_SYNC, FT4_SYNC_OFFSET)
-    } else {
-        (FT8_NUM_SYNC, FT8_LENGTH_SYNC, FT8_SYNC_OFFSET)
-    };
+    let num_sync = wf.protocol.num_sync();
+    let len_sync = wf.protocol.length_sync();
+    let sync_offset = wf.protocol.sync_offset();
 
     // Linear power recovered from the stored u8 magnitude (dB → linear).
     let lin = |v: u8| 10f64.powf(mag_db(v) as f64 / 10.0);
@@ -290,11 +288,7 @@ fn find_candidates(wf: &Waterfall) -> Vec<Candidate> {
     // recordings/generated files aren't always tight to the slot start (FT4 in
     // particular sits ~25 symbols in), so bound the upper end by where the last
     // data symbol still fits rather than the reference's fixed +20.
-    let total_symbols = if wf.protocol == Protocol::Ft4 {
-        105
-    } else {
-        79
-    };
+    let total_symbols = wf.protocol.channel_symbols() as i32;
     let upper = (wf.num_blocks as i32 - total_symbols + 11).max(20);
     let mut cands = Vec::new();
     for time_sub in 0..wf.time_osr {
@@ -334,7 +328,7 @@ fn extract_llr(wf: &Waterfall, c: &Candidate) -> [f32; N] {
     let mut log174 = [0.0f32; N];
     let nb = wf.num_blocks as i32;
     if wf.protocol == Protocol::Ft4 {
-        for k in 0..FT4_ND {
+        for k in 0..wf.protocol.data_symbols() {
             let sync = if k < 29 {
                 5
             } else if k < 58 {
@@ -354,7 +348,7 @@ fn extract_llr(wf: &Waterfall, c: &Candidate) -> [f32; N] {
             log174[bit + 1] = max2(s[1], s[3]) - max2(s[0], s[2]);
         }
     } else {
-        for k in 0..FT8_ND {
+        for k in 0..wf.protocol.data_symbols() {
             let sync = if k < 29 { 7 } else { 14 };
             let sym_idx = (k + sync) as i32;
             let bit = 3 * k;
@@ -435,6 +429,14 @@ fn subtract_enabled() -> bool {
     *EN.get_or_init(|| std::env::var("DM420_SUBTRACT").map(|v| v != "0").unwrap_or(true))
 }
 
+/// Whether the coherent front-end runs (default on). `DM420_COHERENT=0` falls
+/// back to the magnitude-only path — the A/B switch for measuring the coherent
+/// demod's contribution against the magnitude baseline on the same corpus.
+fn coherent_enabled() -> bool {
+    static EN: OnceLock<bool> = OnceLock::new();
+    *EN.get_or_init(|| std::env::var("DM420_COHERENT").map(|v| v != "0").unwrap_or(true))
+}
+
 /// Number of subtraction passes. `DM420_SUBTRACT_PASSES` overrides the default
 /// for tuning; the loop stops early once a pass finds nothing new.
 fn subtract_passes() -> usize {
@@ -461,12 +463,11 @@ pub(crate) fn verify_codeword(protocol: Protocol, plain: &[u8; N]) -> Option<[u8
         return None;
     }
     let mut payload = [0u8; 10];
-    if protocol == Protocol::Ft4 {
-        for i in 0..10 {
-            payload[i] = a91[i] ^ FT4_XOR[i];
+    payload.copy_from_slice(&a91[..10]);
+    if let Some(xor) = protocol.whitening() {
+        for (b, x) in payload.iter_mut().zip(xor.iter()) {
+            *b ^= *x;
         }
-    } else {
-        payload.copy_from_slice(&a91[..10]);
     }
     Some(payload)
 }
@@ -486,17 +487,24 @@ pub fn decode(samples: &[f32], sample_rate: u32, protocol: Protocol) -> Vec<Deco
 /// live pipeline publish each decode onto the bus as it lands, so the UI and the
 /// QSO engine see the strongest signals (e.g. a CQ being answered) first — a beat
 /// before the whole slot's batch would have finished — instead of all at once.
+/// Per-mode coherent demodulator, selected once per slot. FT8 and FT4 have
+/// different geometry and bit-metric steps, so each owns its own `Demod`.
+enum CoherentDemod {
+    Ft8(cohere::Demod),
+    Ft4(cohere_ft4::Demod),
+}
+
 pub fn decode_streaming(
     samples: &[f32],
     sample_rate: u32,
     protocol: Protocol,
     mut on_decode: impl FnMut(Decode),
 ) {
-    // Multi-pass subtraction (FT8 only for now): decode a pass, subtract every
-    // decode's waveform from the audio, rebuild the waterfall on the residual, and
-    // decode again — recovering signals that a louder neighbor was masking. The
-    // residual carries across passes, so each signal is subtracted once.
-    let passes = if protocol == Protocol::Ft8 && subtract_enabled() {
+    // Multi-pass subtraction (FT8 and FT4): decode a pass, subtract every decode's
+    // waveform from the audio, rebuild the waterfall on the residual, and decode
+    // again — recovering signals that a louder neighbor was masking. The residual
+    // carries across passes, so each signal is subtracted once.
+    let passes = if subtract_enabled() {
         subtract_passes()
     } else {
         1
@@ -518,19 +526,24 @@ pub fn decode_streaming(
         let cands = find_candidates(wf); // already sorted strongest-first by score
         let sp = wf.symbol_period;
 
-        // FT8 gets the coherent front-end (Phase 2): per-candidate complex baseband +
-        // fine sync + multi-symbol coherent demod, rebuilt on each pass's residual so
-        // coherent demod and subtraction (Phase 3) compose — every pass decodes a
-        // cleaner residual coherently, and the refined freq/dt feed the next subtract.
-        // FT4 stays on the magnitude path. Coherent is tried first with the magnitude
-        // path as a fallback, so it can only add decodes, never regress.
-        let mut demod = if protocol == Protocol::Ft8 {
-            let mut d = cohere::Demod::new();
-            d.set_slot(&residual);
-            Some(d)
-        } else {
-            None
-        };
+        // Both modes get a coherent front-end: per-candidate complex baseband + fine
+        // sync + multi-symbol coherent demod, rebuilt on each pass's residual so
+        // coherent demod and subtraction compose — every pass decodes a cleaner
+        // residual coherently, and the refined freq/dt feed the next subtract.
+        // Coherent is tried first with the magnitude path as a fallback, so it can
+        // only add decodes, never regress.
+        let mut demod = coherent_enabled().then(|| match protocol {
+            Protocol::Ft8 => {
+                let mut d = cohere::Demod::new();
+                d.set_slot(&residual);
+                CoherentDemod::Ft8(d)
+            }
+            Protocol::Ft4 => {
+                let mut d = cohere_ft4::Demod::new();
+                d.set_slot(&residual);
+                CoherentDemod::Ft4(d)
+            }
+        });
 
         // (payload, freq, dt) for each signal newly decoded this pass — used to
         // subtract them before the next pass.
@@ -542,11 +555,14 @@ pub fn decode_streaming(
                 / sp;
             let coarse_dt = (c.time_offset as f32 + c.time_sub as f32 / wf.time_osr as f32) * sp;
 
-            // Coherent path first (FT8); magnitude path as a safety fallback so the
+            // Coherent path first; magnitude path as a safety fallback so the
             // coherent front-end can only add decodes, never regress.
             let dec = demod
                 .as_mut()
-                .and_then(|d| decode_candidate_coherent(d, wf, c))
+                .and_then(|d| match d {
+                    CoherentDemod::Ft8(d) => decode_candidate_coherent(d, wf, c),
+                    CoherentDemod::Ft4(d) => decode_candidate_coherent_ft4(d, wf, c),
+                })
                 .or_else(|| decode_candidate(wf, c).map(|p| (p, coarse_freq, coarse_dt)));
             let Some((payload, freq_hz, dt)) = dec else {
                 continue;
@@ -572,7 +588,10 @@ pub fn decode_streaming(
             break;
         }
         for (payload, f0, dt) in &decoded {
-            subtract::subtract_ft8(&mut residual, payload, *f0, *dt, sample_rate);
+            match protocol {
+                Protocol::Ft8 => subtract::subtract_ft8(&mut residual, payload, *f0, *dt, sample_rate),
+                Protocol::Ft4 => subtract::subtract_ft4(&mut residual, payload, *f0, *dt, sample_rate),
+            }
         }
     }
 }
@@ -617,10 +636,62 @@ fn decode_candidate_coherent(
     None
 }
 
+/// Empirical FT4 start-sample correction (downsampled samples) added to the
+/// magnitude candidate's start guess before fine sync. FT4's start convention
+/// (a ramp symbol at index 0, the 0.5 s slot offset, NSPS=576) differs from
+/// FT8's, so this is measured via a `DM420_FT4_TOFF` sweep rather than derived —
+/// see the FT8 gotcha in `docs/decoder_ft4_coherent_handoff.md`. Sweep on the
+/// 14-slot real FT4 set (`sample_data/wsjtx_ft4`): a flat optimum across −16..−12
+/// downsampled samples (matched 80, gap 18%), falling off either side; the baked
+/// default −14 is the plateau center. Override via the env var to re-sweep.
+fn ft4_toff() -> f32 {
+    static T: OnceLock<f32> = OnceLock::new();
+    *T.get_or_init(|| {
+        std::env::var("DM420_FT4_TOFF")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(-14.0)
+    })
+}
+
+/// Coherent decode of one candidate (FT4): the FT4 sibling of
+/// [`decode_candidate_coherent`]. Analyze to LLR variants, then BP + OSD + CRC on
+/// each in WSJT-X pass order, returning the first valid payload with the refined
+/// frequency and time offset.
+fn decode_candidate_coherent_ft4(
+    demod: &mut cohere_ft4::Demod,
+    wf: &Waterfall,
+    c: &Candidate,
+) -> Option<([u8; 10], f32, f32)> {
+    let sp = wf.symbol_period;
+    let f0 =
+        (wf.min_bin as f32 + c.freq_offset as f32 + c.freq_sub as f32 / wf.freq_osr as f32) / sp;
+    // 32 downsampled samples/symbol (NSPS/NDOWN = 576/18), the same as FT8. The
+    // start-convention offset is measured empirically, not derived (see ft4_toff).
+    const SPS2: f32 = 32.0;
+    let i0 = (c.time_offset as f32 + c.time_sub as f32 / wf.time_osr as f32) * SPS2 + ft4_toff();
+    let an = demod.analyze(f0, i0)?;
+    for llr in an.llrs.iter() {
+        let (plain, errors) = bp_decode(llr, LDPC_ITERS);
+        if errors == 0 {
+            if let Some(p) = verify_codeword(wf.protocol, &plain) {
+                return Some((p, an.freq_hz, an.dt));
+            }
+        } else if osd_enabled() && errors <= OSD_MAX_ERRORS {
+            for cand in osd::osd_decode(llr) {
+                if let Some(p) = verify_codeword(wf.protocol, &cand) {
+                    return Some((p, an.freq_hz, an.dt));
+                }
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::encode::synth_ft8;
+    use crate::encode::{synth_ft4, synth_ft8};
     use crate::message::{CallHash as Ch, encode_std};
 
     // Deterministic white-ish noise via a simple LCG (no Math.random).
@@ -644,6 +715,52 @@ mod tests {
             decodes.iter().any(|d| d.message == "CQ K1ABC FN42"),
             "got: {:?}",
             decodes.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn round_trip_single_signal_ft4() {
+        let mut h = Ch::new();
+        let payload = encode_std("CQ", "K1ABC", "FN42", &mut h).unwrap();
+        let sig = synth_ft4(&payload, 1200.0, 12000);
+        let decodes = decode(&sig, 12000, Protocol::Ft4);
+        assert!(
+            decodes.iter().any(|d| d.message == "CQ K1ABC FN42"),
+            "got: {:?}",
+            decodes.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn round_trip_ft4_with_noise_and_multiple_signals() {
+        let mut h = Ch::new();
+        let p1 = encode_std("CQ", "K1ABC", "FN42", &mut h).unwrap();
+        let p2 = encode_std("W9XYZ", "K1ABC", "-09", &mut h).unwrap();
+        let mut sig = synth_ft4(&p1, 800.0, 12000);
+        let s2 = synth_ft4(&p2, 1600.0, 12000);
+        for (a, b) in sig.iter_mut().zip(s2.iter()) {
+            *a += *b;
+        }
+        add_noise(&mut sig, 0.05, 0x1234_5678_9abc_def0);
+        let decodes = decode(&sig, 12000, Protocol::Ft4);
+        let msgs: Vec<&String> = decodes.iter().map(|d| &d.message).collect();
+        assert!(msgs.iter().any(|m| *m == "CQ K1ABC FN42"), "got {msgs:?}");
+        assert!(msgs.iter().any(|m| *m == "W9XYZ K1ABC -09"), "got {msgs:?}");
+    }
+
+    /// An FT4-synthesized signal must not decode as FT8 — the two modes are
+    /// different waveforms (8 vs 4 tones, 0.16 vs 0.048 s symbols). This is the
+    /// concrete reason the synth/TX path has to be mode-aware.
+    #[test]
+    fn ft4_signal_does_not_decode_as_ft8() {
+        let mut h = Ch::new();
+        let payload = encode_std("CQ", "K1ABC", "FN42", &mut h).unwrap();
+        let sig = synth_ft4(&payload, 1200.0, 12000);
+        let as_ft8 = decode(&sig, 12000, Protocol::Ft8);
+        assert!(
+            !as_ft8.iter().any(|d| d.message == "CQ K1ABC FN42"),
+            "FT4 waveform should not decode under FT8: {:?}",
+            as_ft8.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }
 
