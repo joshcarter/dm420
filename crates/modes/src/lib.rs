@@ -15,6 +15,7 @@
 //! self-verifying without a radio.
 
 mod cohere;
+mod cohere_ft4;
 mod constants;
 mod crc;
 mod decode;

@@ -3,6 +3,7 @@
 //! and FT4. Output is a list of [`Decode`]s per slot.
 
 use crate::cohere;
+use crate::cohere_ft4;
 use crate::constants::{FT4_COSTAS, FT4_GRAY, FT8_COSTAS, FT8_GRAY};
 use crate::crc;
 use crate::ldpc::{N, bp_decode};
@@ -428,6 +429,14 @@ fn subtract_enabled() -> bool {
     *EN.get_or_init(|| std::env::var("DM420_SUBTRACT").map(|v| v != "0").unwrap_or(true))
 }
 
+/// Whether the coherent front-end runs (default on). `DM420_COHERENT=0` falls
+/// back to the magnitude-only path — the A/B switch for measuring the coherent
+/// demod's contribution against the magnitude baseline on the same corpus.
+fn coherent_enabled() -> bool {
+    static EN: OnceLock<bool> = OnceLock::new();
+    *EN.get_or_init(|| std::env::var("DM420_COHERENT").map(|v| v != "0").unwrap_or(true))
+}
+
 /// Number of subtraction passes. `DM420_SUBTRACT_PASSES` overrides the default
 /// for tuning; the loop stops early once a pass finds nothing new.
 fn subtract_passes() -> usize {
@@ -478,6 +487,13 @@ pub fn decode(samples: &[f32], sample_rate: u32, protocol: Protocol) -> Vec<Deco
 /// live pipeline publish each decode onto the bus as it lands, so the UI and the
 /// QSO engine see the strongest signals (e.g. a CQ being answered) first — a beat
 /// before the whole slot's batch would have finished — instead of all at once.
+/// Per-mode coherent demodulator, selected once per slot. FT8 and FT4 have
+/// different geometry and bit-metric steps, so each owns its own `Demod`.
+enum CoherentDemod {
+    Ft8(cohere::Demod),
+    Ft4(cohere_ft4::Demod),
+}
+
 pub fn decode_streaming(
     samples: &[f32],
     sample_rate: u32,
@@ -510,19 +526,24 @@ pub fn decode_streaming(
         let cands = find_candidates(wf); // already sorted strongest-first by score
         let sp = wf.symbol_period;
 
-        // FT8 gets the coherent front-end (Phase 2): per-candidate complex baseband +
-        // fine sync + multi-symbol coherent demod, rebuilt on each pass's residual so
-        // coherent demod and subtraction (Phase 3) compose — every pass decodes a
-        // cleaner residual coherently, and the refined freq/dt feed the next subtract.
-        // FT4 stays on the magnitude path. Coherent is tried first with the magnitude
-        // path as a fallback, so it can only add decodes, never regress.
-        let mut demod = if protocol == Protocol::Ft8 {
-            let mut d = cohere::Demod::new();
-            d.set_slot(&residual);
-            Some(d)
-        } else {
-            None
-        };
+        // Both modes get a coherent front-end: per-candidate complex baseband + fine
+        // sync + multi-symbol coherent demod, rebuilt on each pass's residual so
+        // coherent demod and subtraction compose — every pass decodes a cleaner
+        // residual coherently, and the refined freq/dt feed the next subtract.
+        // Coherent is tried first with the magnitude path as a fallback, so it can
+        // only add decodes, never regress.
+        let mut demod = coherent_enabled().then(|| match protocol {
+            Protocol::Ft8 => {
+                let mut d = cohere::Demod::new();
+                d.set_slot(&residual);
+                CoherentDemod::Ft8(d)
+            }
+            Protocol::Ft4 => {
+                let mut d = cohere_ft4::Demod::new();
+                d.set_slot(&residual);
+                CoherentDemod::Ft4(d)
+            }
+        });
 
         // (payload, freq, dt) for each signal newly decoded this pass — used to
         // subtract them before the next pass.
@@ -534,11 +555,14 @@ pub fn decode_streaming(
                 / sp;
             let coarse_dt = (c.time_offset as f32 + c.time_sub as f32 / wf.time_osr as f32) * sp;
 
-            // Coherent path first (FT8); magnitude path as a safety fallback so the
+            // Coherent path first; magnitude path as a safety fallback so the
             // coherent front-end can only add decodes, never regress.
             let dec = demod
                 .as_mut()
-                .and_then(|d| decode_candidate_coherent(d, wf, c))
+                .and_then(|d| match d {
+                    CoherentDemod::Ft8(d) => decode_candidate_coherent(d, wf, c),
+                    CoherentDemod::Ft4(d) => decode_candidate_coherent_ft4(d, wf, c),
+                })
                 .or_else(|| decode_candidate(wf, c).map(|p| (p, coarse_freq, coarse_dt)));
             let Some((payload, freq_hz, dt)) = dec else {
                 continue;
@@ -592,6 +616,58 @@ fn decode_candidate_coherent(
     let i0 = (c.time_offset as f32 + c.time_sub as f32 / wf.time_osr as f32) * SPS2 - SPS2;
     let an = demod.analyze(f0, i0)?;
     // Try all five LLR variants (nsym=1/2/3 coherent integration) in WSJT-X pass order.
+    for llr in an.llrs.iter() {
+        let (plain, errors) = bp_decode(llr, LDPC_ITERS);
+        if errors == 0 {
+            if let Some(p) = verify_codeword(wf.protocol, &plain) {
+                return Some((p, an.freq_hz, an.dt));
+            }
+        } else if osd_enabled() && errors <= OSD_MAX_ERRORS {
+            for cand in osd::osd_decode(llr) {
+                if let Some(p) = verify_codeword(wf.protocol, &cand) {
+                    return Some((p, an.freq_hz, an.dt));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Empirical FT4 start-sample correction (downsampled samples) added to the
+/// magnitude candidate's start guess before fine sync. FT4's start convention
+/// (a ramp symbol at index 0, the 0.5 s slot offset, NSPS=576) differs from
+/// FT8's, so this is measured via a `DM420_FT4_TOFF` sweep rather than derived —
+/// see the FT8 gotcha in `docs/decoder_ft4_coherent_handoff.md`. Sweep on the
+/// 14-slot real FT4 set (`sample_data/wsjtx_ft4`): a flat optimum across −16..−12
+/// downsampled samples (matched 80, gap 18%), falling off either side; the baked
+/// default −14 is the plateau center. Override via the env var to re-sweep.
+fn ft4_toff() -> f32 {
+    static T: OnceLock<f32> = OnceLock::new();
+    *T.get_or_init(|| {
+        std::env::var("DM420_FT4_TOFF")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(-14.0)
+    })
+}
+
+/// Coherent decode of one candidate (FT4): the FT4 sibling of
+/// [`decode_candidate_coherent`]. Analyze to LLR variants, then BP + OSD + CRC on
+/// each in WSJT-X pass order, returning the first valid payload with the refined
+/// frequency and time offset.
+fn decode_candidate_coherent_ft4(
+    demod: &mut cohere_ft4::Demod,
+    wf: &Waterfall,
+    c: &Candidate,
+) -> Option<([u8; 10], f32, f32)> {
+    let sp = wf.symbol_period;
+    let f0 =
+        (wf.min_bin as f32 + c.freq_offset as f32 + c.freq_sub as f32 / wf.freq_osr as f32) / sp;
+    // 32 downsampled samples/symbol (NSPS/NDOWN = 576/18), the same as FT8. The
+    // start-convention offset is measured empirically, not derived (see ft4_toff).
+    const SPS2: f32 = 32.0;
+    let i0 = (c.time_offset as f32 + c.time_sub as f32 / wf.time_osr as f32) * SPS2 + ft4_toff();
+    let an = demod.analyze(f0, i0)?;
     for llr in an.llrs.iter() {
         let (plain, errors) = bp_decode(llr, LDPC_ITERS);
         if errors == 0 {
