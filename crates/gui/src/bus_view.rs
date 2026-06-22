@@ -33,6 +33,12 @@ fn cell<T>() -> Cell<T> {
 /// enough that a wide monitor on a crowded band never evicts a still-visible decode.
 const DECODE_RING_CAP: usize = 8192;
 
+/// Capacity of the recent-RX-spectrum ring that backs the clear-lane finder
+/// (`lane_finder`). The finder weights rows by recency (~8 s half-life), so this
+/// only needs the last several seconds of frames; 512 is comfortably more than
+/// that at any plausible spectrum cadence (~20 rows/s → ~25 s).
+const SPECTRUM_HIST_CAP: usize = 512;
+
 /// A rolling window for a stream topic: the pump pushes, dropping the oldest past
 /// `cap`; the GUI snapshots the tail it wants each frame.
 #[derive(Clone)]
@@ -121,6 +127,10 @@ pub struct BusView {
     /// separate from `spectrum` so RX columns don't race it onto one cell; the
     /// panel shows it in place of the RX waterfall during an over.
     spectrum_tx: Cell<SpectrumRow>,
+    /// Rolling window of recent RX spectrum rows, feeding the clear-lane finder
+    /// (`lane_finder`). Short-term and in-memory by design — distinct from any
+    /// long-term decode archive (`JOELS_ROADMAP.md` Now-#10).
+    spectrum_hist: Ring<SpectrumRow>,
     // `scanner`/`clock` are pumped and exposed now; their panel consumers (idle
     // scan status, slot clock in the top bar) land in the next wiring pass.
     #[allow(dead_code)]
@@ -191,6 +201,7 @@ impl BusView {
         // and the panel culls by age, not count. Keep this well past the worst case so
         // a wide monitor + crowded band never drops still-visible decodes. ~1 MB.
         let decodes = Ring::new(DECODE_RING_CAP);
+        let spectrum_hist = Ring::new(SPECTRUM_HIST_CAP);
         let heard: Arc<Mutex<HashMap<String, HeardEntry>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let health: Arc<Mutex<HashMap<SubsystemId, SubsystemHealth>>> =
@@ -245,6 +256,7 @@ impl BusView {
             Topic::Spectrum(mocks::radio_id()),
             spectrum.clone(),
             spectrum_tx.clone(),
+            spectrum_hist.clone(),
             egui_ctx.clone(),
         );
         pump_state(&bus, Topic::ScannerState, scanner.clone(), egui_ctx.clone());
@@ -279,6 +291,7 @@ impl BusView {
             rig,
             spectrum,
             spectrum_tx,
+            spectrum_hist,
             scanner,
             clock,
             bands,
@@ -319,6 +332,12 @@ impl BusView {
     /// during an over (the RX capture is meaningless while transmitting).
     pub fn tx_spectrum(&self) -> Option<SpectrumRow> {
         self.spectrum_tx.lock().unwrap().clone()
+    }
+
+    /// Recent RX spectrum rows (oldest→newest) for the clear-lane finder. A bounded,
+    /// in-memory window — see [`SPECTRUM_HIST_CAP`].
+    pub fn recent_spectrum(&self) -> Vec<SpectrumRow> {
+        self.spectrum_hist.snapshot()
     }
 
     /// The current scanner status, if seen yet. (Consumer lands next pass.)
@@ -710,6 +729,7 @@ fn pump_spectrum(
     topic: Topic,
     rx: Cell<SpectrumRow>,
     tx: Cell<SpectrumRow>,
+    hist: Ring<SpectrumRow>,
     ctx: egui::Context,
 ) {
     let mut sub = match bus.subscribe::<SpectrumRow>(TopicSelector::Exact(topic)) {
@@ -723,11 +743,14 @@ fn pump_spectrum(
         loop {
             match sub.recv().await {
                 Ok(v) => {
-                    let cell = match v.source {
-                        SignalSource::OwnTx => &tx,
-                        SignalSource::Received => &rx,
-                    };
-                    *cell.lock().unwrap() = Some(v);
+                    match v.source {
+                        // RX columns also feed the lane finder's recency window.
+                        SignalSource::Received => {
+                            hist.push(v.clone());
+                            *rx.lock().unwrap() = Some(v);
+                        }
+                        SignalSource::OwnTx => *tx.lock().unwrap() = Some(v),
+                    }
                     ctx.request_repaint();
                 }
                 // Lossy lag: keep reading. Closed/dropped: end the pump.

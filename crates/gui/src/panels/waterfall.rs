@@ -291,10 +291,23 @@ impl Waterfall {
             Pos2::new(row.right() - pad - track_w, cy - 11.0),
             Pos2::new(row.right() - pad, cy + 11.0),
         );
+        // Optional FIND CQ key, parked just left of SEND. Shown only with a live
+        // radio to read the band, a callsign set, and while idle — you choose a CQ
+        // lane when about to start one, not mid-contact. It jumps the TX offset to
+        // the clearest lane (`lane_finder`); the operator then presses SEND.
+        let show_find = ctx.bus.is_real() && call_set && !active_qso;
+        let find_track = show_find.then(|| {
+            let w = measure(painter, &tracked("FIND CQ"), heading_bold(9.0)) + 22.0 + 4.0;
+            Rect::from_min_max(
+                Pos2::new(track.left() - pad - w, cy - 11.0),
+                Pos2::new(track.left() - pad, cy + 11.0),
+            )
+        });
         let box_left = row.left() + pad + label_w + pad;
+        let box_right = find_track.map_or(track.left(), |t| t.left()) - pad;
         let box_rect = Rect::from_min_max(
             Pos2::new(box_left, cy - 11.0),
-            Pos2::new(track.left() - pad, cy + 11.0),
+            Pos2::new(box_right, cy + 11.0),
         );
 
         // Recessed message box (themed to the screen background) with a 1px edge;
@@ -376,6 +389,41 @@ impl Waterfall {
                     }
                 }
                 Activation::None => {}
+            }
+        }
+
+        // FIND CQ: jump the outgoing offset to the clearest CQ lane. Opinionated —
+        // it moves straight to the single best lane (no menu); the operator then
+        // presses SEND. Real-mode only (it reads the live RX spectrum + decodes).
+        if let Some(ftrack) = find_track {
+            lcd_panel(painter, ftrack, pal, 4);
+            let fcell = Rect::from_min_max(
+                Pos2::new(ftrack.left() + 2.0, ftrack.top() + 2.0),
+                Pos2::new(ftrack.right() - 2.0, ftrack.bottom() - 2.0),
+            );
+            let fbtn = key_cell_accent(
+                ctx.ui,
+                painter,
+                pal,
+                fcell,
+                "FIND CQ",
+                true,
+                pal.accent,
+                ctx.ui.id().with("ft8_find_cq_btn"),
+            )
+            .on_hover_text("Jump to the clearest CQ calling frequency");
+            if fbtn.clicked() {
+                let bw = signal_bandwidth_hz(ctx.bus.current_config().protocol);
+                let rows = ctx.bus.recent_spectrum();
+                let decodes = ctx.bus.recent_decodes();
+                if let Some(off) = crate::lane_finder::pick_cq_offset(&rows, &decodes, bw, now_ms) {
+                    // Bare CQ offset — clear any clicked-station selection.
+                    self.real_sel = RealSel {
+                        offset: off,
+                        target: None,
+                        resume: None,
+                    };
+                }
             }
         }
     }

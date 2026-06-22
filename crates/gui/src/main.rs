@@ -16,6 +16,7 @@ mod bus_view;
 mod chrome;
 mod flag;
 mod geo_data;
+mod lane_finder;
 mod logging;
 mod panel_data;
 mod panels;
