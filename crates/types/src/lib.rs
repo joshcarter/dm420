@@ -384,6 +384,11 @@ pub struct QsoState {
     pub partner: Option<Callsign>,
     /// What the engine will send next slot.
     pub next_tx: Option<OutgoingMessage>,
+    /// The engine's current TX audio offset while calling/in a contact (`None`
+    /// when idle). Lets the UI place the TX-lane indicator where the engine is
+    /// actually transmitting — notably after an auto-QSY hop the operator didn't
+    /// set by hand.
+    pub tx_offset: Option<OffsetHz>,
 }
 
 /// Phase of an in-progress contact.
@@ -942,6 +947,7 @@ mod tests {
             phase: QsoPhase::InExchange { step: 2 },
             partner: Some(Callsign("W4LL".into())),
             next_tx: Some(sample_outgoing()),
+            tx_offset: Some(OffsetHz(1500.0)),
         });
     }
 

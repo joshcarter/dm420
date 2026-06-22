@@ -121,6 +121,12 @@ pub struct Waterfall {
     /// only how Hz maps to screen rows. Not persisted across runs.
     view_lo_hz: f32,
     view_span_hz: f32,
+    /// AUTO QSY enabled (UI mirror of the engine's `auto_hop`; pushed via the bus).
+    /// After 3 unanswered CQs the engine hops to the lane finder's best offset.
+    auto_hop: bool,
+    /// The clock slot at which we last fed the engine a hop offset, so we recompute
+    /// the lane once per slot (after that slot's decodes settle), not every frame.
+    last_hop_feed_slot: Option<SlotId>,
 }
 
 impl Waterfall {
@@ -141,7 +147,19 @@ impl Waterfall {
             wide_decode: crate::settings::read_waterslide_wide(),
             view_lo_hz: 0.0,
             view_span_hz: WS_MAX_HZ,
+            auto_hop: false,
+            last_hop_feed_slot: None,
         }
+    }
+
+    /// The clear-lane finder's current best CQ offset for the live mode, or `None`
+    /// if there's nothing to score. Shared by the FIND CQ button and the auto-QSY
+    /// offset feed.
+    fn best_cq_offset(ctx: &PanelCtx, now_ms: i64) -> Option<f32> {
+        let bw = signal_bandwidth_hz(ctx.bus.current_config().protocol);
+        let rows = ctx.bus.recent_spectrum();
+        let decodes = ctx.bus.recent_decodes();
+        crate::lane_finder::pick_cq_offset(&rows, &decodes, bw, now_ms)
     }
 
     /// The bottom "Send" row: `Send:` label, recessed message box (mirrors the
@@ -260,15 +278,38 @@ impl Waterfall {
         let pal = ctx.pal;
         let painter = ctx.painter;
 
-        // Layout: [Send:] [────── box ──────] [ SEND ]
+        // Layout: [ AUTO QSY ] [ FIND CQ ] [Send:] [────── box ──────] [ SEND ]
         let pad = 8.0;
         let label = "Send:";
         let label_font = mono(11.0);
         let label_w = measure(painter, label, label_font.clone());
         let cy = row.center().y;
 
+        // Operating affordances at the far left, before the Send: label. AUTO QSY is
+        // a square checkbox (a mode toggle — matches the Contacts footer toggles);
+        // QSY CLEAR is a momentary lit key that jumps the TX offset to the clearest
+        // lane. Both show whenever there's a live radio + callsign (they read the live
+        // RX spectrum); QSY CLEAR is disabled (dim) during a contact — you pick a CQ
+        // lane when about to start one, not mid-QSO.
+        let show_keys = ctx.bus.is_real() && call_set;
+        let mut x = row.left() + pad;
+        let auto_box = show_keys.then(|| {
+            let sq =
+                Rect::from_center_size(Pos2::new(x + TOGGLE_SQ * 0.5, cy), egui::Vec2::splat(TOGGLE_SQ));
+            let label_w = measure(painter, &tracked("AUTO QSY"), heading(8.5));
+            x = sq.right() + 6.0 + label_w + pad;
+            sq
+        });
+        let find_track = show_keys.then(|| {
+            let w = measure(painter, &tracked("QSY CLEAR"), heading_bold(9.0)) + 22.0 + 4.0;
+            let t = Rect::from_min_max(Pos2::new(x, cy - 11.0), Pos2::new(x + w, cy + 11.0));
+            x = t.right() + pad;
+            t
+        });
+        let label_x = x;
+
         painter.text(
-            Pos2::new(row.left() + pad, cy),
+            Pos2::new(label_x, cy),
             Align2::LEFT_CENTER,
             label,
             label_font,
@@ -291,23 +332,10 @@ impl Waterfall {
             Pos2::new(row.right() - pad - track_w, cy - 11.0),
             Pos2::new(row.right() - pad, cy + 11.0),
         );
-        // Optional FIND CQ key, parked just left of SEND. Shown only with a live
-        // radio to read the band, a callsign set, and while idle — you choose a CQ
-        // lane when about to start one, not mid-contact. It jumps the TX offset to
-        // the clearest lane (`lane_finder`); the operator then presses SEND.
-        let show_find = ctx.bus.is_real() && call_set && !active_qso;
-        let find_track = show_find.then(|| {
-            let w = measure(painter, &tracked("FIND CQ"), heading_bold(9.0)) + 22.0 + 4.0;
-            Rect::from_min_max(
-                Pos2::new(track.left() - pad - w, cy - 11.0),
-                Pos2::new(track.left() - pad, cy + 11.0),
-            )
-        });
-        let box_left = row.left() + pad + label_w + pad;
-        let box_right = find_track.map_or(track.left(), |t| t.left()) - pad;
+        let box_left = label_x + label_w + pad;
         let box_rect = Rect::from_min_max(
             Pos2::new(box_left, cy - 11.0),
-            Pos2::new(box_right, cy + 11.0),
+            Pos2::new(track.left() - pad, cy + 11.0),
         );
 
         // Recessed message box (themed to the screen background) with a 1px edge;
@@ -392,10 +420,12 @@ impl Waterfall {
             }
         }
 
-        // FIND CQ: jump the outgoing offset to the clearest CQ lane. Opinionated —
+        // QSY CLEAR: jump the outgoing offset to the clearest CQ lane. Opinionated —
         // it moves straight to the single best lane (no menu); the operator then
-        // presses SEND. Real-mode only (it reads the live RX spectrum + decodes).
+        // presses SEND. Lit and clickable while idle; drawn dim and inert during a
+        // contact (you pick a lane before a CQ, not mid-QSO).
         if let Some(ftrack) = find_track {
+            let enabled = !active_qso;
             lcd_panel(painter, ftrack, pal, 4);
             let fcell = Rect::from_min_max(
                 Pos2::new(ftrack.left() + 2.0, ftrack.top() + 2.0),
@@ -406,23 +436,67 @@ impl Waterfall {
                 painter,
                 pal,
                 fcell,
-                "FIND CQ",
-                true,
+                "QSY CLEAR",
+                enabled,
                 pal.accent,
-                ctx.ui.id().with("ft8_find_cq_btn"),
-            )
-            .on_hover_text("Jump to the clearest CQ calling frequency");
-            if fbtn.clicked() {
-                let bw = signal_bandwidth_hz(ctx.bus.current_config().protocol);
-                let rows = ctx.bus.recent_spectrum();
-                let decodes = ctx.bus.recent_decodes();
-                if let Some(off) = crate::lane_finder::pick_cq_offset(&rows, &decodes, bw, now_ms) {
-                    // Bare CQ offset — clear any clicked-station selection.
-                    self.real_sel = RealSel {
-                        offset: off,
-                        target: None,
-                        resume: None,
-                    };
+                ctx.ui.id().with("ft8_qsy_clear_btn"),
+            );
+            if enabled
+                && fbtn.clicked()
+                && let Some(off) = Self::best_cq_offset(ctx, now_ms)
+            {
+                // Bare CQ offset — clear any clicked-station selection.
+                self.real_sel = RealSel {
+                    offset: off,
+                    target: None,
+                    resume: None,
+                };
+            }
+        }
+
+        // AUTO QSY: a square checkbox (solid = on, hollow = off), matching the
+        // Contacts footer toggles. When on, the engine moves to a clearer lane after
+        // 3 unanswered CQs — it owns the timing so the hop lands right before the next
+        // CQ, and a reply still cancels it. We mirror the flag here and push it over
+        // the bus to the engine.
+        if let Some(sq) = auto_box {
+            let resp = ctx.ui.interact(
+                sq.expand(2.0),
+                ctx.ui.id().with("ft8_auto_qsy_toggle"),
+                egui::Sense::click(),
+            );
+            if resp.clicked() {
+                self.auto_hop = !self.auto_hop;
+                ctx.bus.set_auto_hop(self.auto_hop);
+            }
+            if self.auto_hop {
+                painter.rect_filled(sq, egui::CornerRadius::ZERO, pal.accent);
+            } else {
+                painter.rect_stroke(
+                    sq,
+                    egui::CornerRadius::ZERO,
+                    egui::Stroke::new(TOGGLE_STROKE, pal.sub),
+                    egui::StrokeKind::Inside,
+                );
+            }
+            painter.text(
+                Pos2::new(sq.right() + 6.0, cy),
+                Align2::LEFT_CENTER,
+                tracked("AUTO QSY"),
+                heading(8.5),
+                if self.auto_hop { pal.legend } else { pal.sub },
+            );
+        }
+
+        // While auto-QSY is on, keep the engine's hop target fresh: feed it the
+        // current best CQ lane once per clock slot (after that slot's decodes
+        // settle), not every frame.
+        if self.auto_hop {
+            let slot = ctx.bus.clock().map(|c| c.slot);
+            if slot != self.last_hop_feed_slot {
+                self.last_hop_feed_slot = slot;
+                if let Some(off) = Self::best_cq_offset(ctx, now_ms) {
+                    ctx.bus.set_cq_hop_offset(off);
                 }
             }
         }
@@ -757,6 +831,14 @@ impl Panel for Waterfall {
                         .and_then(band_for_hz)
                         .map(|b| ctx.bus.worked_calls_on_band(b))
                         .unwrap_or_default();
+                    // The TX-lane indicator follows the engine's actual offset while
+                    // it's calling / in a contact (so it tracks an auto-QSY hop), and
+                    // the local click selection only when idle.
+                    let tx_off = ctx
+                        .bus
+                        .qso_state()
+                        .and_then(|q| q.tx_offset)
+                        .map_or(self.real_sel.offset, |o| o.0);
                     if let Some(sel) = draw_waterslide(
                         painter,
                         body,
@@ -764,7 +846,7 @@ impl Panel for Waterfall {
                         &ctx.bus.recent_decodes(),
                         now_ms,
                         click,
-                        self.real_sel.offset,
+                        tx_off,
                         sel_call.as_deref(),
                         (!ctx.call.trim().is_empty()).then(|| ctx.call.trim()),
                         &worked,

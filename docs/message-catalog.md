@@ -185,6 +185,7 @@ pub struct QsoState {
     pub phase: QsoPhase,
     pub partner: Option<Callsign>,
     pub next_tx: Option<OutgoingMessage>, // what the engine will send next slot
+    pub tx_offset: Option<OffsetHz>,      // engine's current TX offset (calling/active); None when idle
 }
 pub enum QsoPhase { Idle, Calling, InExchange { step: u8 }, Complete, TimedOut }
 

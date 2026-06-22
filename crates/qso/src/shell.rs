@@ -50,12 +50,33 @@ impl BusMessage for QsoAck {
 #[derive(Clone)]
 pub struct QsoControl {
     station: Arc<Mutex<StationConfig>>,
+    hop: Arc<Mutex<HopConfig>>,
+}
+
+/// Auto-QSY config the UI pushes to the running engine (mirrors the station
+/// handle, since nobody publishes operating state back the other way yet).
+#[derive(Clone, Copy, Default)]
+struct HopConfig {
+    /// AUTO QSY enabled.
+    auto: bool,
+    /// The lane finder's current best CQ offset — the hop target.
+    next_offset: Option<OffsetHz>,
 }
 
 impl QsoControl {
     /// Update the station identity / contest the engine builds messages from.
     pub fn set_station(&self, station: StationConfig) {
         *self.station.lock().unwrap() = station;
+    }
+
+    /// Enable/disable auto-QSY after unanswered CQs (the UI's AUTO QSY toggle).
+    pub fn set_auto_hop(&self, on: bool) {
+        self.hop.lock().unwrap().auto = on;
+    }
+
+    /// Push the lane finder's current best CQ offset (the auto-QSY hop target).
+    pub fn set_cq_hop_offset(&self, offset: OffsetHz) {
+        self.hop.lock().unwrap().next_offset = Some(offset);
     }
 }
 
@@ -68,11 +89,13 @@ pub fn spawn(
     allow_transmit: bool,
 ) -> QsoControl {
     let shared = Arc::new(Mutex::new(station.clone()));
+    let hop = Arc::new(Mutex::new(HopConfig::default()));
     let control = QsoControl {
         station: shared.clone(),
+        hop: hop.clone(),
     };
     tracing::info!(radio = ?radio, allow_transmit, "qso: engine spawned");
-    tokio::spawn(run(bus.clone(), radio, station, shared, allow_transmit));
+    tokio::spawn(run(bus.clone(), radio, station, shared, hop, allow_transmit));
     control
 }
 
@@ -81,6 +104,7 @@ async fn run(
     radio: RadioId,
     station: StationConfig,
     shared: Arc<Mutex<StationConfig>>,
+    hop: Arc<Mutex<HopConfig>>,
     allow_transmit: bool,
 ) {
     let mut engine = Engine::new(radio.clone(), station, OffsetHz(1500.0));
@@ -137,6 +161,12 @@ async fn run(
     loop {
         // Pick up any live station-config change before handling the next event.
         engine.set_station(shared.lock().unwrap().clone());
+        // …and live auto-QSY config (UI toggle + lane-finder offset).
+        {
+            let h = *hop.lock().unwrap();
+            engine.set_auto_hop(h.auto);
+            engine.set_next_cq_offset(h.next_offset);
+        }
 
         let step = tokio::select! {
             Some((cmd, responder)) = cmds.next() => {

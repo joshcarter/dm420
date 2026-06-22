@@ -98,10 +98,12 @@ enum State {
         target: DecodeRef,
     },
     /// Calling CQ; no committed partner yet. `tx_parity` is adopted on the first
-    /// slot tick so we transmit every other slot.
+    /// slot tick so we transmit every other slot. `cq_count` is the number of CQs
+    /// sent at the current `offset` with no reply — drives auto-QSY.
     Calling {
         offset: OffsetHz,
         tx_parity: Option<u8>,
+        cq_count: u8,
     },
     /// A committed contact in progress (boxed — much larger than the other
     /// variants).
@@ -136,6 +138,10 @@ struct Active {
     rcvd_fd: Option<(String, Section)>,
 }
 
+/// Unanswered CQs at one offset before auto-QSY moves us to a clearer one. After
+/// this many CQs with no reply, the next CQ goes out on `Engine::next_cq_offset`.
+const CQ_HOP_AFTER: u8 = 3;
+
 /// The QSO engine for one radio.
 pub struct Engine {
     radio: RadioId,
@@ -143,6 +149,11 @@ pub struct Engine {
     /// Latest outgoing offset from the selection (where a CQ would transmit).
     outgoing: OffsetHz,
     state: State,
+    /// Auto-QSY: after `CQ_HOP_AFTER` unanswered CQs, move to `next_cq_offset`
+    /// before the next CQ. Toggled from the UI via `QsoControl`.
+    auto_hop: bool,
+    /// The clearest CQ offset the UI's lane finder last suggested — the hop target.
+    next_cq_offset: Option<OffsetHz>,
 }
 
 impl Engine {
@@ -154,12 +165,24 @@ impl Engine {
             me,
             outgoing,
             state: State::Idle,
+            auto_hop: false,
+            next_cq_offset: None,
         }
     }
 
     /// Replace the station identity / contest profile (live reconfig from the UI).
     pub fn set_station(&mut self, me: StationConfig) {
         self.me = me;
+    }
+
+    /// Enable/disable auto-QSY after unanswered CQs (the UI's AUTO QSY toggle).
+    pub fn set_auto_hop(&mut self, on: bool) {
+        self.auto_hop = on;
+    }
+
+    /// Update the hop target — the lane finder's current best CQ offset.
+    pub fn set_next_cq_offset(&mut self, offset: Option<OffsetHz>) {
+        self.next_cq_offset = offset;
     }
 
     /// The current published state, without stepping (for an initial snapshot).
@@ -200,6 +223,7 @@ impl Engine {
                 self.state = State::Calling {
                     offset: self.outgoing,
                     tx_parity: None,
+                    cq_count: 0,
                 };
                 None
             }
@@ -243,7 +267,7 @@ impl Engine {
         }
         let dispatch = match &self.state {
             State::Armed { .. } => Dispatch::Armed,
-            State::Calling { offset, tx_parity } => Dispatch::Calling(*offset, *tx_parity),
+            State::Calling { offset, tx_parity, .. } => Dispatch::Calling(*offset, *tx_parity),
             State::Active(_) => Dispatch::Active,
             State::Idle => Dispatch::Idle,
         };
@@ -635,11 +659,13 @@ impl Engine {
             self.state = State::Calling {
                 offset: a.offset,
                 tx_parity: Some(a.tx_parity),
+                cq_count: 0,
             };
         } else {
             self.state = State::Calling {
                 offset: self.outgoing,
                 tx_parity: None,
+                cq_count: 0,
             };
         }
     }
@@ -657,20 +683,46 @@ impl Engine {
     }
 
     /// CQ slot: adopt our parity on the first tick, then call CQ every TX slot.
+    /// With auto-QSY on, move to the best lane before the 4th unanswered CQ — being
+    /// still in `Calling` here *is* "no response," since a reply would have already
+    /// committed us to `Active` via `on_decode`, so the existing sequencing gives us
+    /// the "wait for the response decode" behavior for free.
     fn tick_calling(
         &mut self,
         slot: SlotId,
         parity: u8,
     ) -> (Option<TxIntent>, Option<CompletedQso>) {
+        let auto_hop = self.auto_hop;
+        let next = self.next_cq_offset;
+        let mut hopped_to = None;
         let offset = match &mut self.state {
-            State::Calling { offset, tx_parity } => {
+            State::Calling {
+                offset,
+                tx_parity,
+                cq_count,
+            } => {
                 if *tx_parity.get_or_insert(parity) != parity {
                     return (None, None);
                 }
+                // After CQ_HOP_AFTER unanswered CQs, QSY to the suggested lane and
+                // start the count over there. If no lane was suggested, stay put.
+                if auto_hop && *cq_count >= CQ_HOP_AFTER {
+                    if let Some(new) = next {
+                        *offset = new;
+                        hopped_to = Some(new);
+                    }
+                    *cq_count = 0;
+                }
+                *cq_count += 1;
                 *offset
             }
             _ => return (None, None),
         };
+        if let Some(new) = hopped_to {
+            // Keep the click/preview offset in step with where we now transmit.
+            self.outgoing = new;
+            tracing::info!(offset = ?new, "qso engine: auto-QSY to clearer CQ lane");
+        }
         let message = message::cq(&self.me);
         (
             Some(TxIntent {
@@ -791,11 +843,19 @@ impl Engine {
                 a.next.clone(),
             ),
         };
+        // The offset the engine is actually transmitting on (calling or active), so
+        // the UI's TX-lane indicator tracks an auto-QSY hop it didn't set by hand.
+        let tx_offset = match &self.state {
+            State::Calling { offset, .. } => Some(*offset),
+            State::Active(a) => Some(a.offset),
+            _ => None,
+        };
         QsoState {
             radio: self.radio.clone(),
             phase,
             partner,
             next_tx,
+            tx_offset,
         }
     }
 }
@@ -973,6 +1033,73 @@ mod tests {
             -8,
         )));
         assert_eq!(e.state().phase, QsoPhase::Calling);
+    }
+
+    /// The TX offset of the CQ the engine would send on a tick in `slot`.
+    fn cq_offset(e: &mut Engine, slot: u64) -> OffsetHz {
+        e.step(Event::Tick { slot: SlotId(slot) })
+            .tx
+            .expect("a CQ on our parity slot")
+            .offset
+    }
+
+    #[test]
+    fn auto_qsy_hops_after_three_unanswered_cqs() {
+        let mut e = engine(ContestProfile::Standard);
+        e.set_auto_hop(true);
+        e.set_next_cq_offset(Some(OffsetHz(900.0)));
+        e.step(Event::Command(QsoCommand::CallCq));
+        // First three CQs stay on the original 1500 Hz (engine's `outgoing`).
+        assert_eq!(cq_offset(&mut e, 0), OffsetHz(1500.0));
+        assert_eq!(cq_offset(&mut e, 2), OffsetHz(1500.0));
+        assert_eq!(cq_offset(&mut e, 4), OffsetHz(1500.0));
+        // No answer → the fourth QSYs to the suggested lane, and counting restarts.
+        assert_eq!(cq_offset(&mut e, 6), OffsetHz(900.0));
+        assert_eq!(cq_offset(&mut e, 8), OffsetHz(900.0));
+    }
+
+    #[test]
+    fn no_auto_qsy_when_disabled() {
+        let mut e = engine(ContestProfile::Standard);
+        // A hop target is offered, but the toggle is off, so it's ignored.
+        e.set_next_cq_offset(Some(OffsetHz(900.0)));
+        e.step(Event::Command(QsoCommand::CallCq));
+        for slot in [0, 2, 4, 6, 8] {
+            assert_eq!(cq_offset(&mut e, slot), OffsetHz(1500.0));
+        }
+    }
+
+    #[test]
+    fn no_auto_qsy_without_a_suggested_lane() {
+        let mut e = engine(ContestProfile::Standard);
+        e.set_auto_hop(true); // on, but no lane fed → stay put rather than hop nowhere
+        e.step(Event::Command(QsoCommand::CallCq));
+        for slot in [0, 2, 4, 6, 8] {
+            assert_eq!(cq_offset(&mut e, slot), OffsetHz(1500.0));
+        }
+    }
+
+    #[test]
+    fn a_reply_cancels_the_pending_qsy() {
+        let mut e = engine(ContestProfile::Standard);
+        e.set_auto_hop(true);
+        e.set_next_cq_offset(Some(OffsetHz(900.0)));
+        e.step(Event::Command(QsoCommand::CallCq));
+        // Three unanswered CQs (count now at the hop threshold).
+        for slot in [0, 2, 4] {
+            assert_eq!(cq_offset(&mut e, slot), OffsetHz(1500.0));
+        }
+        // A caller answers our CQ before the would-be fourth → commit, don't QSY.
+        let s = e.step(Event::Decode(decode(
+            exch(ME, HIM, ExchangePayload::Grid(GridSquare("FN42".into()))),
+            5,
+            -8,
+        )));
+        assert!(matches!(s.state.phase, QsoPhase::InExchange { .. }));
+        // The next TX is the contact reply, not a CQ on the hop offset.
+        let tx = e.step(Event::Tick { slot: SlotId(6) }).tx.unwrap();
+        assert!(tx.message.text.contains(HIM));
+        assert_ne!(tx.offset, OffsetHz(900.0));
     }
 
     #[test]

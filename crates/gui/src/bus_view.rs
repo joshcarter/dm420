@@ -340,6 +340,18 @@ impl BusView {
         self.spectrum_hist.snapshot()
     }
 
+    /// Enable/disable auto-QSY (the AUTO QSY toggle): after 3 unanswered CQs the
+    /// engine hops to the lane finder's best offset.
+    pub fn set_auto_hop(&self, on: bool) {
+        self.qso_control.set_auto_hop(on);
+    }
+
+    /// Feed the QSO engine the lane finder's current best CQ offset — the auto-QSY
+    /// hop target.
+    pub fn set_cq_hop_offset(&self, offset_hz: f32) {
+        self.qso_control.set_cq_hop_offset(OffsetHz(offset_hz));
+    }
+
     /// The current scanner status, if seen yet. (Consumer lands next pass.)
     #[allow(dead_code)]
     pub fn scanner(&self) -> Option<ScannerState> {
