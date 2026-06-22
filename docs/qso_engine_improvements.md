@@ -99,12 +99,20 @@ single most common explicit ending we hear (27.9 %, vs 17.8 % RR73).** This is n
 edge case — it is the modal case. The CQ side has the mirror gap: a partner who closes
 with `RRR` instead of `73` is not recognized as final (`is_final` excludes `RRR`).
 
-### A3. Mode-mismatched openers are ignored
+### A3. (revised) Opener-mode tolerance — *intentionally narrow*
 
-The opener arms are guarded by `self.me.is_field_day()`. At Field Day, plenty of casual
-stations answer our `CQ FD` with a plain **grid** (they're not in FD mode); we ignore
-them. Symmetrically, in Standard mode an FD-style exchange answer is ignored. We should
-accept either opener regardless of our own contest posture and reply in kind.
+The opener arms are guarded by `self.me.is_field_day()`. **In Field Day mode that guard is
+correct and must stay:** a station answering our `CQ FD` with a plain grid or bare report
+gives us no class+section, so the QSO scores **zero** ARRL FD points — and replying to a
+non-FD station with our FD exchange just manufactures an exchange mismatch that never
+completes (a *new* B1 stall). Ignoring non-FD callers in FD mode is the rate-protecting
+filter we want; it matches roadmap Now-#1 ("filter to Field Day participants, class A–F
+only"). So this is a feature, not the bug an earlier draft called it.
+
+The only real gap is the **Standard-mode** mirror: when we are *not* running FD, an FD
+station that answers our ordinary `CQ` with its exchange is a perfectly good (ordinary)
+QSO we currently drop. That's minor and carries its own mild mismatch risk, so it lives in
+§6 as a suggestion, not a core fix.
 
 ### A4. (minor) Parser-level gaps
 
@@ -152,7 +160,7 @@ QSO is *already logged*, its cap should be tighter (1–2 sends, then resume CQ)
 
 ## 4. Proposal
 
-Five changes, priority-ordered. P1–P3 are the load-bearing ones; all are small and
+Four changes, priority-ordered. P1–P3 are the load-bearing ones; all are small and
 local. Each names its site and its regression test (test style mirrors the existing
 `mod tests` in `engine.rs`).
 
@@ -252,22 +260,7 @@ call CQ → feed `exch(ME, HIM, Report(0))` at snr −8 → assert `InExchange` 
 manual `resume_from` path already handles it, so the live path is inconsistent without
 it.)*
 
-### P4 — Mode-tolerant openers  ⟶ fixes A3
-
-Drop the hard `is_field_day()` gate on *which opener we accept*; accept both a `Grid` and
-an `FieldDay{rogered:false}` answer to our CQ, and choose the reply by the **opener we
-received**, not by our own posture:
-
-- received `Grid` → reply with a report (or our FD exchange if we're running FD and they'd
-  understand it — simplest: reply report);
-- received `FieldDay` → reply with `fd_roger_exchange`.
-
-Keep it minimal: the goal is "don't ignore a station who's clearly answering us." A short
-truth-table in `commit_from_cq` covers it.
-
-**Test:** `fd_cq_answered_with_plain_grid_commits` and the standard-mode mirror.
-
-### P5 — One cheap parser arm: roger + grid  ⟶ fixes A4 (the `R GRID` case)
+### P4 — One cheap parser arm: roger + grid  ⟶ fixes A4 (the `R GRID` case)
 
 In `parse_directed` (`crates/core/src/parse.rs:76`), add before the FD arms:
 
@@ -287,9 +280,9 @@ sequencing.
 
 ## 5. Why this is the right altitude
 
-- **It's a grammar/idiom fix, not a rewrite.** P1–P4 touch three functions and add one
-  field. They make the engine *recognize messages it already parses* and *stop when the
-  other guy stops* — exactly the two complaints.
+- **It's a grammar/idiom fix, not a rewrite.** P1–P3 touch three functions of `engine.rs`
+  and add one field; P4 is a two-line parser arm. They make the engine *recognize messages
+  it already parses* and *stop when the other guy stops* — exactly the two complaints.
 - **It's data-driven.** Every change maps to something we actually heard on the air
   (Appendix B), not a hypothetical.
 - **It moves the `Complete`/`TimedOut` states from dead code to load-bearing**, which the
@@ -303,6 +296,15 @@ sequencing.
 These improve the engine but are **not** required to fix the stalls. Listed so they're
 captured, not so they bloat the core work.
 
+- **Field Day is deliberately exclusive (do not relax).** In FD mode we *intentionally*
+  ignore openers that aren't a valid class+section exchange (see A3) — auto-working non-FD
+  callers dilutes points and risks mismatch stalls. Optional nicety: surface an ignored
+  non-FD caller as a muted "heard · non-FD" tag so the operator can choose to work one by
+  hand during a lull, but never automatically.
+- **Standard-mode cross-mode answers.** When *not* running FD, accept an FD-exchange answer
+  to our ordinary `CQ` as a normal QSO instead of dropping it (the only surviving half of
+  the original "mode-tolerant openers" idea). Low value, and needs care so the cross-mode
+  exchange still terminates.
 - **Answer-immediately toggle.** Today `Armed` only commits on the target's *next* CQ
   (`commit_from_armed`); if they answer someone else or never re-CQ, we never fire. Offer a
   mode that answers the clicked CQ in the next slot (WSJT-X "Call 1st"). Already roadmapped.
@@ -338,8 +340,7 @@ captured, not so they bloat the core work.
 | `cq_side_completes_on_rrr` | P2 |
 | `times_out_after_n_unanswered_overs` | P1 / B1 |
 | `cq_side_releases_rr73_after_log` | P1 / B2 |
-| `fd_cq_answered_with_plain_grid_commits` (+ standard mirror) | P4 / A3 |
-| `parse_roger_grid` (in `core::parse` tests) | P5 / A4 |
+| `parse_roger_grid` (in `core::parse` tests) | P4 / A4 |
 
 The existing `standard_answering_full_flow` / `standard_calling_cq_full_flow` must keep
 passing unchanged — they pin the happy path these changes must not regress.
@@ -420,13 +421,13 @@ encounters, ranked by frequency:
 ```
     103  <HASH> CALL           e.g. '<...> W5C/D'       nonstandard station answering  → §6
      49  <empty>               e.g. ''                  empty/garble decode            → ignore
-     20  CALL CALL R GRID      e.g. '0N2JZB 5B6EZM/R R CN00'  roger+grid (rover/VHF)   → P5
+     20  CALL CALL R GRID      e.g. '0N2JZB 5B6EZM/R R CN00'  roger+grid (rover/VHF)   → P4
       ~25 (long tail)          telemetry hex, split rovers, corrupt decodes           → ignore
 ```
 
 **Takeaway:** the parser is not the problem — 1.03 % unparsed, and most of that is
 un-actionable garble/telemetry. The recognizable misses are `<HASH> CALL` (deferred, §6)
-and `CALL CALL R GRID` (cheap, P5). The real wins are in the **sequencer** (§4 P1–P4).
+and `CALL CALL R GRID` (cheap, P4). The real wins are in the **sequencer** (§4 P1–P3).
 
 ### B.4 How real QSOs end (3,073 reconstructed QSOs with ≥2 messages)
 
