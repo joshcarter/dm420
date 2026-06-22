@@ -258,12 +258,17 @@ async fn run_decodes(bus: BusHandle) {
 
 // --------------------------------------------------------------------- scanner
 
-/// (band, stations heard, unworked) — the band-scan panel's two columns.
-const BAND_SEED: &[(Band, u32, u32)] = &[
-    (Band::B40m, 23, 7),
-    (Band::B20m, 41, 12),
-    (Band::B15m, 18, 9),
-    (Band::B10m, 6, 4),
+/// (band, mode, heard, cq, unworked) — seeds the band-scan panel in mock mode
+/// (`cq` ⊆ `heard`).
+const BAND_SEED: &[(Band, OverAirMode, u32, u32, u32)] = &[
+    (Band::B40m, OverAirMode::Ft8, 23, 6, 7),
+    (Band::B40m, OverAirMode::Ft4, 9, 3, 5),
+    (Band::B20m, OverAirMode::Ft8, 41, 12, 12),
+    (Band::B20m, OverAirMode::Ft4, 15, 4, 9),
+    (Band::B15m, OverAirMode::Ft8, 18, 5, 9),
+    (Band::B15m, OverAirMode::Ft4, 6, 2, 4),
+    (Band::B10m, OverAirMode::Ft8, 6, 2, 4),
+    (Band::B10m, OverAirMode::Ft4, 2, 1, 2),
 ];
 
 /// Publish a steady `Idle` scanner state, plus one [`BandActivity`] per band on a
@@ -277,26 +282,30 @@ async fn run_scanner(bus: BusHandle) {
         ScannerState {
             status: ScanStatus::Idle,
             current: None,
+            current_mode: None,
             last_scan: Some(Timestamp(now_ms())),
         },
     );
 
     let mut tick = tokio::time::interval(Duration::from_millis(700));
-    let mut i = 0usize;
+    let mut i = 0u32;
     loop {
         tick.tick().await;
-        let (band, seen, unworked) = BAND_SEED[i % BAND_SEED.len()];
         // A little jitter so the counts visibly tick — proof it's live, not baked.
-        let wobble = (i / BAND_SEED.len()) as u32 % 3;
+        let wobble = i % 3;
         i += 1;
-        let _ = bus.publish(
-            &Topic::ScannerCandidates,
-            BandActivity {
+        // Publish the whole snapshot (one BandActivity per band/mode) as one value.
+        let snapshot: Vec<BandActivity> = BAND_SEED
+            .iter()
+            .map(|&(band, mode, heard, cq, unworked)| BandActivity {
                 band,
-                stations_seen: seen + wobble,
+                mode,
+                heard: heard + wobble,
+                cq,
                 unworked,
                 t: Timestamp(now_ms()),
-            },
-        );
+            })
+            .collect();
+        let _ = bus.publish(&Topic::ScannerCandidates, snapshot);
     }
 }

@@ -256,15 +256,17 @@ pub enum WorkedStatus { New, WorkedByMe, WorkedByNetwork(StationId) }
 ```rust
 // scanner/command (Command) ; scanner/state (State) ; scanner/candidates (State, replace)
 pub enum ScannerCommand {
-    StartSurvey { bands: Vec<Band>, dwell_slots: u8 }, // dwell_slots >= 2 (even/odd slots)
+    StartSurvey { stops: Vec<(Band, OverAirMode)>, dwell_slots: u8 }, // each toggle = one stop; dwell >= 2 (parity)
+    SetStops { stops: Vec<(Band, OverAirMode)> },                     // change stops live mid-scan (no count reset)
     Cancel,
 }
 pub enum ScannerAck { Ok } // receipt for a ScannerCommand (scanner/state carries the result)
-pub struct ScannerState { pub status: ScanStatus, pub current: Option<Band>, pub last_scan: Option<Timestamp> }
+pub struct ScannerState { pub status: ScanStatus, pub current: Option<Band>, pub current_mode: Option<OverAirMode>, pub last_scan: Option<Timestamp> }
 pub enum ScanStatus { Idle, Scanning }
 
-// Per-band counts feed the band-scan panel and the cross-station band_activity gossip.
-pub struct BandActivity { pub band: Band, pub stations_seen: u32, pub unworked: u32, pub t: Timestamp }
+// scanner/candidates carries the full snapshot `Vec<BandActivity>` (one per scanned
+// band/mode) as a single State value; cumulative per (band, mode); cq ⊆ heard.
+pub struct BandActivity { pub band: Band, pub mode: OverAirMode, pub heard: u32, pub cq: u32, pub unworked: u32, pub t: Timestamp }
 ```
 
 ## 9. Cross-station gossip (Josh-owned)

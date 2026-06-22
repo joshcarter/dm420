@@ -1,23 +1,24 @@
 //! The band scanner — the pure sweep engine.
 //!
 //! A *strategy for single-receiver hardware*: on demand it time-slices the
-//! receiver across selected bands and modes, dwelling a couple of slots on each and
-//! reporting per-band heard/unworked counts. This crate is the **pure state
-//! machine** only — no clock, no bus, no radio. The `core::scanner` shell drives
-//! it: it feeds slot boundaries ([`Scanner::on_slot`]), decodes
+//! receiver across selected band/mode stops, dwelling a couple of slots on each and
+//! reporting per-(band, mode) heard / calling-CQ / unworked counts. This crate is
+//! the **pure state machine** only — no clock, no bus, no radio. The `core::scan`
+//! shell drives it: it feeds slot boundaries ([`Scanner::on_slot`]), decodes
 //! ([`Scanner::on_decode`]) and logged contacts ([`Scanner::on_logged`]), and acts
 //! on the [`Step`] / [`Scanner::current`] / [`Scanner::tallies`] it reports
 //! (retuning the rig, switching mode, publishing state). Keeping the logic pure
 //! makes the sweep testable without hardware (mirrors `qso::engine`).
 //!
 //! Behaviour (per `docs/band_scanner.md`, with the agreed tweaks):
-//! - Dwell **≥2 slots** per stop so both even/odd TX parities are covered — a
-//!   one-slot dwell would miss every station whose transmit turn is the other slot.
-//! - Scan **both FT8 and FT4**. The plan is **mode-major** (all bands in FT8, then
-//!   all bands in FT4) because a band change is a cheap retune but a mode change
-//!   restarts audio capture — so we change mode only twice per full cycle.
-//! - **Loop until cancelled**, accumulating heard stations across passes so later
-//!   passes pick up traffic an earlier one missed.
+//! - Dwell **≥2 slots** per stop so both even/odd TX parities are covered.
+//! - Scan the selected **(band, mode) stops** (the panel's per-band FT8/FT4
+//!   toggles). The plan is **mode-major** (all FT8 stops, then FT4) because a mode
+//!   change restarts audio capture while a band change is a cheap retune.
+//! - **Loop until cancelled**, accumulating distinct callsigns across passes so
+//!   later passes pick up traffic an earlier one missed.
+//! - Counts are split into **heard** (every station decoded transmitting) and **cq**
+//!   (those calling CQ, a subset), each per band *and* mode, plus **unworked**.
 //!
 //! Specs: `docs/band_scanner.md`, `docs/message-catalog.md` §8. Owner: Josh (N0JDC).
 
@@ -26,6 +27,9 @@
 use std::collections::{HashMap, HashSet};
 
 use types::{Band, Callsign, OverAirMode, ParsedMessage, calling_freq};
+
+/// Mode-major plan order: FT8 stops before FT4 (a mode change restarts capture).
+const MODE_ORDER: [OverAirMode; 2] = [OverAirMode::Ft8, OverAirMode::Ft4];
 
 /// Where the sweep is in its life cycle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,12 +47,16 @@ pub enum Step {
     Hop { mode: OverAirMode, band: Band },
 }
 
-/// Per-band tally for the panel: distinct stations heard, and how many of those are
-/// unworked (heard on this band but not in the logbook for this band).
+/// Per-(band, mode) tally for the panel. `cq` ⊆ `heard`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BandTally {
     pub band: Band,
-    pub seen: u32,
+    pub mode: OverAirMode,
+    /// Distinct stations heard transmitting.
+    pub heard: u32,
+    /// Distinct stations heard calling CQ (subset of `heard`).
+    pub cq: u32,
+    /// Distinct heard stations not logged on this band + mode.
     pub unworked: u32,
 }
 
@@ -56,20 +64,20 @@ pub struct BandTally {
 /// drives it.
 pub struct Scanner {
     phase: Phase,
-    /// Bands in display order (e.g. 40, 20, 15, 10) — also the tally order.
+    /// Distinct bands in display order (first-seen across the stops).
     bands: Vec<Band>,
-    /// The sweep order, **mode-major** (FT8 across all bands, then FT4) so a full
-    /// cycle changes mode only twice — mode changes restart capture, retunes don't.
+    /// The sweep order: `(mode, band)` stops, **mode-major**.
     plan: Vec<(OverAirMode, Band)>,
     /// Slots to dwell per stop (clamped to ≥2 for even/odd parity coverage).
     dwell_slots: u8,
     cursor: usize,
     slots_here: u8,
-    /// Distinct stations heard per band, **accumulated across the whole scan** so
-    /// looping picks up traffic an earlier pass missed.
-    heard: HashMap<Band, HashSet<Callsign>>,
-    /// `(call, band)` pairs already in the logbook — fed from `logbook/entries`.
-    worked: HashSet<(Callsign, Band)>,
+    /// Distinct stations heard per `(band, mode)`, accumulated across the scan.
+    heard: HashMap<(Band, OverAirMode), HashSet<Callsign>>,
+    /// Distinct CQ callers per `(band, mode)` (a subset of `heard`).
+    cq: HashMap<(Band, OverAirMode), HashSet<Callsign>>,
+    /// `(call, band, mode)` already in the logbook — fed from `logbook/entries`.
+    worked: HashSet<(Callsign, Band, OverAirMode)>,
 }
 
 impl Scanner {
@@ -82,6 +90,7 @@ impl Scanner {
             cursor: 0,
             slots_here: 0,
             heard: HashMap::new(),
+            cq: HashMap::new(),
             worked: HashSet::new(),
         }
     }
@@ -98,27 +107,33 @@ impl Scanner {
         }
     }
 
-    /// Begin a survey of `bands` in each of `modes`, dwelling `dwell_slots` slots
-    /// (clamped to ≥2 for parity) per stop. Builds the mode-major plan, skipping any
-    /// `(band, mode)` with no established calling frequency (e.g. FT4 on 160 m).
-    /// Resets the heard tallies (a fresh scan) but keeps the worked-set. Returns the
-    /// first stop to tune, or `None` if no stop is valid.
-    pub fn start(
-        &mut self,
-        bands: &[Band],
-        modes: &[OverAirMode],
-        dwell_slots: u8,
-    ) -> Option<(OverAirMode, Band)> {
-        self.bands = bands.to_vec();
-        self.plan = modes
-            .iter()
-            .flat_map(|&m| bands.iter().map(move |&b| (m, b)))
-            .filter(|&(m, b)| calling_freq(b, m).is_some())
-            .collect();
+    /// Begin a survey of the given `(band, mode)` `stops`, dwelling `dwell_slots`
+    /// slots (clamped to ≥2 for parity) per stop. Reorders the stops **mode-major**
+    /// (all FT8, then FT4), drops any with no calling frequency (e.g. FT4 on 160 m),
+    /// and dedups. Resets the heard/cq tallies (a fresh scan) but keeps the
+    /// worked-set. Returns the first stop to tune, or `None` if no stop is valid.
+    pub fn start(&mut self, stops: &[(Band, OverAirMode)], dwell_slots: u8) -> Option<(OverAirMode, Band)> {
+        let mut bands = Vec::new();
+        for &(b, _) in stops {
+            if !bands.contains(&b) {
+                bands.push(b);
+            }
+        }
+        self.bands = bands;
+        let mut plan = Vec::new();
+        for &m in &MODE_ORDER {
+            for &(b, sm) in stops {
+                if sm == m && calling_freq(b, m).is_some() && !plan.contains(&(m, b)) {
+                    plan.push((m, b));
+                }
+            }
+        }
+        self.plan = plan;
         self.dwell_slots = dwell_slots.max(2);
         self.cursor = 0;
         self.slots_here = 0;
         self.heard.clear();
+        self.cq.clear();
         if self.plan.is_empty() {
             self.phase = Phase::Idle;
             return None;
@@ -131,6 +146,52 @@ impl Scanner {
     pub fn cancel(&mut self) {
         self.phase = Phase::Idle;
         self.slots_here = 0;
+    }
+
+    /// Replace the sweep's stops mid-scan **without** resetting the accumulated
+    /// counts (the panel's band/mode toggles). Rebuilds the mode-major plan, keeps
+    /// the heard/cq and worked sets, and keeps dwelling the current stop if it
+    /// survived. Returns `true` if the current stop was removed (toggled off) — the
+    /// shell should retune to the new [`current`](Self::current). No-op while idle;
+    /// if every stop is toggled off the sweep goes [`Phase::Idle`].
+    pub fn update_stops(&mut self, stops: &[(Band, OverAirMode)]) -> bool {
+        if self.phase != Phase::Scanning {
+            return false;
+        }
+        let prev = self.current();
+        let mut bands = Vec::new();
+        for &(b, _) in stops {
+            if !bands.contains(&b) {
+                bands.push(b);
+            }
+        }
+        self.bands = bands;
+        let mut plan = Vec::new();
+        for &m in &MODE_ORDER {
+            for &(b, sm) in stops {
+                if sm == m && calling_freq(b, m).is_some() && !plan.contains(&(m, b)) {
+                    plan.push((m, b));
+                }
+            }
+        }
+        self.plan = plan;
+        if self.plan.is_empty() {
+            self.phase = Phase::Idle;
+            return false;
+        }
+        match prev.and_then(|c| self.plan.iter().position(|&p| p == c)) {
+            // The stop we were dwelling survived — keep dwelling it.
+            Some(i) => {
+                self.cursor = i;
+                false
+            }
+            // It was removed — clamp the cursor and tell the shell to retune.
+            None => {
+                self.cursor %= self.plan.len();
+                self.slots_here = 0;
+                true
+            }
+        }
     }
 
     /// Account one elapsed slot at the current stop. After `dwell_slots` slots,
@@ -151,49 +212,59 @@ impl Scanner {
         }
     }
 
-    /// Note a decoded message heard on `band`. The transmitting station (CQ caller,
-    /// or the sender of an exchange / sign-off) is added to that band's heard set;
-    /// unclassifiable text is ignored. The caller supplies `band` rather than the
-    /// engine assuming the *current* stop, because a decode arrives a slot or two
-    /// after its audio (the decoder runs once the slot ends) — by which point the
-    /// sweep may have hopped on — so it must be credited to the band that was tuned
-    /// when it was on the air.
-    pub fn on_decode(&mut self, band: Band, msg: &ParsedMessage) {
+    /// Note a decoded message heard on `band` in `mode`. The transmitting station
+    /// (CQ caller, or the sender of an exchange / sign-off) is added to that
+    /// `(band, mode)`'s heard set, and to its CQ set when the message is a CQ;
+    /// unclassifiable text is ignored. The caller supplies `band`/`mode` rather than
+    /// the engine assuming the *current* stop, because a decode arrives a slot or two
+    /// after its audio — by which point the sweep may have hopped — so it must be
+    /// credited to where it was actually heard.
+    pub fn on_decode(&mut self, band: Band, mode: OverAirMode, msg: &ParsedMessage) {
         if self.phase != Phase::Scanning {
             return;
         }
         if let Some(call) = station_of(msg) {
-            self.heard.entry(band).or_default().insert(call.clone());
+            self.heard.entry((band, mode)).or_default().insert(call.clone());
+            if matches!(msg, ParsedMessage::Cq { .. }) {
+                self.cq.entry((band, mode)).or_default().insert(call.clone());
+            }
         }
     }
 
-    /// Record a logged contact so it counts as worked on its band (drives the
+    /// Record a logged contact so it counts as worked on its band + mode (drives the
     /// unworked tally). Fed from the logbook's startup replay + live
     /// `logbook/entries`.
-    pub fn on_logged(&mut self, call: Callsign, band: Band) {
-        self.worked.insert((call, band));
+    pub fn on_logged(&mut self, call: Callsign, band: Band, mode: OverAirMode) {
+        self.worked.insert((call, band, mode));
     }
 
-    /// Per-band tallies in display order: distinct stations heard and how many are
-    /// unworked on that band.
+    /// Per-(band, mode) tallies, one per planned stop in sweep order.
     pub fn tallies(&self) -> Vec<BandTally> {
-        self.bands
+        self.plan
             .iter()
-            .map(|&band| {
-                let heard = self.heard.get(&band);
-                let seen = heard.map_or(0, |h| h.len()) as u32;
-                let unworked = heard.map_or(0, |h| {
+            .map(|&(mode, band)| {
+                let heard_set = self.heard.get(&(band, mode));
+                let heard = heard_set.map_or(0, |h| h.len()) as u32;
+                let cq = self.cq.get(&(band, mode)).map_or(0, |c| c.len()) as u32;
+                let unworked = heard_set.map_or(0, |h| {
                     h.iter()
-                        .filter(|&c| !self.worked.contains(&(c.clone(), band)))
+                        .filter(|&c| !self.worked.contains(&(c.clone(), band, mode)))
                         .count()
                 }) as u32;
                 BandTally {
                     band,
-                    seen,
+                    mode,
+                    heard,
+                    cq,
                     unworked,
                 }
             })
             .collect()
+    }
+
+    /// The distinct bands being scanned, in display order.
+    pub fn bands(&self) -> &[Band] {
+        &self.bands
     }
 }
 
@@ -216,7 +287,7 @@ fn station_of(msg: &ParsedMessage) -> Option<&Callsign> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use types::{ExchangePayload, GridSquare, Signoff};
+    use types::{ExchangePayload, GridSquare};
 
     fn call(s: &str) -> Callsign {
         Callsign(s.into())
@@ -230,13 +301,36 @@ mod tests {
         }
     }
 
+    fn exch(from: &str) -> ParsedMessage {
+        ParsedMessage::Exchange {
+            to: call("N0JDC"),
+            from: call(from),
+            payload: ExchangePayload::Report(-7),
+        }
+    }
+
+    fn tally(s: &Scanner, band: Band, mode: OverAirMode) -> BandTally {
+        s.tallies()
+            .into_iter()
+            .find(|t| t.band == band && t.mode == mode)
+            .expect("tally for band/mode")
+    }
+
     #[test]
     fn plan_is_mode_major_and_skips_missing_calling_freq() {
         let mut s = Scanner::new();
-        // 160 m has an FT8 calling freq but no FT4 one — so (FT4, 160m) is skipped.
-        let first = s.start(&[Band::B160m, Band::B20m], &[OverAirMode::Ft8, OverAirMode::Ft4], 2);
+        // Stops arrive band-major from the panel; the engine reorders mode-major and
+        // drops (FT4, 160m) which has no calling frequency.
+        let first = s.start(
+            &[
+                (Band::B160m, OverAirMode::Ft8),
+                (Band::B160m, OverAirMode::Ft4),
+                (Band::B20m, OverAirMode::Ft8),
+                (Band::B20m, OverAirMode::Ft4),
+            ],
+            2,
+        );
         assert_eq!(first, Some((OverAirMode::Ft8, Band::B160m)));
-        // Mode-major: all FT8 stops, then the surviving FT4 stop.
         assert_eq!(
             s.plan,
             vec![
@@ -250,70 +344,51 @@ mod tests {
     #[test]
     fn dwells_two_slots_then_hops_and_loops() {
         let mut s = Scanner::new();
-        s.start(&[Band::B40m, Band::B20m], &[OverAirMode::Ft8], 2);
+        s.start(&[(Band::B40m, OverAirMode::Ft8), (Band::B20m, OverAirMode::Ft8)], 2);
         assert_eq!(s.current(), Some((OverAirMode::Ft8, Band::B40m)));
-        // First slot: keep dwelling.
         assert_eq!(s.on_slot(), Step::Dwell);
-        // Second slot: hop to the next band.
-        assert_eq!(
-            s.on_slot(),
-            Step::Hop {
-                mode: OverAirMode::Ft8,
-                band: Band::B20m
-            }
-        );
-        assert_eq!(s.current(), Some((OverAirMode::Ft8, Band::B20m)));
-        // Two more slots wrap back to the first band — the scan loops.
+        assert_eq!(s.on_slot(), Step::Hop { mode: OverAirMode::Ft8, band: Band::B20m });
         assert_eq!(s.on_slot(), Step::Dwell);
-        assert_eq!(
-            s.on_slot(),
-            Step::Hop {
-                mode: OverAirMode::Ft8,
-                band: Band::B40m
-            }
-        );
+        // Wraps back to the first stop — the scan loops.
+        assert_eq!(s.on_slot(), Step::Hop { mode: OverAirMode::Ft8, band: Band::B40m });
     }
 
     #[test]
     fn dwell_is_clamped_to_two_for_parity() {
         let mut s = Scanner::new();
-        s.start(&[Band::B40m, Band::B20m], &[OverAirMode::Ft8], 1); // ask for 1…
-        assert_eq!(s.on_slot(), Step::Dwell); // …but we still dwell 2.
+        s.start(&[(Band::B40m, OverAirMode::Ft8), (Band::B20m, OverAirMode::Ft8)], 1);
+        assert_eq!(s.on_slot(), Step::Dwell);
         assert!(matches!(s.on_slot(), Step::Hop { .. }));
     }
 
     #[test]
-    fn tallies_count_distinct_heard_and_unworked() {
+    fn cq_is_a_subset_of_heard() {
         let mut s = Scanner::new();
-        s.start(&[Band::B20m], &[OverAirMode::Ft8], 2);
-        s.on_decode(Band::B20m, &cq("W1ABC"));
-        s.on_decode(Band::B20m, &cq("K2DEF"));
-        // A second decode from W1ABC (as an exchange sender) must not double-count.
-        s.on_decode(Band::B20m, &ParsedMessage::Exchange {
-            to: call("N0JDC"),
-            from: call("W1ABC"),
-            payload: ExchangePayload::Report(-7),
-        });
-        // Worked W1ABC on 20 m; K2DEF stays unworked. A contact on another band
-        // must not mark them worked here.
-        s.on_logged(call("W1ABC"), Band::B20m);
-        s.on_logged(call("K2DEF"), Band::B40m);
-        let t = s.tallies();
-        assert_eq!(t, vec![BandTally { band: Band::B20m, seen: 2, unworked: 1 }]);
+        s.start(&[(Band::B20m, OverAirMode::Ft8)], 2);
+        s.on_decode(Band::B20m, OverAirMode::Ft8, &cq("W1ABC")); // CQ → heard + cq
+        s.on_decode(Band::B20m, OverAirMode::Ft8, &exch("K2DEF")); // exchange → heard only
+        s.on_decode(Band::B20m, OverAirMode::Ft8, &exch("W1ABC")); // dup of W1ABC
+        let t = tally(&s, Band::B20m, OverAirMode::Ft8);
+        assert_eq!(t.heard, 2); // W1ABC, K2DEF
+        assert_eq!(t.cq, 1); // only W1ABC called CQ
     }
 
     #[test]
-    fn signoff_sender_counts_as_heard() {
+    fn counts_split_by_mode_and_unworked_is_per_band_mode() {
         let mut s = Scanner::new();
-        s.start(&[Band::B20m], &[OverAirMode::Ft8], 2);
-        s.on_decode(Band::B20m, &ParsedMessage::Signoff {
-            to: call("N0JDC"),
-            from: call("W1ABC"),
-            kind: Signoff::Rr73,
-        });
-        // Free text names no station, so it's ignored.
-        s.on_decode(Band::B20m, &ParsedMessage::Free("hello world".into()));
-        assert_eq!(s.tallies()[0].seen, 1);
+        s.start(
+            &[(Band::B20m, OverAirMode::Ft8), (Band::B20m, OverAirMode::Ft4)],
+            2,
+        );
+        s.on_decode(Band::B20m, OverAirMode::Ft8, &cq("W1ABC"));
+        s.on_decode(Band::B20m, OverAirMode::Ft4, &cq("K2DEF"));
+        // Worked W1ABC on 20m FT8 only — so it's worked there, but K2DEF on 20m FT4
+        // stays unworked, and W1ABC would still be unworked on FT4.
+        s.on_logged(call("W1ABC"), Band::B20m, OverAirMode::Ft8);
+        let ft8 = tally(&s, Band::B20m, OverAirMode::Ft8);
+        let ft4 = tally(&s, Band::B20m, OverAirMode::Ft4);
+        assert_eq!((ft8.heard, ft8.cq, ft8.unworked), (1, 1, 0));
+        assert_eq!((ft4.heard, ft4.cq, ft4.unworked), (1, 1, 1));
     }
 
     #[test]
@@ -321,19 +396,37 @@ mod tests {
         let mut s = Scanner::new();
         assert_eq!(s.current(), None);
         assert_eq!(s.on_slot(), Step::Dwell);
-        s.on_decode(Band::B20m, &cq("W1ABC")); // no-op while idle
+        s.on_decode(Band::B20m, OverAirMode::Ft8, &cq("W1ABC")); // no-op while idle
         assert!(s.tallies().is_empty());
     }
 
     #[test]
     fn cancel_stops_but_keeps_tallies() {
         let mut s = Scanner::new();
-        s.start(&[Band::B20m], &[OverAirMode::Ft8], 2);
-        s.on_decode(Band::B20m, &cq("W1ABC"));
+        s.start(&[(Band::B20m, OverAirMode::Ft8)], 2);
+        s.on_decode(Band::B20m, OverAirMode::Ft8, &cq("W1ABC"));
         s.cancel();
         assert_eq!(s.phase(), Phase::Idle);
         assert_eq!(s.current(), None);
-        // Last results survive for the panel.
-        assert_eq!(s.tallies()[0].seen, 1);
+        assert_eq!(tally(&s, Band::B20m, OverAirMode::Ft8).heard, 1);
+    }
+
+    #[test]
+    fn update_stops_replans_and_preserves_counts() {
+        let mut s = Scanner::new();
+        s.start(
+            &[(Band::B40m, OverAirMode::Ft8), (Band::B20m, OverAirMode::Ft8)],
+            2,
+        );
+        s.on_decode(Band::B40m, OverAirMode::Ft8, &cq("W1ABC"));
+        // Drop 40m (the current stop), add 15m → current changed, so retune.
+        assert!(s.update_stops(&[
+            (Band::B20m, OverAirMode::Ft8),
+            (Band::B15m, OverAirMode::Ft8),
+        ]));
+        assert!(s.tallies().iter().all(|t| t.band != Band::B40m)); // 40m no longer reported
+        // Bring 40m back — its accumulated count survived (counts are not reset).
+        s.update_stops(&[(Band::B40m, OverAirMode::Ft8), (Band::B20m, OverAirMode::Ft8)]);
+        assert_eq!(tally(&s, Band::B40m, OverAirMode::Ft8).heard, 1);
     }
 }

@@ -40,17 +40,16 @@ shipped sweep covers mode×band at each band's calling frequency; extend it for 
 > &nbsp;&nbsp;&nbsp;&nbsp;Report on all heard stations and all unworked stations, filtered by those doing the Field Day exchange.
 > &nbsp;&nbsp;&nbsp;&nbsp;May also need to filter by SNR so we're not chasing −20 dB stations we'll never hit.
 
-Still to design in (the **mode dimension, 2-slot dwell, and loop are done**):
+Still to design in (done so far: **mode×band sweep, 2-slot dwell, loop, per-band
+FT8/FT4 toggles, and cumulative per-(band,mode) heard/cq/unworked counts**):
 - **Per-offset sweep** — also dwell at the calling freq −1000/+1000 Hz (maybe ±2000) to
   cover more than one ~3 kHz passband per band. Each offset stop needs its own ≥2 slots.
 - **Filter to Field Day participants** — stations sending the FD `<class> <section>`
   exchange (the parser already understands this form; `gui/src/settings.rs:145` notes
   the `ContestProfile` UI is still TODO).
 - **SNR floor filter** so the report surfaces only workable signals.
-- **Per-mode unworked** — today "unworked" is per band (any mode); split per band *and*
-  mode if Field Day scoring needs it (ties into item 3).
-- **Configurable dwell / interval count** — Josh's note wants 5–10 intervals; the shipped
-  default is 2 (the parity minimum). Surface it (and band selection) in the panel.
+- **Configurable interval count** — Josh's note wants 5–10 intervals; the shipped dwell
+  is fixed at 2 (the parity minimum). Surface it in the panel.
 
 ### 2. Decode archive — persist *every* heard and sent message
 **Raw capture is shipped** — the `archive` crate. When `[archive] decodes` names a file

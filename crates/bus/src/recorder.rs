@@ -98,9 +98,9 @@ fn publish_envelope(bus: &BusHandle, env: &Envelope) -> Result<(), BusError> {
         TopicKind::QsoState => pub_as!(QsoState),
         TopicKind::LogbookEntries => pub_as!(LogEntry),
         TopicKind::ScannerState => pub_as!(ScannerState),
-        // Provisional: scanner/candidates payload shape is not finalized; carried
-        // as BandActivity for now (class-consistent State).
-        TopicKind::ScannerCandidates => pub_as!(BandActivity),
+        // scanner/candidates carries the full per-scan snapshot (one BandActivity
+        // per scanned band/mode) as a single State value.
+        TopicKind::ScannerCandidates => pub_as!(Vec<BandActivity>),
         TopicKind::ClockStatus => pub_as!(ClockStatus),
         TopicKind::Health => pub_as!(SubsystemHealth),
         // Not produced by publish(): command topics + deferred §9 gossip. Skip.

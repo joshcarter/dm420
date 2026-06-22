@@ -58,7 +58,7 @@ Severity: 🔴 correctness/blocker · 🟡 should-fix · 🟢 polish.
 - ✅ **Logbook is real in real mode.** `core::spawn` runs the `logbook` crate: it
   records the QSO the engine logs on RR73, persists the whole log as JSON
   (`~/.dm420/logbook.json` or `DM420_LOGBOOK`), and replays history on startup.
-  `mocks::spawn_support` no longer publishes fake QSOs. Still pending: **ADIF**
+  the mock no longer publishes fake QSOs into the real path. Still pending: **ADIF**
   import/export and the **peer-merge** G-set; and `build_log` (in `qso/shell.rs`)
   still stamps placeholder **band/freq/mode** until `OperatingState` is published.
 - ✅ **Scanner is real in real mode** — the `scanner` sweep engine + `core::scan` shell

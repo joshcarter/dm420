@@ -19,8 +19,13 @@ below, with three agreed tweaks:
   band + mode (the spec's "return to normal operating state").
 
 Per-band heard/unworked counts come from live decodes cross-referenced against the
-logbook (`unworked` = heard on that band but not yet logged on that band). The
-original spec follows.
+logbook. Counts are cumulative over the scan (distinct callsigns) and split per
+**band and mode** into **heard** (every station decoded transmitting), **cq** (those
+calling CQ, a subset of heard), and **unworked** (heard but not yet logged on that
+band + mode). The panel has a per-band **FT8/FT4 toggle pair** to skip bands/modes
+(flippable live mid-scan, without resetting counts), shows the elapsed scan time
+(mm:ss) while running, brightens the band/mode being dwelled (dimming its other
+mode), and zeroes the counts when a scan starts. The original spec follows.
 
 The band scanner will be selectively activated by the user, and when
 it runs, it blocks radio transmissions and does the following:

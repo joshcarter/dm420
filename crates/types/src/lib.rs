@@ -588,10 +588,16 @@ pub enum WorkedStatus {
 /// `scanner/command` (Command) — to the band scanner.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum ScannerCommand {
-    /// `dwell_slots >= 2` (even/odd slots).
+    /// Survey the given `(band, mode)` stops — each band/mode panel toggle is one
+    /// stop — dwelling `dwell_slots` per stop. `dwell_slots >= 2` (even/odd parity).
     StartSurvey {
-        bands: Vec<Band>,
+        stops: Vec<(Band, OverAirMode)>,
         dwell_slots: u8,
+    },
+    /// Replace the live sweep's stops mid-scan (the panel's band/mode toggles)
+    /// **without** resetting the accumulated counts. Ignored when not scanning.
+    SetStops {
+        stops: Vec<(Band, OverAirMode)>,
     },
     Cancel,
 }
@@ -608,6 +614,8 @@ pub enum ScannerAck {
 pub struct ScannerState {
     pub status: ScanStatus,
     pub current: Option<Band>,
+    /// The mode being dwelled on right now (pairs with `current`); `None` when idle.
+    pub current_mode: Option<OverAirMode>,
     pub last_scan: Option<Timestamp>,
 }
 
@@ -618,12 +626,18 @@ pub enum ScanStatus {
     Scanning,
 }
 
-/// Per-band counts feeding the band-scan panel and (later) the cross-station
-/// `band_activity` gossip.
+/// Per-(band, mode) scan counts feeding the band-scan panel and (later) the
+/// cross-station `band_activity` gossip. Counts are cumulative over the scan
+/// (distinct callsigns). `cq` (stations that called CQ) is a subset of `heard`.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BandActivity {
     pub band: Band,
-    pub stations_seen: u32,
+    pub mode: OverAirMode,
+    /// Distinct stations heard transmitting.
+    pub heard: u32,
+    /// Distinct stations heard calling CQ (a subset of `heard`).
+    pub cq: u32,
+    /// Distinct heard stations not yet logged on this band + mode.
     pub unworked: u32,
     pub t: Timestamp,
 }
@@ -1128,18 +1142,28 @@ mod tests {
     #[test]
     fn scanner_round_trip() {
         round_trip(ScannerCommand::StartSurvey {
-            bands: vec![Band::B40m, Band::B20m, Band::B15m, Band::B10m],
+            stops: vec![
+                (Band::B40m, OverAirMode::Ft8),
+                (Band::B40m, OverAirMode::Ft4),
+                (Band::B20m, OverAirMode::Ft8),
+            ],
             dwell_slots: 2,
+        });
+        round_trip(ScannerCommand::SetStops {
+            stops: vec![(Band::B20m, OverAirMode::Ft8)],
         });
         round_trip(ScannerCommand::Cancel);
         round_trip(ScannerState {
             status: ScanStatus::Scanning,
             current: Some(Band::B20m),
+            current_mode: Some(OverAirMode::Ft4),
             last_scan: Some(Timestamp(1_700_000_000_000)),
         });
         round_trip(BandActivity {
             band: Band::B40m,
-            stations_seen: 23,
+            mode: OverAirMode::Ft8,
+            heard: 23,
+            cq: 6,
             unworked: 7,
             t: Timestamp(1_700_000_000_000),
         });

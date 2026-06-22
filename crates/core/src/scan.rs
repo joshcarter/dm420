@@ -1,9 +1,10 @@
 //! The band-scanner I/O shell — drives the pure [`scanner::Scanner`] engine.
 //!
 //! Serves `scanner/command`; while a survey runs it time-slices the receiver across
-//! the selected bands in **both FT8 and FT4**, dwelling 2 slots per stop (even/odd
-//! parity) and looping until cancelled. It blocks TX for the whole sweep, and
-//! restores the operator's band+mode when cancelled.
+//! the selected `(band, mode)` stops in **both FT8 and FT4**, dwelling 2 slots per
+//! stop (even/odd parity) and looping until cancelled. It blocks TX for the whole
+//! sweep, restores the operator's band+mode when cancelled, and supports changing
+//! the stops live (`SetStops`) without resetting the counts.
 //!
 //! Why this lives in `core` and not the `scanner` crate: switching FT8↔FT4 means
 //! reconfiguring capture through the in-process [`AudioControl`] handle (it restarts
@@ -11,12 +12,15 @@
 //! holding the in-process [`Granter`] token. Both handles live here. The *pure*
 //! sweep logic stays in the `scanner` crate so it's testable without hardware.
 //!
-//! Hardware-timing notes (tune on a real rig): a mode hop restarts capture, so each
-//! stop's 2-slot count begins only at the next clean slot boundary after the retune
-//! (the in-progress slot is skipped via a `prev_slot` resync). A band-only hop is a
-//! cheap CAT retune. A full FT8+FT4 × 4-band pass is therefore a few minutes.
+//! **Decode attribution is by timestamp.** A decode arrives a slot or two after its
+//! audio (the decoder runs once the slot ends), so by the time it lands the sweep
+//! may have hopped. We record when we tuned each band (`tunes`) and credit each
+//! decode to the band that was on the air at the decode's own `t` (its slot start).
+//! Decodes older than the first tune — e.g. traffic on the band the operator was on
+//! before the scan — are dropped, not mis-credited. The `prev_slot` resync is a
+//! separate concern: it keeps the *dwell* from counting the partial slot in progress
+//! right after a retune.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,14 +31,6 @@ use scanner::{Phase, Scanner, Step};
 
 use crate::control::AudioControl;
 use crate::interlock::Granter;
-
-/// The modes every survey sweeps, in plan order (FT8 first; the engine is
-/// mode-major so capture restarts only at the FT8→FT4 boundary).
-const SURVEY_MODES: [t::OverAirMode; 2] = [t::OverAirMode::Ft8, t::OverAirMode::Ft4];
-
-/// How many recent slots to keep in the slot→band map. Decodes lag their slot by
-/// only a slot or two, so 16 is comfortably enough to credit a late decode right.
-const SLOT_BAND_KEEP: u64 = 16;
 
 /// Launch the band-scanner service onto `bus`. `audio` is the live-capture mode
 /// handle (`None` for WAV/no-capture: the survey still sweeps bands but can't switch
@@ -88,16 +84,13 @@ async fn run(bus: BusHandle, radio: t::RadioId, audio: Option<Arc<AudioControl>>
     let mut token: Option<t::InterlockToken> = None;
     let mut saved: Option<(t::AbsHz, Protocol)> = None;
     let mut latest_vfo: Option<t::AbsHz> = None;
-    // Last clock slot seen. `None` means "resync" — seed without ticking, so the
-    // partial slot in progress right after a retune isn't counted.
+    // Slot resync for the *dwell* (not attribution): `None` seeds without counting,
+    // so the partial slot in progress right after a retune isn't counted toward the
+    // 2-slot dwell.
     let mut prev_slot: Option<t::SlotId> = None;
-    // The band/mode currently tuned, and the band each recent slot was received on —
-    // so a decode that arrives a slot or two late (the decoder runs after the slot
-    // ends) is credited to the band that was on the air then, not whatever we've
-    // since hopped to.
-    let mut active_band: Option<t::Band> = None;
-    let mut active_mode: Option<t::OverAirMode> = None;
-    let mut slot_band: HashMap<t::SlotId, t::Band> = HashMap::new();
+    // When (epoch ms) we tuned each band, newest last. A decode is credited to the
+    // band whose tune is the latest at or before the decode's own timestamp.
+    let mut tunes: Vec<(i64, t::Band)> = Vec::new();
 
     publish_state(&bus, &engine, None);
     tracing::info!("scanner: service ready (idle)");
@@ -107,31 +100,54 @@ async fn run(bus: BusHandle, radio: t::RadioId, audio: Option<Arc<AudioControl>>
             m = cmds.next() => {
                 let Some((cmd, responder)) = m else { break };
                 match cmd {
-                    t::ScannerCommand::StartSurvey { bands, dwell_slots } => {
+                    t::ScannerCommand::StartSurvey { stops, dwell_slots } => {
                         // Remember where the operator was so we can restore it.
                         let cur_proto = audio.as_ref().map(|a| a.snapshot().1).unwrap_or(Protocol::Ft8);
                         saved = latest_vfo.map(|vfo| (vfo, cur_proto));
                         token = acquire(&granter);
-                        if let Some((mode, band)) = engine.start(&bands, &SURVEY_MODES, dwell_slots) {
-                            active_band = Some(band);
-                            active_mode = Some(mode);
-                            slot_band.clear();
+                        if let Some((mode, band)) = engine.start(&stops, dwell_slots) {
+                            tunes.clear();
+                            tunes.push((now_ms(), band));
                             prev_slot = None; // resync onto the first stop
                             apply_stop(&bus, &radio, audio.as_deref(), mode, band).await;
+                            publish_snapshot(&bus, &engine); // a fresh scan → zeroed counts
                             publish_state(&bus, &engine, None);
-                            tracing::info!(?bands, "scanner: survey started");
+                            tracing::info!(stops = stops.len(), "scanner: survey started");
                         } else {
                             tracing::warn!("scanner: no scannable band/mode stops; not starting");
                             if let Some(tok) = token.take() { granter.release(tok); }
+                        }
+                    }
+                    t::ScannerCommand::SetStops { stops } => {
+                        if engine.phase() == Phase::Scanning {
+                            let changed = engine.update_stops(&stops);
+                            if engine.phase() != Phase::Scanning {
+                                // Everything toggled off — wind the scan down like Cancel.
+                                restore(&bus, &radio, audio.as_deref(), saved.take()).await;
+                                if let Some(tok) = token.take() { granter.release(tok); }
+                                tunes.clear();
+                                prev_slot = None;
+                                publish_state(&bus, &engine, Some(now_ms()));
+                            } else {
+                                if changed {
+                                    // The dwelled stop was removed — retune to the new one.
+                                    if let Some((mode, band)) = engine.current() {
+                                        tunes.push((now_ms(), band));
+                                        prune_tunes(&mut tunes);
+                                        apply_stop(&bus, &radio, audio.as_deref(), mode, band).await;
+                                        prev_slot = None;
+                                    }
+                                }
+                                publish_snapshot(&bus, &engine);
+                                publish_state(&bus, &engine, None);
+                            }
                         }
                     }
                     t::ScannerCommand::Cancel => {
                         engine.cancel();
                         restore(&bus, &radio, audio.as_deref(), saved.take()).await;
                         if let Some(tok) = token.take() { granter.release(tok); }
-                        active_band = None;
-                        active_mode = None;
-                        slot_band.clear();
+                        tunes.clear();
                         prev_slot = None;
                         publish_state(&bus, &engine, Some(now_ms()));
                         tracing::info!("scanner: survey cancelled");
@@ -145,49 +161,42 @@ async fn run(bus: BusHandle, radio: t::RadioId, audio: Option<Arc<AudioControl>>
                     prev_slot = Some(cs.slot);
                     continue;
                 }
-                // Record which band this slot is being received on (to credit
-                // late-arriving decodes), pruning the map to recent slots.
-                if let Some(b) = active_band {
-                    slot_band.insert(cs.slot, b);
-                    slot_band.retain(|s, _| s.0 + SLOT_BAND_KEEP >= cs.slot.0);
-                }
                 // Seed `prev_slot` on the first message without firing (we may be
                 // mid-slot, and a resync sets it to `None`), then tick on each change.
+                // This governs the dwell only; attribution is by timestamp below.
                 let boundary = prev_slot.is_some_and(|p| p != cs.slot);
                 prev_slot = Some(cs.slot);
                 if !boundary {
-                    continue;
+                    continue; // the partial slot after a retune isn't counted toward the dwell
                 }
                 // Keep TX blocked: extend the grant before the ~20 s TTL lapses.
                 if let Some(tok) = token { granter.refresh(tok); }
                 if let Step::Hop { mode, band } = engine.on_slot() {
-                    if active_mode != Some(mode) {
-                        slot_band.clear(); // slot numbering changes with the mode
-                    }
-                    active_band = Some(band);
-                    active_mode = Some(mode);
+                    tunes.push((now_ms(), band));
+                    prune_tunes(&mut tunes);
                     apply_stop(&bus, &radio, audio.as_deref(), mode, band).await;
                     prev_slot = None; // skip the partial slot after the retune
                 }
-                if let Some((_, band)) = engine.current() {
-                    publish_band(&bus, &engine, band);
-                }
+                publish_snapshot(&bus, &engine);
                 publish_state(&bus, &engine, None);
             }
             r = decodes.recv() => {
                 let Ok(d) = r else { continue };
-                if let t::DecodeContent::Slotted { slot, message, .. } = &d.content {
-                    // Credit the decode to the band tuned when its slot was on the air
-                    // (it arrives a slot or two after), falling back to the current band.
-                    if let Some(band) = slot_band.get(slot).copied().or(active_band) {
-                        engine.on_decode(band, message);
-                        publish_band(&bus, &engine, band);
+                let mode = d.mode;
+                let ts = d.t.0;
+                if let t::DecodeContent::Slotted { message, .. } = &d.content {
+                    // Credit to the band tuned when this decode's audio was on the air.
+                    // A decode older than the first tune (pre-scan traffic on the band
+                    // we tuned away from) has no match and is dropped, not mis-credited.
+                    if let Some(band) = band_at(&tunes, ts) {
+                        engine.on_decode(band, mode, message);
+                        publish_snapshot(&bus, &engine);
                     }
                 }
             }
             r = logs.recv() => {
                 let Ok(e) = r else { continue };
-                engine.on_logged(e.call, e.band);
+                engine.on_logged(e.call, e.band, e.mode);
             }
             r = rig.recv() => {
                 let Ok(s) = r else { continue };
@@ -208,6 +217,22 @@ fn acquire(granter: &Granter) -> Option<t::InterlockToken> {
             tracing::warn!(?other, "scanner: could not hold TX interlock; TX block is best-effort");
             None
         }
+    }
+}
+
+/// The band tuned when audio captured at `ts` (epoch ms) was on the air: the most
+/// recent tune at or before `ts`. `None` if `ts` predates the scan's first tune.
+fn band_at(tunes: &[(i64, t::Band)], ts: i64) -> Option<t::Band> {
+    tunes.iter().rev().find(|(tm, _)| *tm <= ts).map(|(_, b)| *b)
+}
+
+/// Keep the tune history bounded; decodes lag their audio by only a slot or two, so
+/// the relevant tune is always recent.
+fn prune_tunes(tunes: &mut Vec<(i64, t::Band)>) {
+    const KEEP: usize = 64;
+    if tunes.len() > KEEP {
+        let drop = tunes.len() - KEEP;
+        tunes.drain(0..drop);
     }
 }
 
@@ -275,26 +300,31 @@ fn publish_state(bus: &BusHandle, engine: &Scanner, last_scan_ms: Option<i64>) {
         t::ScannerState {
             status,
             current: engine.current().map(|(_, band)| band),
+            current_mode: engine.current().map(|(mode, _)| mode),
             last_scan: last_scan_ms.map(t::Timestamp),
         },
     );
 }
 
-/// Publish `band`'s live tally on `scanner/candidates`. One band per publish (the GUI
-/// accumulates by band). Called as decodes are credited and on each slot boundary, so
-/// a band's count surfaces as soon as a station is heard on it — not a sweep later.
-fn publish_band(bus: &BusHandle, engine: &Scanner, band: t::Band) {
-    if let Some(tally) = engine.tallies().into_iter().find(|t| t.band == band) {
-        let _ = bus.publish(
-            &Topic::ScannerCandidates,
-            t::BandActivity {
-                band: tally.band,
-                stations_seen: tally.seen,
-                unworked: tally.unworked,
-                t: t::Timestamp(now_ms()),
-            },
-        );
-    }
+/// Publish the full per-scan snapshot on `scanner/candidates`: one [`t::BandActivity`]
+/// per scanned `(band, mode)`, as a single State value. Sent on each decode and slot
+/// boundary (and zeroed on Start), so the panel always sees a complete, current set —
+/// no accumulation, no coalescing, and counts reset cleanly when a scan begins.
+fn publish_snapshot(bus: &BusHandle, engine: &Scanner) {
+    let now = now_ms();
+    let snapshot: Vec<t::BandActivity> = engine
+        .tallies()
+        .into_iter()
+        .map(|tl| t::BandActivity {
+            band: tl.band,
+            mode: tl.mode,
+            heard: tl.heard,
+            cq: tl.cq,
+            unworked: tl.unworked,
+            t: t::Timestamp(now),
+        })
+        .collect();
+    let _ = bus.publish(&Topic::ScannerCandidates, snapshot);
 }
 
 /// Map an over-air mode to the capture protocol. FT8/FT4 are direct; the

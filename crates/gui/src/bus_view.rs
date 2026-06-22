@@ -137,7 +137,7 @@ pub struct BusView {
     scanner: Cell<ScannerState>,
     #[allow(dead_code)]
     clock: Cell<ClockStatus>,
-    bands: Arc<Mutex<HashMap<Band, BandActivity>>>,
+    bands: Arc<Mutex<Vec<BandActivity>>>,
     logs: Ring<LogEntry>,
     decodes: Ring<Decode>,
     /// Stations heard with a grid, keyed by call → newest [`HeardEntry`].
@@ -193,7 +193,7 @@ impl BusView {
         let scanner = cell();
         let clock = cell();
         let qso = cell();
-        let bands: Arc<Mutex<HashMap<Band, BandActivity>>> = Arc::new(Mutex::new(HashMap::new()));
+        let bands: Arc<Mutex<Vec<BandActivity>>> = Arc::new(Mutex::new(Vec::new()));
         let logs = Ring::new(512);
         // Sized to hold every decode that can be on the waterslide at once: the panel
         // shows (panel_width / line_width) slot-columns of history (monitor-dependent —
@@ -364,7 +364,7 @@ impl BusView {
     /// Per-band activity, sorted low band → high. Accumulated from the (provisional)
     /// single-value `scanner/candidates` State topic — see [`pump_bands`].
     pub fn band_activity(&self) -> Vec<BandActivity> {
-        let mut v: Vec<BandActivity> = self.bands.lock().unwrap().values().cloned().collect();
+        let mut v = self.bands.lock().unwrap().clone();
         v.sort_by_key(|b| band_order(b.band));
         v
     }
@@ -618,14 +618,20 @@ impl BusView {
     /// the bus runtime, like [`set_freq`]; progress comes back on `scanner/state`
     /// and `scanner/candidates`. In mock mode (no scanner server) it times out
     /// harmlessly.
-    pub fn start_scan(&self, bands: Vec<Band>, dwell_slots: u8) {
-        self.send_scanner_command(ScannerCommand::StartSurvey { bands, dwell_slots });
+    pub fn start_scan(&self, stops: Vec<(Band, OverAirMode)>, dwell_slots: u8) {
+        self.send_scanner_command(ScannerCommand::StartSurvey { stops, dwell_slots });
     }
 
     /// Cancel the running survey; the scanner restores the operator's prior
     /// band + mode.
     pub fn cancel_scan(&self) {
         self.send_scanner_command(ScannerCommand::Cancel);
+    }
+
+    /// Replace the live sweep's stops (the panel's band/mode toggles) without
+    /// resetting counts. Sent as the operator toggles during a scan.
+    pub fn set_stops(&self, stops: Vec<(Band, OverAirMode)>) {
+        self.send_scanner_command(ScannerCommand::SetStops { stops });
     }
 
     fn send_scanner_command(&self, cmd: ScannerCommand) {
@@ -958,9 +964,9 @@ fn pump_health(
 /// publishes the bands spaced apart; this pump folds each into a map so all bands
 /// are visible at once. A `Vec<BandActivity>` snapshot payload would let us drop
 /// this accumulation — a question for whoever finalizes the scanner seam.
-fn pump_bands(bus: &BusHandle, bands: Arc<Mutex<HashMap<Band, BandActivity>>>, ctx: egui::Context) {
+fn pump_bands(bus: &BusHandle, bands: Arc<Mutex<Vec<BandActivity>>>, ctx: egui::Context) {
     let mut sub =
-        match bus.subscribe::<BandActivity>(TopicSelector::Exact(Topic::ScannerCandidates)) {
+        match bus.subscribe::<Vec<BandActivity>>(TopicSelector::Exact(Topic::ScannerCandidates)) {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!(error = ?e, "bus_view: candidates subscribe failed");
@@ -970,8 +976,8 @@ fn pump_bands(bus: &BusHandle, bands: Arc<Mutex<HashMap<Band, BandActivity>>>, c
     tokio::spawn(async move {
         loop {
             match sub.recv().await {
-                Ok(b) => {
-                    bands.lock().unwrap().insert(b.band, b);
+                Ok(snapshot) => {
+                    *bands.lock().unwrap() = snapshot;
                     ctx.request_repaint();
                 }
                 Err(BusError::Lagged { .. }) => continue,
