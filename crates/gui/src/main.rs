@@ -505,6 +505,10 @@ impl eframe::App for App {
         // Because this bypasses eframe's own on-exit `save`, persist the window
         // size + tile layout here, the last reliable point before we exit.
         if ctx.input(|i| i.viewport().close_requested()) {
+            // Safety first: never leave the rig keyed on exit. Drop PTT before we
+            // bypass normal teardown with process::exit — a mid-over quit would
+            // otherwise hold the carrier until the rig's PTT watchdog trips (~15 s).
+            self.view.unkey_for_shutdown();
             self.persist_window_layout(&ctx);
             std::process::exit(0);
         }
@@ -634,6 +638,18 @@ impl eframe::App for App {
             });
 
         self.run_screenshot(&ctx);
+    }
+
+    /// The ⌘Q / normal-termination path. macOS does **not** deliver a
+    /// `close_requested` frame here — only the red close button does (handled in
+    /// `ui`) — so this `on_exit` is the one hook that runs on a ⌘Q quit. Drop the
+    /// rig's PTT so quitting mid-over can't leave the transmitter keyed, then exit
+    /// hard to skip winit's crashy AppKit teardown (the same workaround as the
+    /// close-request path). Window layout is already persisted by the reactive
+    /// `maybe_persist_window` debounce, so there's nothing else to flush here.
+    fn on_exit(&mut self) {
+        self.view.unkey_for_shutdown();
+        std::process::exit(0);
     }
 }
 
