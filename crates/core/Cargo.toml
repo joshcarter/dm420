@@ -17,6 +17,7 @@ modes.workspace = true
 dsp.workspace = true
 logbook.workspace = true
 archive.workspace = true
+scanner.workspace = true
 net.workspace = true
 tokio.workspace = true
 tracing.workspace = true

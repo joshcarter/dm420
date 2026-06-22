@@ -64,18 +64,18 @@ subscriber must never stall a publisher.**
 | `audio` | ✅ implemented | cpal capture/playback/device list (vendored) |
 | `dsp` | ✅ implemented | hand-rolled radix-2 FFT + spectrum rows |
 | `modes` | ✅ implemented | FT8+FT4 **decode and encode/synth** (FT4 synth verified sample-identical to the `ft8_lib` reference offline; on-air TX not yet confirmed). MIT `ft8_lib` port (vendored, W4LL; see `crates/modes/ATTRIBUTION.md`) |
-| `mocks` | ✅ implemented | fake producers for every topic; `mocks::spawn_support` |
+| `mocks` | ✅ implemented | fake producers for every topic (`mocks::spawn`) — the `DM420_MOCK=1` no-hardware path |
 | `gui` | ✅ active dev | the app |
 | `qso` | ✅ implemented | contact auto-sequencer (CQ→report→RR73→73, incl. Field Day); tracks mode from decodes and drives the real TX path (`engine.rs`/`shell.rs`/`message.rs`, ~1.8k lines) |
 | `logbook` | ✅ implemented | JSON-persistent log store: logs on RR73, replays history on startup; ADIF + peer-merge still pending |
 | `archive` | ✅ implemented | raw decode/transmit archive: append-only JSONL of every heard + sent message (off by default; opt in via `[archive] decodes`). Diagnostics/analysis; not QSO-grouped |
 | `callbook` | ✅ implemented | offline call-sign → country/ISO prefix resolver (Tier-1 of the Call Sign panel); pure, no I/O. Online name enrichment (Tier-2) not built |
-| `scanner` | 🪧 **stub** | band-scanner strategy — not built; currently mocked |
+| `scanner` | ✅ implemented | pure band-scan sweep engine; the `core::scan` shell drives it — time-slices RX across 40/20/15/10 in FT8+FT4, 2-slot dwell, loops until cancel, blocks TX |
 
-In **real mode** the **scanner** is the only remaining mock (`mocks::spawn_support`); the
-**qso** auto-sequencer, **logbook**, decode, interlock granter, **audio-TX**, and the
-opt-in **decode archive** (`archive` crate) are all real (spawned by `core::spawn`), and
-the clock is real wall-clock. So real mode runs live
+In **real mode everything is real now** — the **qso** auto-sequencer, **logbook**, decode,
+interlock granter, **audio-TX**, the opt-in **decode archive** (`archive` crate), and the
+**band scanner** (`scanner` engine + `core::scan` shell) are all spawned by `core::spawn`,
+and the clock is real wall-clock. So real mode runs live
 **end-to-end QSOs — RX and TX — on FT8** (FT4 TX is implemented and offline-verified,
 not yet keyed on a real radio), and the Log Book and Contacts/map panels show
 **real** QSOs. Mock mode still uses `mocks::spawn` for everything (seeded **fake** QSOs,
@@ -193,9 +193,10 @@ Notable open items (see `TODO.md`, `docs/live_pipeline_notes.md`, `OVERVIEW.md �
   **sample-identical to the `ft8_lib` reference** offline (`ft4_cq_1200.wav`, Pearson r = 1.0).
   Remaining: a first on-air FT4 QSO, and `rig::actor::PTT_WATCHDOG` is still FT8-sized (15 s).
   See `docs/live_pipeline_notes.md`.
-- 🔴 **Build the real `scanner` crate** — the last mock (`qso` and `logbook` are now real;
-  `scanner` is still `mocks::spawn_support`). Mirror the `mocks::spawn` / `core::spawn`
-  pattern, one topic at a time.
+- ✅ **Band scanner built** — `scanner` (pure sweep engine) + `core::scan` shell time-slice
+  the RX across 40/20/15/10 in FT8+FT4 (2-slot dwell, loops until cancel, blocks TX), wired
+  into `core::spawn`. The last real-mode mock is gone. Enhancements (per-offset sweep,
+  Field-Day-exchange filter, SNR floor) are in `JOELS_ROADMAP.md` Now-#1.
 - 🔴 **Spectrogram ↔ decode-text drift:** text is placed by wall-clock age, the
   spectrogram scrolls by accumulated frame `dt`. Fix = place spectrogram columns by
   their `SpectrumRow.t`.

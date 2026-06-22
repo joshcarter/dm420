@@ -56,18 +56,10 @@ pub fn spawn(bus: &BusHandle) {
     tokio::spawn(run_scanner(bus.clone()));
 }
 
-/// Launch only the producers the real `core` adapter does not yet cover (the
-/// scanner). Use this alongside `core::spawn` so the real rig/decode/logbook
-/// producers own their topics without a second writer fighting them.
-///
-/// The clock and logbook are no longer here: `core::spawn` runs the real
-/// mode-aware slot clock (`core::clock`) and the real persistent logbook in real
-/// mode, so a mock writer must not also publish onto `clock/status` /
-/// `logbook/entries`. (A 15 s-hardcoded mock clock on the real path was the FT4
-/// TX-window bug.)
-pub fn spawn_support(bus: &BusHandle) {
-    tokio::spawn(run_scanner(bus.clone()));
-}
+// `spawn_support` is gone: the band scanner is real now (`core::scan` in real
+// mode), so `core::spawn` owns every real-mode topic and there are no remaining
+// real-mode support mocks. The mock scanner (`run_scanner`) still backs the
+// no-hardware `mocks::spawn` path below.
 
 // --------------------------------------------------------------------- rig
 

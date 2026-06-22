@@ -61,8 +61,12 @@ Severity: 🔴 correctness/blocker · 🟡 should-fix · 🟢 polish.
   `mocks::spawn_support` no longer publishes fake QSOs. Still pending: **ADIF**
   import/export and the **peer-merge** G-set; and `build_log` (in `qso/shell.rs`)
   still stamps placeholder **band/freq/mode** until `OperatingState` is published.
-- 🟡 **Scanner is still mock** even in real mode (`mocks::spawn_support`);
-  the clock is real wall-clock. Real scanner strategy still needed.
+- ✅ **Scanner is real in real mode** — the `scanner` sweep engine + `core::scan` shell
+  (spawned by `core::spawn`): time-slices the RX across 40/20/15/10 in FT8+FT4, 2-slot
+  dwell, loops until cancel, blocks TX (holds the interlock), restores band+mode on cancel.
+  `mocks::spawn` still backs the no-hardware path. **To tune on-air:** the hop cadence —
+  a mode change restarts capture, so the partial first slot after each retune is skipped
+  and the 2-slot count starts on the next clean boundary.
 
 ## Audio capture
 

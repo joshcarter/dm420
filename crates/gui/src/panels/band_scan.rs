@@ -1,17 +1,29 @@
-//! Band Scan panel: two-column band blocks + a Scan/Cancel lit key. The band list
-//! and its heard/unworked counts come live from the bus (`scanner/candidates`);
-//! the scan-sweep animation is panel-owned view state that self-advances each
-//! frame from the frame delta.
+//! Band Scan panel: two-column band blocks + a Scan/Cancel lit key.
+//!
+//! Fully bus-driven now that the real scanner exists (`core::scan`): the
+//! Scan/Cancel key issues `ScannerCommand::StartSurvey`/`Cancel`, and the run
+//! status, the highlighted (currently-dwelling) band, and each band's heard/unworked
+//! counts all come live from `scanner/state` + `scanner/candidates`. The four bands
+//! (40/20/15/10) are a fixed layout per the spec; counts read 0 until a scan has
+//! visited them.
+
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use eframe::egui;
 use egui::{Align2, CornerRadius, Pos2, Rect, Stroke};
-use types::{Band, BandActivity};
+use types::{Band, BandActivity, ScanStatus};
 
 use super::{Panel, PanelCtx};
 use crate::chrome::{key_cell, lcd_panel, measure, panel_header, split_block};
 use crate::theme::*;
 
-const SCAN_DWELL: f32 = 2.5; // seconds per band
+/// The fixed band layout (spec: 40/20 left column, 15/10 right column) — also the
+/// band set handed to the scanner on Scan.
+const SCAN_BANDS: [Band; 4] = [Band::B40m, Band::B20m, Band::B15m, Band::B10m];
+
+/// Slots dwelled per band/mode. The scanner clamps to ≥2 (even/odd parity); we ask
+/// for exactly two.
+const DWELL_SLOTS: u8 = 2;
 
 /// Short display label for a band, e.g. `"40m"`.
 fn band_label(b: Band) -> &'static str {
@@ -29,41 +41,25 @@ fn band_label(b: Band) -> &'static str {
     }
 }
 
-pub struct BandScan {
-    running: bool,
-    active_band: usize,
-    accum: f32,    // seconds into the current band dwell
-    last_min: u32, // "Last scan: N min ago" (0 == just now)
+/// "just now" / "N min ago" for the last-scan timestamp (epoch ms).
+fn ago(then_ms: i64) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(then_ms);
+    let mins = (now - then_ms).max(0) / 60_000;
+    if mins == 0 {
+        "just now".to_string()
+    } else {
+        format!("{mins} min ago")
+    }
 }
+
+pub struct BandScan;
 
 impl BandScan {
     pub fn new() -> Self {
-        Self {
-            running: false,
-            active_band: 0,
-            accum: 0.0,
-            last_min: 4,
-        }
-    }
-
-    /// Advance the scan clock, stepping bands every `SCAN_DWELL` and stopping
-    /// after the last band. `n` is the live band count from the bus.
-    fn tick(&mut self, dt: f32, n: usize) {
-        if !self.running || n == 0 {
-            return;
-        }
-        self.accum += dt;
-        while self.accum >= SCAN_DWELL {
-            self.accum -= SCAN_DWELL;
-            self.active_band += 1;
-            if self.active_band >= n {
-                self.running = false;
-                self.active_band = 0;
-                self.accum = 0.0;
-                self.last_min = 0;
-                break;
-            }
-        }
+        Self
     }
 }
 
@@ -73,28 +69,33 @@ impl Panel for BandScan {
     }
 
     fn ui(&mut self, ctx: &mut PanelCtx, block: Rect) {
-        let bands = ctx.bus.band_activity();
-        self.tick(ctx.dt as f32, bands.len());
+        // Live scanner run state and per-band counts from the bus.
+        let state = ctx.bus.scanner();
+        let scanning = state
+            .as_ref()
+            .map(|s| s.status == ScanStatus::Scanning)
+            .unwrap_or(false);
+        let current = state.as_ref().and_then(|s| s.current);
+        let last_scan = state.as_ref().and_then(|s| s.last_scan);
+        let activity = ctx.bus.band_activity();
 
         let pal = ctx.pal;
         let painter = ctx.painter;
         let (header, screen) = split_block(block);
 
-        let active_label = bands
-            .get(self.active_band)
-            .map(|b| band_label(b.band))
-            .unwrap_or("");
-        let status = if self.running {
-            format!("Scanning {active_label} …")
-        } else if self.last_min == 0 {
-            "Last scan: just now".to_string()
+        let status = if scanning {
+            let lbl = current.map(band_label).unwrap_or("");
+            format!("Scanning {lbl} …")
         } else {
-            format!("Last scan: {} min ago", self.last_min)
+            match last_scan {
+                Some(ts) => format!("Last scan: {}", ago(ts.0)),
+                None => "Idle".to_string(),
+            }
         };
         panel_header(painter, header, pal, "Band Scan", &status, ctx.active);
 
         // Scan / Cancel button (lit accent key in a recessed track), header-right.
-        let label = if self.running { "CANCEL" } else { "SCAN" };
+        let label = if scanning { "CANCEL" } else { "SCAN" };
         let cy = header.center().y;
         let cell_w = measure(painter, &tracked(label), heading_bold(9.0)) + 22.0;
         let track_w = cell_w + 4.0;
@@ -117,13 +118,10 @@ impl Panel for BandScan {
             ctx.ui.id().with("scan_btn"),
         );
         if resp.clicked() {
-            if self.running {
-                self.running = false;
-                self.accum = 0.0;
+            if scanning {
+                ctx.bus.cancel_scan();
             } else {
-                self.running = true;
-                self.active_band = 0;
-                self.accum = 0.0;
+                ctx.bus.start_scan(SCAN_BANDS.to_vec(), DWELL_SLOTS);
             }
         }
 
@@ -140,92 +138,90 @@ impl Panel for BandScan {
         );
         let left_half = Rect::from_min_max(screen.min, Pos2::new(mid, screen.bottom()));
         let right_half = Rect::from_min_max(Pos2::new(mid, screen.top()), screen.max);
-        self.draw_column(painter, left_half, pal, &bands, &[0, 1]);
-        self.draw_column(painter, right_half, pal, &bands, &[2, 3]);
+        draw_column(painter, left_half, pal, &activity, current, &[SCAN_BANDS[0], SCAN_BANDS[1]]);
+        draw_column(painter, right_half, pal, &activity, current, &[SCAN_BANDS[2], SCAN_BANDS[3]]);
     }
 }
 
-impl BandScan {
-    fn draw_column(
-        &self,
-        painter: &egui::Painter,
-        half: Rect,
-        pal: &Palette,
-        bands: &[BandActivity],
-        idxs: &[usize; 2],
-    ) {
-        const BLOCK_H: f32 = 30.0;
-        const BLOCK_GAP: f32 = 7.0;
-        let total = BLOCK_H * 2.0 + BLOCK_GAP;
-        let top = half.center().y - total / 2.0;
-        let content_left = half.left() + 12.0;
+/// Draw one column's two band blocks. Each shows the band as a large label with its
+/// heard / unworked counts (looked up from `activity`, 0 if not yet scanned); the
+/// block highlights when it is the band the scanner is currently dwelling on.
+fn draw_column(
+    painter: &egui::Painter,
+    half: Rect,
+    pal: &Palette,
+    activity: &[BandActivity],
+    current: Option<Band>,
+    bands: &[Band; 2],
+) {
+    const BLOCK_H: f32 = 30.0;
+    const BLOCK_GAP: f32 = 7.0;
+    let total = BLOCK_H * 2.0 + BLOCK_GAP;
+    let top = half.center().y - total / 2.0;
+    let content_left = half.left() + 12.0;
 
-        for (slot, &bi) in idxs.iter().enumerate() {
-            let Some(activity) = bands.get(bi) else {
-                continue;
-            };
-            let band = band_label(activity.band);
-            let heard = activity.stations_seen;
-            let unworked = activity.unworked;
-            let active = self.running && self.active_band == bi;
-            let by = top + slot as f32 * (BLOCK_H + BLOCK_GAP);
-            let bcy = by + BLOCK_H / 2.0;
+    for (slot, &band) in bands.iter().enumerate() {
+        let act = activity.iter().find(|a| a.band == band);
+        let heard = act.map_or(0, |a| a.stations_seen);
+        let unworked = act.map_or(0, |a| a.unworked);
+        let active = current == Some(band);
+        let by = top + slot as f32 * (BLOCK_H + BLOCK_GAP);
+        let bcy = by + BLOCK_H / 2.0;
 
-            if active {
-                painter.rect_filled(
-                    Rect::from_min_max(
-                        Pos2::new(content_left, by),
-                        Pos2::new(content_left + 2.0, by + BLOCK_H),
-                    ),
-                    CornerRadius::ZERO,
-                    pal.accent,
-                );
-            }
-            let num_x = content_left + 10.0;
-            let num_color = if active { pal.accent } else { pal.sub };
-            painter.text(
-                Pos2::new(num_x, bcy),
-                Align2::LEFT_CENTER,
-                band,
-                heading_bold(22.0),
-                num_color,
-            );
-
-            let text_x = num_x + 40.0 + 9.0;
-            let n1 = format!("{heard}");
-            let w1 = painter
-                .text(
-                    Pos2::new(text_x, bcy - 7.0),
-                    Align2::LEFT_CENTER,
-                    &n1,
-                    mono(11.0),
-                    pal.legend,
-                )
-                .width();
-            painter.text(
-                Pos2::new(text_x + w1 + 3.0, bcy - 7.0),
-                Align2::LEFT_CENTER,
-                "heard",
-                mono(11.0),
-                pal.dim,
-            );
-            let n2 = format!("{unworked}");
-            let w2 = painter
-                .text(
-                    Pos2::new(text_x, bcy + 7.0),
-                    Align2::LEFT_CENTER,
-                    &n2,
-                    mono(11.0),
-                    pal.accent,
-                )
-                .width();
-            painter.text(
-                Pos2::new(text_x + w2 + 3.0, bcy + 7.0),
-                Align2::LEFT_CENTER,
-                "unworked",
-                mono(11.0),
-                pal.dim,
+        if active {
+            painter.rect_filled(
+                Rect::from_min_max(
+                    Pos2::new(content_left, by),
+                    Pos2::new(content_left + 2.0, by + BLOCK_H),
+                ),
+                CornerRadius::ZERO,
+                pal.accent,
             );
         }
+        let num_x = content_left + 10.0;
+        let num_color = if active { pal.accent } else { pal.sub };
+        painter.text(
+            Pos2::new(num_x, bcy),
+            Align2::LEFT_CENTER,
+            band_label(band),
+            heading_bold(22.0),
+            num_color,
+        );
+
+        let text_x = num_x + 40.0 + 9.0;
+        let n1 = format!("{heard}");
+        let w1 = painter
+            .text(
+                Pos2::new(text_x, bcy - 7.0),
+                Align2::LEFT_CENTER,
+                &n1,
+                mono(11.0),
+                pal.legend,
+            )
+            .width();
+        painter.text(
+            Pos2::new(text_x + w1 + 3.0, bcy - 7.0),
+            Align2::LEFT_CENTER,
+            "heard",
+            mono(11.0),
+            pal.dim,
+        );
+        let n2 = format!("{unworked}");
+        let w2 = painter
+            .text(
+                Pos2::new(text_x, bcy + 7.0),
+                Align2::LEFT_CENTER,
+                &n2,
+                mono(11.0),
+                pal.accent,
+            )
+            .width();
+        painter.text(
+            Pos2::new(text_x + w2 + 3.0, bcy + 7.0),
+            Align2::LEFT_CENTER,
+            "unworked",
+            mono(11.0),
+            pal.dim,
+        );
     }
 }

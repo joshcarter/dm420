@@ -20,15 +20,19 @@ Where something is unusually critical, that's called out in prose, not with a ta
 The mission is throughput: find workable stations across bands/modes fast, work them,
 don't double-work them, capture everything, and share the log across operating positions.
 
-### 1. Build the real `scanner` crate — *the headline Field Day feature*
-The band scanner is the last remaining mock (`mocks::spawn_support`); `qso` and
-`logbook` are now real. It is the single biggest lever on "work many stations fast,"
-because it's how an operator discovers where the workable, **unworked** Field Day
-stations are. Mirror the `mocks::spawn` / `core::spawn` pattern, one topic at a time
-(spec: `docs/band_scanner.md`).
+### 1. Band scanner — *the headline Field Day feature* (base **shipped**; enhancements next)
+**Shipped.** The `scanner` crate (pure sweep engine) + the `core::scan` shell now
+time-slice the receiver across 40/20/15/10 in **both FT8 and FT4** (mode-major, to minimize
+capture restarts), dwelling **2 slots per stop** (even/odd parity) and **looping until
+cancelled** — blocking TX for the sweep (holds the interlock) and restoring the operator's
+band+mode on cancel. Per-band heard/unworked counts come from live decodes cross-referenced
+against the logbook. Wired into `core::spawn`; it was the last real-mode mock. Spec:
+`docs/band_scanner.md`. It is the single biggest lever on "work many stations fast,"
+because it's how an operator discovers where the workable, **unworked** Field Day stations
+are.
 
-**Extend the scan to sweep modes *and* bands (Josh, 2026-06-22).** The base spec only
-time-slices bands; for Field Day, scan the mode×band×offset space:
+**Remaining enhancements — sweep the mode×band×*offset* space (Josh, 2026-06-22).** The
+shipped sweep covers mode×band at each band's calling frequency; extend it for Field Day:
 
 > Switch to mode [FT4, FT8]; for each:
 > &nbsp;&nbsp;Switch to band at calling freq, −1000 Hz, and +1000 Hz (maybe ±2000 Hz as well); for each:
@@ -36,13 +40,17 @@ time-slices bands; for Field Day, scan the mode×band×offset space:
 > &nbsp;&nbsp;&nbsp;&nbsp;Report on all heard stations and all unworked stations, filtered by those doing the Field Day exchange.
 > &nbsp;&nbsp;&nbsp;&nbsp;May also need to filter by SNR so we're not chasing −20 dB stations we'll never hit.
 
-Implications to design in:
-- **Mode dimension** on top of the band/offset sweep (the scanner today is band-only).
+Still to design in (the **mode dimension, 2-slot dwell, and loop are done**):
+- **Per-offset sweep** — also dwell at the calling freq −1000/+1000 Hz (maybe ±2000) to
+  cover more than one ~3 kHz passband per band. Each offset stop needs its own ≥2 slots.
 - **Filter to Field Day participants** — stations sending the FD `<class> <section>`
   exchange (the parser already understands this form; `gui/src/settings.rs:145` notes
   the `ContestProfile` UI is still TODO).
 - **SNR floor filter** so the report surfaces only workable signals.
-- **Unworked-aware**, per band *and* per mode (ties into item 3).
+- **Per-mode unworked** — today "unworked" is per band (any mode); split per band *and*
+  mode if Field Day scoring needs it (ties into item 3).
+- **Configurable dwell / interval count** — Josh's note wants 5–10 intervals; the shipped
+  default is 2 (the parity minimum). Surface it (and band selection) in the panel.
 
 ### 2. Decode archive — persist *every* heard and sent message
 **Raw capture is shipped** — the `archive` crate. When `[archive] decodes` names a file

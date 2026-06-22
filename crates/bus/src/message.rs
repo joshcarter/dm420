@@ -58,3 +58,4 @@ bus_message!(InterlockRequest, Command);
 bus_message!(InterlockReply, Command);
 bus_message!(QsoCommand, Command);
 bus_message!(ScannerCommand, Command);
+bus_message!(ScannerAck, Command);

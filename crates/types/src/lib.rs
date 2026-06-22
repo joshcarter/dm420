@@ -328,9 +328,45 @@ pub enum SessionCommand {
     TuneBand(Band),
 }
 
-// NOTE: `calling_freq(mode, band) -> AbsHz` is mode-owned *reference data*, not a
-// message — it lives in the `modes` crate, not here. One source of truth for
-// "where FT8 lives on 20m".
+/// The dial (calling) frequency for a band in a given mode — the **one source of
+/// truth** for "where FT8/FT4 lives on each band." FT8 and FT4 have distinct
+/// calling frequencies (e.g. 20 m is 14.074 FT8, 14.080 FT4); the architecture-only
+/// modes fall back to the FT8 table. `None` for a `(band, mode)` with no established
+/// calling frequency (FT4 has none on 160 m). Pure reference data keyed by the
+/// shared `Band`/`OverAirMode` vocabulary, so the GUI, the session layer, and the
+/// band scanner all resolve a band to a frequency the same way. (Lives here, not in
+/// `modes`, because `modes` is the vendored, dependency-free decoder crate and can't
+/// see these enums.)
+pub fn calling_freq(band: Band, mode: OverAirMode) -> Option<AbsHz> {
+    let hz = match mode {
+        OverAirMode::Ft4 => match band {
+            Band::B160m => return None, // FT4 has no established 160 m calling freq
+            Band::B80m => 3_575_000,
+            Band::B40m => 7_047_500,
+            Band::B30m => 10_140_000,
+            Band::B20m => 14_080_000,
+            Band::B17m => 18_104_000,
+            Band::B15m => 21_140_000,
+            Band::B12m => 24_919_000,
+            Band::B10m => 28_180_000,
+            Band::B6m => 50_318_000,
+        },
+        // FT8, and a sensible default for the architecture-only modes.
+        OverAirMode::Ft8 | OverAirMode::Psk31 | OverAirMode::Rtty => match band {
+            Band::B160m => 1_840_000,
+            Band::B80m => 3_573_000,
+            Band::B40m => 7_074_000,
+            Band::B30m => 10_136_000,
+            Band::B20m => 14_074_000,
+            Band::B17m => 18_100_000,
+            Band::B15m => 21_074_000,
+            Band::B12m => 24_915_000,
+            Band::B10m => 28_074_000,
+            Band::B6m => 50_313_000,
+        },
+    };
+    Some(AbsHz(hz))
+}
 
 // =====================================================================
 // §5  Selection + QSO
@@ -558,6 +594,13 @@ pub enum ScannerCommand {
         dwell_slots: u8,
     },
     Cancel,
+}
+
+/// Reply to a [`ScannerCommand`] — receipt only; the real outcome shows up as a new
+/// [`ScannerState`] on `scanner/state`.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ScannerAck {
+    Ok,
 }
 
 /// `scanner/state` (State) — written by the scanner.
@@ -852,6 +895,25 @@ mod tests {
         round_trip(ContestProfile::ArrlFieldDay);
         round_trip(SignalSource::Received);
         round_trip(SignalSource::OwnTx);
+    }
+
+    #[test]
+    fn calling_freq_is_mode_specific() {
+        // FT8 and FT4 sit on different calling frequencies on the same band.
+        assert_eq!(
+            calling_freq(Band::B20m, OverAirMode::Ft8),
+            Some(AbsHz(14_074_000))
+        );
+        assert_eq!(
+            calling_freq(Band::B20m, OverAirMode::Ft4),
+            Some(AbsHz(14_080_000))
+        );
+        // FT4 has no established 160 m calling frequency; FT8 does.
+        assert_eq!(calling_freq(Band::B160m, OverAirMode::Ft4), None);
+        assert_eq!(
+            calling_freq(Band::B160m, OverAirMode::Ft8),
+            Some(AbsHz(1_840_000))
+        );
     }
 
     #[test]

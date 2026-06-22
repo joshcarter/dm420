@@ -2,6 +2,26 @@
 
 This document describes a new type of UI panel.
 
+## Status — implemented (June 2026)
+
+The scanner is **built and wired**: the `scanner` crate's pure sweep engine + the
+`core::scan` I/O shell, spawned by `core::spawn` in real mode. It follows the spec
+below, with three agreed tweaks:
+
+- **Two intervals per stop** (not one): it dwells ≥2 slots per band/mode so both
+  even/odd TX parities are covered — a one-slot dwell would miss every station whose
+  transmit turn is the other slot.
+- **Both FT8 and FT4** are scanned. The plan is *mode-major* (all bands in FT8, then
+  all bands in FT4) because a mode change restarts audio capture while a band change is
+  a cheap retune — so mode changes are minimized.
+- **Loops until the user cancels** (rather than one pass then auto-return), so later
+  passes pick up traffic an earlier one missed. Cancel restores the operator's prior
+  band + mode (the spec's "return to normal operating state").
+
+Per-band heard/unworked counts come from live decodes cross-referenced against the
+logbook (`unworked` = heard on that band but not yet logged on that band). The
+original spec follows.
+
 The band scanner will be selectively activated by the user, and when
 it runs, it blocks radio transmissions and does the following:
 

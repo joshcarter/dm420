@@ -796,6 +796,7 @@ dependencies = [
  "modes",
  "net",
  "rig",
+ "scanner",
  "serde",
  "serde_json",
  "tempfile",

@@ -76,40 +76,11 @@ fn parse_band(arg: &str) -> Option<Band> {
     })
 }
 
-/// The dial (calling) frequency in Hz for a band in a given mode. FT8 and FT4
-/// have distinct calling frequencies per band (e.g. 20 m is 14.074 for FT8,
-/// 14.080 for FT4); the architecture-only modes fall back to the FT8 table.
-/// Returns `None` for a (band, mode) pair with no established calling frequency
-/// (FT4 has none on 160 m).
+/// The dial (calling) frequency in Hz for a band in a given mode. Thin GUI-side
+/// wrapper over [`bus::types::calling_freq`] — the shared source of truth — that
+/// unwraps the `AbsHz` to the `u64` the send/parse path uses.
 pub fn calling_freq_hz(band: Band, mode: OverAirMode) -> Option<u64> {
-    let hz = match mode {
-        OverAirMode::Ft4 => match band {
-            Band::B160m => return None, // FT4 has no established 160 m calling freq
-            Band::B80m => 3_575_000,
-            Band::B40m => 7_047_500,
-            Band::B30m => 10_140_000,
-            Band::B20m => 14_080_000,
-            Band::B17m => 18_104_000,
-            Band::B15m => 21_140_000,
-            Band::B12m => 24_919_000,
-            Band::B10m => 28_180_000,
-            Band::B6m => 50_318_000,
-        },
-        // FT8, and a sensible default for the architecture-only modes.
-        OverAirMode::Ft8 | OverAirMode::Psk31 | OverAirMode::Rtty => match band {
-            Band::B160m => 1_840_000,
-            Band::B80m => 3_573_000,
-            Band::B40m => 7_074_000,
-            Band::B30m => 10_136_000,
-            Band::B20m => 14_074_000,
-            Band::B17m => 18_100_000,
-            Band::B15m => 21_074_000,
-            Band::B12m => 24_915_000,
-            Band::B10m => 28_074_000,
-            Band::B6m => 50_313_000,
-        },
-    };
-    Some(hz)
+    bus::types::calling_freq(band, mode).map(|a| a.0)
 }
 
 /// The next auto-generated message for the current selection: a CQ call when the

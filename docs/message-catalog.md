@@ -259,6 +259,7 @@ pub enum ScannerCommand {
     StartSurvey { bands: Vec<Band>, dwell_slots: u8 }, // dwell_slots >= 2 (even/odd slots)
     Cancel,
 }
+pub enum ScannerAck { Ok } // receipt for a ScannerCommand (scanner/state carries the result)
 pub struct ScannerState { pub status: ScanStatus, pub current: Option<Band>, pub last_scan: Option<Timestamp> }
 pub enum ScanStatus { Idle, Scanning }
 

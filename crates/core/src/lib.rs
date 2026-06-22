@@ -31,6 +31,7 @@ mod interlock;
 mod map;
 mod parse;
 mod rig_adapter;
+mod scan;
 mod tx;
 
 pub use control::{AudioControl, CoreControl, RigControl, TxControl};
@@ -252,6 +253,10 @@ pub fn spawn(bus: &BusHandle, cfg: CoreConfig) -> CoreControl {
         archive::spawn(bus, radio.clone(), path);
     }
 
+    // The band scanner (spawned after the decode match below) needs the radio id,
+    // but that match consumes `radio` — clone it here while it's still owned.
+    let scanner_radio = radio.clone();
+
     // The active mode for the slot clock below: live capture follows it through
     // `AudioControl`, so capture this only as the WAV/none fallback.
     let fallback_proto = match &decode {
@@ -271,6 +276,11 @@ pub fn spawn(bus: &BusHandle, cfg: CoreConfig) -> CoreControl {
         }
         DecodeSource::None => {}
     }
+
+    // Band scanner: on demand, time-slices the receiver across bands/modes, holding
+    // the TX interlock for the sweep. Needs the in-process AudioControl (a mode
+    // switch restarts capture — not a bus op) and the granter, both owned here.
+    scan::spawn(bus, scanner_radio, control.audio.clone(), granter.clone());
 
     // Slot-timing clock: the single authoritative slot identity (`clock/status`),
     // mode-aware so its slot numbering matches the decoder's and the QSO tick

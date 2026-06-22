@@ -81,6 +81,22 @@ impl Granter {
         }
     }
 
+    /// Extend the current holder's grant by another TTL. Returns `true` if `token`
+    /// is the live holder (its expiry was pushed out), `false` otherwise. Lets a
+    /// long-running holder — the band scanner, which holds TX off for a whole
+    /// multi-minute sweep — keep the token alive past the TTL **without** a
+    /// release/re-acquire gap another client could slip a transmission through.
+    pub fn refresh(&self, token: t::InterlockToken) -> bool {
+        let mut s = self.state.lock().unwrap();
+        match s.held {
+            Some((held, _)) if held == token => {
+                s.held = Some((held, Instant::now() + self.ttl));
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Whether `token` is the current, unexpired holder — checked on every keying
     /// PttRequest by the rig adapter.
     pub fn validate(&self, token: t::InterlockToken) -> bool {
@@ -163,5 +179,15 @@ mod tests {
         // Already past its TTL: does not validate, and the next acquire succeeds.
         assert!(!g.validate(a));
         assert!(matches!(g.acquire(), t::InterlockReply::Granted { .. }));
+    }
+
+    #[test]
+    fn refresh_extends_only_for_the_holder() {
+        let g = Granter::new(Duration::from_secs(60));
+        let a = token(g.acquire());
+        assert!(g.refresh(a)); // the holder can extend its grant
+        assert!(!g.refresh(t::InterlockToken(9999))); // a non-holder cannot
+        assert!(matches!(g.release(a), t::InterlockReply::Released));
+        assert!(!g.refresh(a)); // nothing to refresh once released
     }
 }

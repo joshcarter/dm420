@@ -221,13 +221,10 @@ impl BusView {
         let applied = Arc::new(Mutex::new(settings.hardware()));
         let _guard = rt.enter();
         let control = if real {
-            // Real rig + decode + clock + logbook producers; mocks still drive only
-            // the topics `core` doesn't cover yet (the scanner). Note: decodes are
-            // NOT among them — `spawn_support` deliberately omits `run_decodes`, so
-            // the decode stream is the real decoder's alone.
-            let control = app_core::spawn(&bus, settings.core_config());
-            mocks::spawn_support(&bus);
-            control
+            // Real rig + decode + clock + logbook + band-scanner producers —
+            // `core::spawn` covers them all now (the scanner is real too), so no mock
+            // support is needed in real mode. The decode stream is the real decoder's.
+            app_core::spawn(&bus, settings.core_config())
         } else {
             mocks::spawn(&bus);
             app_core::CoreControl::default()
@@ -610,6 +607,34 @@ impl BusView {
                 .request::<RigCommand, app_core::CommandResult>(
                     &Topic::RigCommand(mocks::radio_id()),
                     RigCommand::SetFreq(AbsHz(hz)),
+                    Duration::from_secs(1),
+                )
+                .await;
+        });
+    }
+
+    /// Start a band-scan survey over `bands`, dwelling `dwell_slots` slots per
+    /// band/mode (the scanner clamps to ≥2 for even/odd parity). Fire-and-forget on
+    /// the bus runtime, like [`set_freq`]; progress comes back on `scanner/state`
+    /// and `scanner/candidates`. In mock mode (no scanner server) it times out
+    /// harmlessly.
+    pub fn start_scan(&self, bands: Vec<Band>, dwell_slots: u8) {
+        self.send_scanner_command(ScannerCommand::StartSurvey { bands, dwell_slots });
+    }
+
+    /// Cancel the running survey; the scanner restores the operator's prior
+    /// band + mode.
+    pub fn cancel_scan(&self) {
+        self.send_scanner_command(ScannerCommand::Cancel);
+    }
+
+    fn send_scanner_command(&self, cmd: ScannerCommand) {
+        let bus = self.bus.clone();
+        self._rt.spawn(async move {
+            let _ = bus
+                .request::<ScannerCommand, ScannerAck>(
+                    &Topic::ScannerCommand,
+                    cmd,
                     Duration::from_secs(1),
                 )
                 .await;
