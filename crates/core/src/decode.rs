@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bus::types as t;
 use bus::{BusHandle, Topic};
-use modes::{Decode as ModeDecode, Protocol, decode, decode_streaming};
+use modes::{CallHash, Decode as ModeDecode, Protocol, decode, decode_streaming};
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -211,13 +211,20 @@ fn spawn_decode_pass(
     audio: Vec<f32>,
     slot_start_ms: i64,
     published: Arc<Mutex<HashMap<i64, HashSet<String>>>>,
+    call_hash: Arc<Mutex<CallHash>>,
     pass: &'static str,
     cleanup: bool,
 ) {
     std::thread::spawn(move || {
         let secs = audio.len() / DECODE_RATE as usize;
         let mut n = 0usize;
-        decode_streaming(&audio, DECODE_RATE, proto, |d| {
+        // Decode against a snapshot of the session callsign table so the CPU-heavy
+        // decode stays lock-free, then fold what this slot learned back in. The
+        // snapshot lets a compound call heard earlier (e.g. `CQ W1AW/0`) resolve a
+        // hashed `<...>` reply that lands in a later slot — a fresh-per-slot table
+        // could only resolve calls that recur as a literal within the same slot.
+        let mut hash = call_hash.lock().unwrap().clone();
+        decode_streaming(&audio, DECODE_RATE, proto, &mut hash, |d| {
             // Insert under the lock, publish outside it (the guard drops at the `;`).
             let fresh = published
                 .lock()
@@ -230,6 +237,7 @@ fn spawn_decode_pass(
                 n += 1;
             }
         });
+        call_hash.lock().unwrap().merge_from(&hash);
         if cleanup {
             published.lock().unwrap().remove(&slot_start_ms);
         }
@@ -391,6 +399,11 @@ fn run_stream(
     let early_trigger = modes::slot_period(proto) - DECODE_TAIL;
     let mut early_decoded = false;
     let published: Arc<Mutex<HashMap<i64, HashSet<String>>>> = Arc::new(Mutex::new(HashMap::new()));
+    // Session-lived callsign hash table, shared across this session's slots so a
+    // hashed `<...>` reference resolves to a call heard in an earlier slot. Like
+    // the spectrogram and slot alignment, it's per-session state — a reconnect
+    // starts fresh.
+    let call_hash: Arc<Mutex<CallHash>> = Arc::new(Mutex::new(CallHash::new()));
 
     let mut ever_healthy = false;
     let mut silent_for = Duration::ZERO;
@@ -471,6 +484,7 @@ fn run_stream(
                 audio,
                 slot_start_ms,
                 published.clone(),
+                call_hash.clone(),
                 "full",
                 true,
             );
@@ -485,6 +499,7 @@ fn run_stream(
                 audio,
                 slot_start_ms,
                 published.clone(),
+                call_hash.clone(),
                 "early",
                 false,
             );

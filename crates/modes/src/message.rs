@@ -32,7 +32,7 @@ pub enum MessageType {
 
 /// Session callsign hash table: maps the 22-bit hash to the resolved callsign so
 /// later `<...>`/hashed references can be filled in. Cheap and small.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct CallHash {
     by_n22: HashMap<u32, String>,
 }
@@ -40,6 +40,19 @@ pub struct CallHash {
 impl CallHash {
     pub fn new() -> CallHash {
         CallHash::default()
+    }
+
+    /// Fold every `hash → callsign` entry from `other` into this table. The live
+    /// pipeline decodes each slot against a throwaway snapshot of the session
+    /// table (so decode threads stay lock-free), then merges the calls that slot
+    /// learned back here — that's how a compound call heard in one slot (e.g. a
+    /// `CQ W1AW/0`) stays resolvable when its hashed `<...>` reply lands a slot
+    /// later. Same hash → same call (barring a 22-bit collision), so first writer
+    /// wins.
+    pub fn merge_from(&mut self, other: &CallHash) {
+        for (n22, call) in &other.by_n22 {
+            self.by_n22.entry(*n22).or_insert_with(|| call.clone());
+        }
     }
 
     /// Hash a (trimmed) callsign and remember it. Returns (n22, n12, n10), or
@@ -658,5 +671,19 @@ mod tests {
         chk[10] = 0;
         chk[11] = 0;
         assert_eq!(stored, crc::compute_crc(&chk, 82));
+    }
+
+    #[test]
+    fn merge_carries_calls_across_tables() {
+        // A call learned in one table only resolves in another after a merge —
+        // the mechanism that lets a hashed `<...>` reply resolve a slot after the
+        // CQ that taught us the call.
+        let mut learned = CallHash::new();
+        let (n22, _, _) = learned.save("W1AW/0").unwrap();
+
+        let mut session = CallHash::new();
+        assert_eq!(session.lookup(n22, 0), None);
+        session.merge_from(&learned);
+        assert_eq!(session.lookup(n22, 0), Some("W1AW/0"));
     }
 }

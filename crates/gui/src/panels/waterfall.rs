@@ -6,8 +6,8 @@ use egui::{Align2, Color32, ColorImage, Pos2, Rect, TextureHandle, TextureOption
 use std::collections::{HashMap, HashSet};
 
 use types::{
-    Band, Decode, DecodeContent, ExchangePayload, HealthState, OverAirMode, ParsedMessage,
-    QsoPhase, Signoff, SlotId, SpectrumRow, SubsystemHealth, SubsystemId,
+    Band, Callsign, Decode, DecodeContent, ExchangePayload, HealthState, OverAirMode,
+    ParsedMessage, QsoPhase, Signoff, SlotId, SpectrumRow, SubsystemHealth, SubsystemId,
 };
 
 use app_core::{LineProfile, Protocol, SerialConfig};
@@ -30,20 +30,46 @@ fn fmt_snr(snr: i8) -> String {
 /// The human-readable body of a decode (`CQ EA7KW IM67`, an exchange, etc.).
 fn decode_text(d: &Decode) -> String {
     match &d.content {
-        DecodeContent::Slotted { message, .. } => match message {
+        DecodeContent::Slotted { message, raw, .. } => match message {
             ParsedMessage::Cq { caller, grid, .. } => match grid {
-                Some(g) => format!("CQ {} {}", caller.0, g.0),
-                None => format!("CQ {}", caller.0),
+                Some(g) => format!("CQ {} {}", display_call(caller, raw), g.0),
+                None => format!("CQ {}", display_call(caller, raw)),
             },
             ParsedMessage::Exchange { to, from, payload } => {
-                format!("{} {} {}", to.0, from.0, fmt_payload(payload))
+                format!(
+                    "{} {} {}",
+                    display_call(to, raw),
+                    display_call(from, raw),
+                    fmt_payload(payload)
+                )
             }
             ParsedMessage::Signoff { to, from, kind } => {
-                format!("{} {} {}", to.0, from.0, fmt_signoff(*kind))
+                format!(
+                    "{} {} {}",
+                    display_call(to, raw),
+                    display_call(from, raw),
+                    fmt_signoff(*kind)
+                )
             }
             ParsedMessage::Free(s) | ParsedMessage::Raw(s) => s.clone(),
         },
         DecodeContent::Streaming { text } => text.clone(),
+    }
+}
+
+/// Re-add the decoder's `<…>` hashed-call cue for display. Parsing strips the
+/// brackets so a resolved hash matches/logs as the real station (`<W1AW/0>` →
+/// `W1AW/0`); but when the decoder's verbatim `raw` line shows the call
+/// bracketed, it arrived as a 22-bit hash we resolved from the session table, not
+/// a directly-decoded call. Surfacing the brackets here keeps that lower-
+/// confidence cue visible (a hash *could* collide). An unresolved hash already
+/// reads `<...>` as the call itself, so it falls through the `else` unchanged.
+fn display_call(call: &Callsign, raw: &str) -> String {
+    let bracketed = format!("<{}>", call.0);
+    if raw.contains(&bracketed) {
+        bracketed
+    } else {
+        call.0.clone()
     }
 }
 
@@ -2324,4 +2350,20 @@ fn draw_fault_body(painter: &egui::Painter, screen: Rect, pal: &Palette, health:
         mono(9.0),
         pal.dim,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_call_marks_resolved_hashes() {
+        let raw = "W4LL <W1AW/0> -10";
+        // The hashed call gets its resolved-hash brackets back for display…
+        assert_eq!(display_call(&Callsign("W1AW/0".into()), raw), "<W1AW/0>");
+        // …but a directly-decoded call in the same line stays bare.
+        assert_eq!(display_call(&Callsign("W4LL".into()), raw), "W4LL");
+        // An unresolved hash is already `<...>` as the call itself; leave it be.
+        assert_eq!(display_call(&Callsign("<...>".into()), "W4LL <...> -10"), "<...>");
+    }
 }

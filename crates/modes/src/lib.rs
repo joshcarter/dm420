@@ -31,7 +31,7 @@ mod waterfall;
 
 pub use decode::{Decode, decode, decode_streaming};
 pub use encode::{synth_ft4, synth_ft8};
-pub use message::MessageType;
+pub use message::{CallHash, MessageType};
 
 /// Synthesize a full slot of audio for a text message (e.g. `"CQ K1ABC FN42"`) in
 /// the given `protocol`, at the given audio frequency and sample rate. Returns

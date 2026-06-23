@@ -45,16 +45,30 @@ fn parse_cq(rest: &[&str], text: &str) -> ParsedMessage {
     let contest = mods.first().and_then(|m| contest_tag(m));
 
     ParsedMessage::Cq {
-        caller: Callsign((*caller).to_string()),
+        caller: callsign(caller),
         contest,
         grid,
     }
 }
 
+/// Build a [`Callsign`] from a decoded token, stripping the angle brackets the
+/// decoder puts around a *hashed* callsign once it has resolved the 22-bit hash
+/// to a full call (`<W1AW/0>` → `W1AW/0`). Stripping is what lets a compound
+/// station's hashed reply compare equal to the partner the engine is working
+/// (and log/plot under the real call). The unresolved sentinel `<...>` is left
+/// verbatim — it names no station, so it must never match a real partner.
+fn callsign(tok: &str) -> Callsign {
+    let resolved = tok
+        .strip_prefix('<')
+        .and_then(|s| s.strip_suffix('>'))
+        .filter(|inner| *inner != "...");
+    Callsign(resolved.unwrap_or(tok).to_string())
+}
+
 /// `TO FROM [exchange]` — signoff, report, grid, R-report, or Field Day exchange.
 fn parse_directed(to: &str, from: &str, rest: &[&str], text: &str) -> ParsedMessage {
-    let to = Callsign(to.to_string());
-    let from = Callsign(from.to_string());
+    let to = callsign(to);
+    let from = callsign(from);
 
     match rest {
         // RRR / RR73 / 73
@@ -253,5 +267,37 @@ mod tests {
     #[test]
     fn unparseable_keeps_text() {
         assert!(matches!(parse_message(""), ParsedMessage::Raw(_)));
+    }
+
+    #[test]
+    fn resolves_bracketed_hashed_call() {
+        // A compound station replies with its own call as a resolved hash; the
+        // brackets are stripped so it compares equal to the partner being worked.
+        match parse_message("W4LL <W1AW/0> -10") {
+            ParsedMessage::Exchange { to, from, payload } => {
+                assert_eq!(to.0, "W4LL");
+                assert_eq!(from.0, "W1AW/0");
+                assert!(matches!(payload, ExchangePayload::Report(-10)));
+            }
+            other => panic!("expected Exchange, got {other:?}"),
+        }
+        // Our call hashed in the `to` slot resolves the same way.
+        match parse_message("<W4LL> W1AW/0 RR73") {
+            ParsedMessage::Signoff { to, from, .. } => {
+                assert_eq!(to.0, "W4LL");
+                assert_eq!(from.0, "W1AW/0");
+            }
+            other => panic!("expected Signoff, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unresolved_hash_sentinel_is_preserved() {
+        // Until the decoder learns the full call, `<...>` names no station — keep
+        // it verbatim so it can never be mistaken for a real partner.
+        match parse_message("W4LL <...> -10") {
+            ParsedMessage::Exchange { from, .. } => assert_eq!(from.0, "<...>"),
+            other => panic!("expected Exchange, got {other:?}"),
+        }
     }
 }

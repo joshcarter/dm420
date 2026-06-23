@@ -478,7 +478,9 @@ pub fn decode(samples: &[f32], sample_rate: u32, protocol: Protocol) -> Vec<Deco
     // Collect the streamed decodes; order is strongest-first (candidate score).
     // The call site re-sorts low-to-high in frequency if it wants that.
     let mut out = Vec::new();
-    decode_streaming(samples, sample_rate, protocol, |d| out.push(d));
+    // One-shot decode: a fresh hash table lives only for this slot's passes.
+    let mut hash = CallHash::new();
+    decode_streaming(samples, sample_rate, protocol, &mut hash, |d| out.push(d));
     out
 }
 
@@ -498,6 +500,7 @@ pub fn decode_streaming(
     samples: &[f32],
     sample_rate: u32,
     protocol: Protocol,
+    hash: &mut CallHash,
     mut on_decode: impl FnMut(Decode),
 ) {
     // Multi-pass subtraction (FT8 and FT4): decode a pass, subtract every decode's
@@ -510,7 +513,6 @@ pub fn decode_streaming(
         1
     };
     let mut residual = samples.to_vec();
-    let mut hash = CallHash::new();
     let mut seen: HashSet<[u8; 10]> = HashSet::new();
     for pass in 0..passes {
         let mut mon = Monitor::new(sample_rate, protocol, TIME_OSR, FREQ_OSR, 200.0, 3000.0);
@@ -571,7 +573,7 @@ pub fn decode_streaming(
                 continue; // already found (and subtracted) — don't emit or re-subtract
             }
             decoded.push((payload, freq_hz, dt));
-            if let Some((text, msg_type)) = message::decode(&payload, &mut hash) {
+            if let Some((text, msg_type)) = message::decode(&payload, hash) {
                 on_decode(Decode {
                     score: c.score,
                     snr_db: estimate_snr(wf, c, noise),
