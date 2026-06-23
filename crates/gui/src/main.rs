@@ -12,6 +12,7 @@
 //! helpers live in `chrome`; all colour/chrome flows through a `theme::Palette`.
 
 mod app;
+mod app_nap;
 mod bus_view;
 mod chrome;
 mod flag;
@@ -46,6 +47,12 @@ fn main() -> eframe::Result<()> {
     // must live for the whole run (it flushes the writer on drop).
     let _log_guard = logging::init();
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "DM420 starting");
+
+    // Keep macOS from napping the process when the window is backgrounded. The
+    // key-down and PTT-watchdog paths run on background threads/timers that App Nap
+    // would otherwise throttle, which can leave the rig keyed after you tab away
+    // mid-over. Held for the whole run (no-op off macOS); dropped at exit.
+    let _nap_guard = app_nap::prevent_app_nap();
 
     // Reopen at the last session's window size & position. The screenshot path
     // keeps a fixed canvas (deterministic shots), so it ignores the saved geometry.

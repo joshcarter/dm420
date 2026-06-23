@@ -112,19 +112,22 @@ Quick operating-surface fixes from `TODO.md` that matter mid-contest:
   channel while armed; consider auto-arm when selecting a channel's traffic.
 - Sent text should be accent2 and is not rendering at the correct vertical height.
 
-### 8. Waterfall pauses when DM420 is tabbed away (likely a bug)
-When the app loses focus / is in the background, the waterslide appears to stop
-advancing; it resumes on refocus. Almost certainly **not** intended — you want to keep
-watching the band while another window is on top. Likely a render-throttle issue, not a
-data-loss one: decode/RX runs off-thread on the bus, so the *pipeline* keeps going; it's
-the egui repaint that stalls when the window is unfocused/occluded (eframe only redraws
-on events or an explicit repaint request). The waterfall panel already asks for ~30 fps
-via `request_repaint_after(33ms)` (`gui/src/panels/waterfall.rs:736`) and bus pumps call
-`request_repaint()` on new data (`gui/src/bus_view.rs`), but winit/macOS may not honor
-those for a backgrounded window. Investigate: confirm whether decodes/timestamps keep
-flowing while tabbed away (data fine, display frozen) vs. the pipeline itself pausing;
-then decide whether to drive continuous repaint while unfocused (and whether the
-spectrogram correctly catches up on refocus — ties into the #6 drift fix).
+### 8. Waterfall pauses when DM420 is tabbed away — *App Nap half fixed; render half → Next*
+**The dangerous half is fixed.** The earlier "egui repaint throttle" guess was incomplete:
+the root cause was macOS **App Nap** throttling the *whole* backgrounded process — every
+thread and timer, including `core::tx`'s playback-done poll and the rig-actor **PTT
+watchdog**. That's why a TX begun just before tabbing away could leave the rig **keyed**
+until refocus (and why the *pipeline*, not just the display, paused). Held off now by an
+`NSProcessInfo` activity assertion taken for the session (`gui/src/app_nap.rs`,
+`UserInitiated | LatencyCritical` — disables App Nap and timer coalescing), so the unkey
+path, watchdog, and FT8/FT4 slot timing run full-speed in the background. *(Implemented;
+not yet committed.)*
+
+**The remaining render-only gap is moved to Next** → *"Waterslide freezes while
+backgrounded."* With the pipeline now live in the background, the spectrogram still gaps on
+refocus because it's an incremental, frame-coupled renderer and macOS won't redraw a
+fully-occluded window. Diagnosis + fix plan live there; it's the same timestamp-rebuild as
+#6.
 
 ### 9. Investigate QSO correctness
 QSOs may be "a bit off" — needs closer observation on-air before we can pin it down.
@@ -318,6 +321,51 @@ content mid-QSO.
 - **Split audio offset:** double-click to lock the audio offset (click again to unlock);
   determine the real TX audio-offset limits (currently a hard 1000–2000 Hz window);
   figure out how to tell when two stations are working at different offsets.
+
+### Waterslide freezes while backgrounded (render the spectrogram from timestamps)
+*Split out of old Now-#8 once the App Nap root cause was fixed — this is the render-only
+remainder.*
+
+**Symptom (reported 2026-06-22).** Start a transmit, tab away to another app, come back —
+the waterslide didn't advance while away: a frozen gap for that interval, catching up only
+on refocus. Observed during TX; the RX side has the same exposure.
+
+**It's render-only now (App Nap is fixed — see Now-#8).** Data keeps flowing in the
+background; the spectrogram just doesn't capture it:
+- `Spectrogram::update_and_paint` (`gui/src/panels/waterfall.rs`) is **incremental and
+  frame-coupled** — each frame it advances `dx_frac += dt * (w / history_secs)` and writes
+  only the single `latest` `SpectrumRow` into the newly-exposed columns. It stays continuous
+  only if painted ~20–30×/s.
+- The panel already requests that (`request_repaint_after(33ms)`) and the bus pumps call
+  `request_repaint()` on new data — but **macOS won't redraw a fully-occluded window**
+  (covered by the app you tabbed to), so no frames fire while away, and the lone catch-up
+  frame on refocus has a huge `dt` that smears the latest column across the gap. (A merely
+  unfocused-but-*visible* window keeps drawing — so confirm full occlusion if unsure.)
+
+**Fix — rebuild from timestamps each paint (the same mechanism as Now-#6):**
+1. **Ring spectrum rows by `SpectrumRow.t` in `bus_view`.** RX is already ringed
+   (`recent_spectrum`, 512 rows ≈ 25 s); **also ring the own-TX columns**, which are
+   latest-only today (the `SignalSource::OwnTx` arm in `bus_view.rs`) — that's why the *TX*
+   case can't be reconstructed. Size the TX ring like RX (~the visible history).
+2. **Make `update_and_paint` timestamp-driven** — pass the ring + `now_ms` instead of `dt` +
+   `latest`. For each column `c` (0 = the NOW line), compute `t_c = now_ms − (c/w)·history_secs`
+   and write the ring row nearest `t_c`. Full rebuild each paint ⇒ no gap, columns land at
+   their true time, and the refocus catch-up frame is automatically correct. Drop `dx_frac`.
+3. **Preserve the visuals** — axis orientation (bin 0 = bottom row), the zoom/pan frequency
+   crop (`lo_frac`/`hi_frac` uv mapping), and the colour map.
+
+**One fix, three bugs.** This is the same timestamp-rebuild as **Now-#6** (spectrogram↔
+decode-text drift) and the **"Faithful spectrum stream"** bullet under *Decode pipeline
+robustness* below — doing it once fixes the drift, the dropped-frame smear, *and* this
+background gap. The decode-text side already places by wall-clock `now_ms`, so this brings
+the spectrogram into agreement with it.
+
+**Accepted bound.** Backgrounded longer than the ring depth (~25 s) ⇒ you catch up only the
+last N seconds — which is all the visible window shows anyway; don't over-size the ring.
+
+**Why Next, not Now.** The safety-critical half (the stuck key) is already fixed; this is
+display fidelity while tabbed away — real, but cosmetic and not Field-Day-this-weekend
+critical.
 
 ### QSO sequencing
 - **Answering model: "wait-for-CQ" vs "answer-immediately" (open design decision).** Arming to a

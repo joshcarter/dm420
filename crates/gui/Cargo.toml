@@ -46,3 +46,10 @@ app_core = { package = "core", path = "../core" }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-appender.workspace = true
+
+# macOS-only: an NSProcessInfo activity assertion that disables App Nap so a
+# backgrounded window can't throttle the background TX/decode pipeline and leave
+# the rig keyed. See `src/app_nap.rs`. No-op (and not depended on) off macOS.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2.workspace = true
+objc2-foundation.workspace = true

@@ -37,6 +37,15 @@ egui_tiles = "0.15.0"
 egui_extras = "0.34.3"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 
+# --- macOS App Nap suppression (gui binary only) ---
+# DM420 keys a real transmitter; the key-down and PTT-watchdog paths run on
+# background threads, which macOS App Nap throttles when the window is backgrounded
+# (see crates/gui/src/app_nap.rs). An NSProcessInfo activity assertion turns that
+# off. Pinned to the versions eframe already pulls in transitively so Cargo unifies
+# to one build (no new objc2 in the lock).
+objc2 = "0.6.4"
+objc2-foundation = { version = "0.3.2", features = ["NSProcessInfo", "NSString"] }
+
 # --- async / bus transport ---
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time", "net"] }
 
