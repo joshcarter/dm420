@@ -265,3 +265,85 @@ The ordering maximizes stability per unit effort: safety first, then a cheap sha
 **domain (logbook/archive/callbook/scanner/mocks/net)** — Individually tight. Worked-status in 3+ places with inconsistent keys (`scanner/lib.rs:80`, `bus_view.rs:417,:385`; none read `origin`). Scanner per-(band,mode) rule contradicts per-band Field-Day rule and GUI (`scanner/lib.rs:80,237,249-253` vs `bus_view.rs:421`). `net` introduces a second station-identity definition disconnected from `LogEntry.origin` (`net/lib.rs:66-69,204`); per-process `seq` resets to 0 on restart, peers drop a restarted op as stale (`net/lib.rs:154`; `peers.rs:56-61`); peer `StationSnapshot` has zero subscribers. `scanner.worked` grows unbounded with no reset path (`scanner/lib.rs:113-114,237-239`) — breaks the planned Field-Day reset. JSONL append plumbing duplicated (`logbook/lib.rs:105-125` vs `archive/lib.rs:136-156`). Mock mode serves no `ScannerCommand` — band-scan controls are a dead surface under `DM420_MOCK=1` (`mocks/lib.rs:279-311`).
 
 **Cross-cutting lenses** corroborate the above: state-duplication (worked-status/mode/offset/band/clock/selection/identity all multi-owner); state-transition (open-loop TX as the deepest fault, scanner↔TX best-effort exclusion, config apply-on-edge); module-boundaries (dead catalog topics, GUI poking producer handles, domain logic in panels, net publishing into the void); consolidate-vs-split (the 9 consolidations and 6 splits above); coupling (TX fail-unsafe, no canonical owners, config bypass, fragmented clocks as the five highest-leverage amplifiers).
+
+---
+
+## Addendum — Mock Removal & Multi-Operator Sequencing
+
+Two owner-supplied factors fold into the plan: (1) the `DM420_MOCK=1` path is essentially unused and is dead weight; (2) multi-operator (shared logbook + currently-working station + heard stations across LAN instances) is the *next* feature, and the worry is that "cleaning up dead code" could un-plumb concepts multi-op is about to need.
+
+### The reframing: there are two different kinds of "dead"
+
+The trap is reading the main report's "build the owner or delete the topic" as license to delete the unbuilt producers. It isn't — because two unrelated things both read as "dead," and they need opposite treatment:
+
+| Kind | What it is | Examples | Action |
+|---|---|---|---|
+| **Implemented-but-unused** | code that runs but nothing needs | `mocks` crate, the mock spawn branch, `panel_data` prototype tables, the mock-only waterslide block | **DELETE / carve** |
+| **Designed-but-unimplemented** | a contract defined in `types`/catalog with no producer yet | `EnrichedDecode`/`WorkedStatus`, `OperatingState`, `SessionCommand`, `StationSnapshot`/`HeardStation`/`WorkingTarget`, `origin: Mine\|Peer` threading | **BUILD (mostly)** — these are the review's own fixes *and* the multi-op substrate |
+
+Almost every "dead topic" the main report flagged is the second kind. `networking.md` (the authoritative multi-op spec, design-status) shows they are load-bearing for the feature you're about to add — so the cleanup and the feature are one continuous arc, not sequential strangers. **`net` already subscribes `radio/{id}/decodes_enriched`** to derive shared heard-stations and **consumes `WorkedStatus::WorkedByNetwork`** for auto-pick exclusion — i.e. driver #2 (the enrichment producer) is simultaneously the local single-source fix and a hard multi-op prerequisite. Build it once, multi-op-aware.
+
+### Mock removal — precise scope (verified)
+
+De-risking facts confirmed against the tree: `mocks` is a dependency of **`crates/gui` only**; **no test or example** references `mocks::`/`DM420_MOCK`; the mock-vs-real choice is a single `else` branch (`bus_view.rs:225-229`); and `DM420_WAV` replay is wired into the **real** path (`settings.rs:784` → `core::spawn`), entirely independent of mocks.
+
+**DELETE:**
+- `crates/mocks/` (whole crate, 311 lines) + the `mocks.workspace = true` line in `crates/gui/Cargo.toml`.
+- The mock branch `bus_view.rs:225-229` → always `core::spawn`; drop the `real` flag (`settings.rs:189`) and its accessors (`bus_view.rs:155,309`) and the `CoreConfig.real` plumbing — once mock is gone, `real` is always true.
+- The "available in real mode — relaunch without DM420_MOCK=1" affordance (`waterfall.rs:782`) and any "real mode only" UI gating.
+- The mock copies of `now_ms` / `fmt_snr` (also covered by Consolidate #1/#5 — they delete for free).
+
+**CARVE (split live from dead — do not nuke the whole file):**
+- `waterslide_panel.rs:160-319` — the mock-only parallel waterslide → delete; **keep** `Target` / `WaterslideTheme` / `martian_cmap[_light]` (live: used by `send.rs`, `waterfall.rs`).
+- `waterslide_sim.rs` (398) — `mod` is declared but no `waterslide_sim::` use-site appears; confirm unreferenced, then delete or fold what survives into `waterslide_render.rs` (Split #1).
+- `panel_data.rs` (709) — delete the prototype data tables behind `#![allow(dead_code)]` (`:77-447,461-582`); **keep** `Locator`, the live layout constants, and the `CALLSIGN_H` placeholder (still read by `chrome.rs`/`contacts.rs`/`call_sign.rs`/`settings.rs`/`bus_view.rs`/`waterfall.rs`).
+
+**KEEP (not mock — do not touch under this banner):**
+- `DM420_WAV` replay — real-mode bring-up / decoder-dev input; orthogonal to mocks.
+- `geo_data.rs` (LAND_VERTS/IDX) — live map basemap.
+
+**Screenshot path — RESOLVED:** daylight-color screenshots (`MARTIAN_SHOT`/`MARTIAN_LIGHT`) are captured against a **real radio**, not mock-seeded data — and the code path is already decoupled from `DM420_MOCK`. So mock deletes outright; no fixture-replacement feed is needed.
+
+**Bonus:** removing the mock branch shrinks the `Option<AudioControl> == None` "silently no-op" surface that drivers #2 and #5 named as a divergence source. WAV still yields `control.audio = None`, but driver #2c's `OperatingState` owner turns that into an *honest* "not applied" instead of a silent UI-vs-reality divergence.
+
+### Multi-op substrate — what to KEEP & BUILD (don't un-plumb)
+
+Cross-referencing `networking.md`'s wiring against the main report's "dead/unbuilt" list:
+
+| Designed-but-unbuilt | Defined | Multi-op role (`networking.md`) | Driver | Verdict |
+|---|---|---|---|---|
+| `EnrichedDecode` / `WorkedStatus` (incl. `WorkedByNetwork(StationId)`) | `types` lib.rs:268 / 578 | `net` derives shared `HeardStation` from `decodes_enriched`; engine excludes `WorkedByNetwork` from auto-pick | #2 | **BUILD** — produce the network variant + `origin` from day one |
+| `origin: Mine\|Peer` on `MapSpot`/`HeardEntry` | missing (`LogEntry` already has it) | peer log entries injected on `logbook/entries`; UI must render mine ≠ peer | #2/#8 | **BUILD/EXTEND** (multi-op step 2 UI) |
+| `OperatingState` (mode/band/posture) | `types` lib.rs:303 | upstream of `WorkingTarget.band` + snapshot `band_activity` | #2/#5 | **BUILD** (local owner) |
+| `SessionCommand` (SetMode/SetContest/TuneBand) | `types` lib.rs:325 | local config-as-bus-command — the clean replacement for the GUI poking `AudioControl` | #5 | **BUILD** (this *is* the driver-#5 fix), not delete |
+| `StationSnapshot` / `HeardStation` / `WorkingTarget` (§9) | `types` lib.rs:684 + spec | the gossip vocabulary on `station/{id}/snapshot` (State) | net steps 1–3 | **KEEP** — `net`'s "zero subscribers" is *expected at step 1*; consumers land in steps 2–3 |
+| `tx_report` consumer / closed TX loop | `types` / `core::tx` | trustworthy `qso/{id}/state` → trustworthy shared `WorkingTarget` | #1 | **BUILD** — an open-loop FSM would gossip *wrong* working-intent to peers |
+| typed `Progress` FSM | `qso::engine` | same: correct published state for intent derivation | #4 | **BUILD** |
+| wildcard `State` late-join snapshot | `bus/handle.rs:391-406` | panels subscribe `station/*/snapshot` (**wildcard State**); a late-joining instance needs the current snapshot, not just future ones | bus finding | **RECLASSIFY → multi-op blocker** (was "latent, no live bug") — fix before wildcard snapshot consumers ship |
+
+**DELETE/DEFER (genuinely dead, no multi-op role):**
+
+| `logbook/query` (`LogbookQuery`) | Exists only in `bus/topic.rs` + `recorder.rs` — no producer, server, or consumer; log sync uses `net`'s anti-entropy digests, not this Command topic. | **DELETE (confirmed by owner)** during the Phase-4 catalog reconciliation — remove the topic from the taxonomy + recorder. |
+
+### Revised refactor sequence (cleanup → multi-op as one arc)
+
+Re-ordered from the main report to (a) pull dead-weight removal forward so every later phase edits smaller files, and (b) make Phase 2's single-owners *be* the gossip inputs, so multi-op is built on clean substrate rather than racing it.
+
+- **Phase 0 — Safety** (unchanged): 0a watchdog/timeout ordering + `ForceUnkey`; 0b `Granter::revoke`.
+- **Phase A — Dead-weight removal (NEW, pull early):**
+  - **A1.** Delete the `mocks` crate + spawn branch + `real` flag → one always-real `core::spawn` path. *(Screenshots run against a real radio, so no fixture replacement needed — clean delete.)*
+  - **A2.** Carve dead prototype tables from `panel_data.rs`; delete the mock-only waterslide block; audit/remove `waterslide_sim.rs`.
+  - **A3.** Shared-utility pass (was 1b): `now_ms` / `Band::from_hz` / `OverAirMode↔Protocol` / format / `geo::distance_km` — also deletes the mock copies as a side effect.
+- **Phase 1 — Close the loops:** 1a TX outcome loop (#1); 1c clock unification (#6).
+- **Phase 2 — Single owners, built multi-op-aware (the substrate):** 2a `RigState`→`build_log` band/freq **+ recover the log-`seq` high-water on startup** (resume minting new `QsoId`s from `1 + max(seq where origin == me)` off the replayed log — no sidecar; closes the restart `QsoId` collision that would otherwise silently drop a post-restart contact, per the seq-persistence finding below); **2b enrichment producer = `WorkedStatus`/`EnrichedDecode` carrying `origin` and emitting `WorkedByNetwork` from day one** (#2 + the `net` heard/auto-pick prerequisite); 2c `OperatingState` owner + `SessionCommand` config-as-command (#2/#5); 2d offset owner + publish `offset_locked` (#3, also fixes `WorkingTarget.offset`); 2e `Selection` owner (#8, the single source for "currently-working station" → `WorkingTarget.call`).
+- **Phase 3 — Lifecycle hardening:** 3a `Progress` enum + transition table (#4); 3b config commit decoupled from the lock edge + rig-ownership posture (#5).
+- **Phase 4 — Bus hardening for gossip + catalog truth:** fix wildcard `State` late-join snapshot (`handle.rs:391-406`, now a multi-op blocker); reconcile `message-catalog.md` with reality (mark each formerly-"dead" topic BUILT or tag the build-step that builds it; delete only `logbook/query`).
+- **Phase 5 — Multi-op feature** (`networking.md` build order, now standing on clean owners): step 2 shared logbook (origin rendering — threading already in place from 2b); step 3 working-intent (`WorkingTarget` from the clean FSM + selection + offset owners); step 4 heard/band aggregation (straight off the 2b enrichment producer). *(Step 1, the `net` skeleton + §9 types + snapshot exchange, is already built.)*
+
+The throughline: **Phase 2's owners are the gossip inputs.** `decodes_enriched` → peers' heard map; `qso/{id}/state` → `WorkingTarget`; `logbook/entries` + `origin` → the shared G-set; `offset_locked`/`Selection` → correct working-intent. Do the cleanup multi-op-aware and Phase 5 becomes wiring, not re-plumbing.
+
+### Open questions for the owner
+
+1. ~~Screenshot population~~ — **RESOLVED:** captured against a real radio; mock deletes cleanly.
+2. ~~`logbook/query`~~ — **RESOLVED:** delete it in the Phase-4 catalog reconciliation.
+3. **`seq` persistence** (`networking.md` open Q) — **finding:** the high-water is *already on disk*. `LogEntry.id` is a `QsoId { origin, seq }` (`types` lib.rs:548/571) and the logbook already replays every entry into a `seen: HashSet<QsoId>` on startup (`logbook/lib.rs:50`). So persistence needs **no sidecar** — on startup, resume minting from `1 + max(seq where origin == me)` derived from the replayed log. **Decided — folded into Phase 2 (2a)** (the logbook is already open there for the band/freq fix); deriving from the log can't drift from the log the way a separate high-water file could. The separate, milder restart bug is the **snapshot** `seq` (`net/lib.rs:154` starts at 0 each process), which makes a restarted op look *stale* to peers until `PEER_TTL` ages out their record — fix alongside, but it self-heals where the log `seq` collision silently *loses data*.
