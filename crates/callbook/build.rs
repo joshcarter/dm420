@@ -33,7 +33,7 @@ fn main() {
 
 fn strip_modifiers(s: &str) -> &str {
     let end = s
-        .find(|c| matches!(c, '(' | '[' | '{' | '~'))
+        .find(['(', '[', '{', '~'])
         .unwrap_or(s.len());
     s[..end].trim()
 }

@@ -664,11 +664,10 @@ impl Panel for Waterfall {
             pal.accent,
             ctx.ui.id().with("header_clear_qsy"),
         );
-        if clear_resp.clicked() && !self.offset_locked && !op_armed {
-            if let Some(off) = Self::best_cq_offset(ctx, now_ms) {
+        if clear_resp.clicked() && !self.offset_locked && !op_armed
+            && let Some(off) = Self::best_cq_offset(ctx, now_ms) {
                 self.real_sel = RealSel { offset: off, target: None, resume: None };
             }
-        }
         // When the mode actually changes, also retune to the calling frequency for
         // the new mode on the current band (FT8 and FT4 use different dial freqs).
         let new_mode_if_changed = if mode_clicks[0] && proto != Protocol::Ft8 {
@@ -683,15 +682,14 @@ impl Panel for Waterfall {
             let vfo_hz = self
                 .vfo_override_hz
                 .or_else(|| ctx.bus.rig_state().map(|r| r.vfo.0));
-            if let Some(band) = vfo_hz.and_then(band_for_hz) {
-                if let Some(hz) = crate::send::calling_freq_hz(band, new_mode) {
+            if let Some(band) = vfo_hz.and_then(band_for_hz)
+                && let Some(hz) = crate::send::calling_freq_hz(band, new_mode) {
                     if ctx.bus.is_real() {
                         ctx.bus.set_freq(hz);
                     } else {
                         self.vfo_override_hz = Some(hz);
                     }
                 }
-            }
         }
 
         // Tuned-frequency readout (FREQ chip), centered in the header bar like the
@@ -895,13 +893,12 @@ impl Panel for Waterfall {
                     // when unlocked, so auto-QSY hops are reflected in the cursor.
                     // When locked, real_sel.offset is authoritative — the engine is
                     // never allowed to move it.
-                    if !self.offset_locked {
-                        if let Some(engine_off) =
+                    if !self.offset_locked
+                        && let Some(engine_off) =
                             ctx.bus.qso_state().and_then(|q| q.tx_offset)
                         {
                             self.real_sel.offset = engine_off.0;
                         }
-                    }
 
                     // Click-to-select on the live waterslide (mock mode selects via
                     // the sim's own `ui()`; the real waterslide is draw-only). We
@@ -1821,12 +1818,14 @@ fn draw_waterslide(
         // A decode addressed *to* our callsign — someone answering our CQ or sending
         // us an exchange/signoff — also reads in accent3 so it catches the eye.
         let is_addressed_to_me = match (&d.content, my_call) {
-            (DecodeContent::Slotted { message, .. }, Some(mine)) => match message {
-                ParsedMessage::Exchange { to, .. } | ParsedMessage::Signoff { to, .. } => {
-                    to.0.eq_ignore_ascii_case(mine)
-                }
-                _ => false,
-            },
+            (
+                DecodeContent::Slotted {
+                    message:
+                        ParsedMessage::Exchange { to, .. } | ParsedMessage::Signoff { to, .. },
+                    ..
+                },
+                Some(mine),
+            ) => to.0.eq_ignore_ascii_case(mine),
             _ => false,
         };
         let msg_col = if is_own_tx || is_addressed_to_me {
