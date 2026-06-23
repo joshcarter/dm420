@@ -595,21 +595,42 @@ impl Panel for Waterfall {
         let painter = ctx.painter;
         let pal = ctx.pal;
 
+        // Hoist operating state so both the header chrome (CLEAR QSY button) and the
+        // body chrome (frame tint, TX lane) share the same snapshot this frame.
+        let op_phase = ctx
+            .bus
+            .qso_state()
+            .map(|s| s.phase)
+            .unwrap_or(QsoPhase::Idle);
+        let op_armed = !matches!(op_phase, QsoPhase::Idle);
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let op_transmitting = ctx.bus.tx_spectrum().is_some_and(|r| now_ms - r.t.0 < 500);
+
         let header = Rect::from_min_max(
             block.min,
             Pos2::new(block.right(), block.top() + pd::HEADER_ROW_H),
         );
         panel_header(painter, header, pal, "Digital", "", ctx.active);
 
-        // Right cluster, laid out right-to-left: the FT8/FT4 mode toggle, then the
-        // tuned-frequency readout styled like the header clocks.
+        // Header layout: [Digital] [FT8/FT4] · · · [FREQ] · · · [CLEAR QSY]
         let cy = header.center().y;
         let proto = ctx.bus.current_config().protocol;
+
+        // FT8/FT4 toggle — anchored just right of the "Digital" title text.
+        // Replicate segmented's internal cell sizing (CELL_PAD_X=11, PAD=2, GAP=2)
+        // to compute the track width for left-anchoring.
+        let title_right = header.left()
+            + FOCUS_BOX_SZ
+            + 8.0
+            + measure(painter, &tracked("DIGITAL"), heading(11.0));
+        let ft8_cell_w = measure(painter, &tracked("FT8"), heading(9.0)) + 22.0;
+        let ft4_cell_w = measure(painter, &tracked("FT4"), heading(9.0)) + 22.0;
+        let mode_track_w = 4.0 + ft8_cell_w + ft4_cell_w + 2.0;
         let (_mode_left, mode_clicks) = crate::chrome::segmented(
             ctx.ui,
             painter,
             pal,
-            header.right() - 2.0,
+            title_right + 8.0 + mode_track_w,
             cy,
             20.0,
             "",
@@ -619,6 +640,35 @@ impl Panel for Waterfall {
             ],
             "sw_mode",
         );
+
+        // CLEAR QSY button — right-anchored in the header. Uses the same
+        // lcd_panel + key_cell_accent (active=true) pattern as SEND and SCAN.
+        let clear_cell_w = measure(painter, &tracked("CLEAR QSY"), heading_bold(9.0)) + 14.0;
+        let clear_track_w = clear_cell_w + 4.0;
+        let clear_track = Rect::from_center_size(
+            Pos2::new(header.right() - 2.0 - clear_track_w * 0.5, cy),
+            egui::Vec2::new(clear_track_w, 20.0),
+        );
+        lcd_panel(painter, clear_track, pal, 4);
+        let clear_cell = Rect::from_min_max(
+            Pos2::new(clear_track.left() + 2.0, clear_track.top() + 2.0),
+            Pos2::new(clear_track.right() - 2.0, clear_track.bottom() - 2.0),
+        );
+        let clear_resp = key_cell_accent(
+            ctx.ui,
+            painter,
+            pal,
+            clear_cell,
+            "CLEAR QSY",
+            !self.offset_locked,
+            pal.accent,
+            ctx.ui.id().with("header_clear_qsy"),
+        );
+        if clear_resp.clicked() && !self.offset_locked && !op_armed {
+            if let Some(off) = Self::best_cq_offset(ctx, now_ms) {
+                self.real_sel = RealSel { offset: off, target: None, resume: None };
+            }
+        }
         // When the mode actually changes, also retune to the calling frequency for
         // the new mode on the current band (FT8 and FT4 use different dial freqs).
         let new_mode_if_changed = if mode_clicks[0] && proto != Protocol::Ft8 {
@@ -695,14 +745,7 @@ impl Panel for Waterfall {
         // while actually keyed on the air. The corner brackets, the NOW divider, and
         // the TX lane all read this so they agree. Only when locked (operating) — the
         // unlocked screen is the radio-setup form, where state tinting is meaningless.
-        let op_phase = ctx
-            .bus
-            .qso_state()
-            .map(|s| s.phase)
-            .unwrap_or(QsoPhase::Idle);
-        let op_armed = !matches!(op_phase, QsoPhase::Idle);
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        let op_transmitting = ctx.bus.tx_spectrum().is_some_and(|r| now_ms - r.t.0 < 500);
+        // (op_phase / op_armed / now_ms / op_transmitting hoisted before the header.)
         let op_accent = if ctx.unlocked {
             pal.accent
         } else if op_transmitting {
@@ -974,6 +1017,7 @@ impl Panel for Waterfall {
                         op_accent,
                         op_armed,
                         op_transmitting,
+                        self.offset_locked,
                         now_frac,
                         self.view_lo_hz,
                         self.view_span_hz,
@@ -1585,6 +1629,9 @@ fn draw_waterslide(
     // Controls the TX lane indicator style (rules vs. hatch rows).
     tx_armed: bool,
     tx_transmitting: bool,
+    // When true, the TX audio offset is locked; the idle rules are drawn thicker
+    // to make the locked state more prominent.
+    offset_locked: bool,
     // NOW-line position as a fraction of the panel width (0.5 = centered 1:1,
     // ~0.667 = the wide-decode 2:1 split). Both sides span `history_secs`, so the
     // right (spectrogram) side gets its own pixels-per-second when it's narrower.
@@ -1987,13 +2034,14 @@ fn draw_waterslide(
         } else {
             let rule_top = band.top() - WS_RULE_GAP;
             let rule_bottom = band.bottom() + WS_RULE_GAP;
+            let rule_w = if offset_locked { 3.0 } else { 1.5 };
             painter.line_segment(
                 [Pos2::new(band.left(), rule_top), Pos2::new(band.right(), rule_top)],
-                egui::Stroke::new(1.5, lane),
+                egui::Stroke::new(rule_w, lane),
             );
             painter.line_segment(
                 [Pos2::new(band.left(), rule_bottom), Pos2::new(band.right(), rule_bottom)],
-                egui::Stroke::new(1.5, lane),
+                egui::Stroke::new(rule_w, lane),
             );
             painter.text(
                 Pos2::new(rect.left() + 4.0, rule_top - 1.0),
