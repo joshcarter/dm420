@@ -5,5 +5,6 @@ edition.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "Offline call-sign → DXCC country resolver (prefix table). Pure, no I/O."
+build = "build.rs"
 
 [dependencies]

@@ -3,10 +3,9 @@
 //! Pure data + functions, no async and no I/O — the Tier-1 lookup behind the
 //! Call Sign panel (`docs/call_sign_lookup_panel.md`). Given a callsign it
 //! resolves the operating **prefix** to a country name plus an ISO 3166-1
-//! alpha-2 code (which keys the flag icon). This is a curated Phase-1 subset of
-//! the DXCC/ITU prefix allocations — broad enough for everyday FT8/Field Day
-//! traffic, not the full ~340-entity list. A fuller table (and online name
-//! enrichment) is Tier-2 work; see the panel spec.
+//! alpha-2 code (which keys the flag icon). The prefix table is generated at
+//! compile time from the DXCC `cty.dat` country file (BigCty, AD1C), covering
+//! the full ~340-entity list.
 //!
 //! Resolution is **longest-prefix match**: the table holds prefixes of varying
 //! length and the longest one that leads the callsign wins (so `KH6` beats `K`,
@@ -75,116 +74,12 @@ fn resolve_prefix(token: &str) -> Option<Country> {
     None
 }
 
-const MAX_PREFIX_LEN: usize = 3;
+// Longest prefix in cty.dat is 4 chars (e.g. KH7K, 3D2/c stripped to 3D2, etc.)
+// Use 6 as a safe ceiling.
+const MAX_PREFIX_LEN: usize = 6;
 
-/// Curated `(prefix, country, iso2)` table, Phase-1 subset. Longest matching
-/// prefix wins, so specific multi-char entries (e.g. `KH6`, `MM`) sit alongside
-/// the broad single-letter ones (`K`, `G`) without conflict. Several entities
-/// intentionally share an ISO/flag (US territories → `US`, UK home nations →
-/// `GB`) since Phase 1 resolves to *country*, not full DXCC entity.
-#[rustfmt::skip]
-static TABLE: &[(&str, &str, &str)] = &[
-    // ---- United States (K / W / N and the AA–AL block; territories → US) ----
-    ("K", "United States", "US"), ("W", "United States", "US"), ("N", "United States", "US"),
-    ("AA", "United States", "US"), ("AB", "United States", "US"), ("AC", "United States", "US"),
-    ("AD", "United States", "US"), ("AE", "United States", "US"), ("AF", "United States", "US"),
-    ("AG", "United States", "US"), ("AI", "United States", "US"), ("AJ", "United States", "US"),
-    ("AK", "United States", "US"), ("AL", "United States", "US"),
-    ("KL", "Alaska", "US"), ("AL7", "Alaska", "US"), ("NL", "Alaska", "US"), ("WL", "Alaska", "US"),
-    ("KH", "Hawaii", "US"), ("NH", "Hawaii", "US"), ("WH", "Hawaii", "US"), ("AH", "Hawaii", "US"),
-    ("KP4", "Puerto Rico", "PR"), ("NP4", "Puerto Rico", "PR"), ("WP4", "Puerto Rico", "PR"),
-    ("KP2", "US Virgin Islands", "VI"),
-    // ---- Canada ----
-    ("VE", "Canada", "CA"), ("VA", "Canada", "CA"), ("VO", "Canada", "CA"), ("VY", "Canada", "CA"),
-    ("CF", "Canada", "CA"), ("CG", "Canada", "CA"), ("CK", "Canada", "CA"),
-    // ---- Mexico / Central America / Caribbean ----
-    ("XE", "Mexico", "MX"), ("XF", "Mexico", "MX"), ("4A", "Mexico", "MX"),
-    ("CO", "Cuba", "CU"), ("CM", "Cuba", "CU"), ("HI", "Dominican Rep.", "DO"), ("HH", "Haiti", "HT"),
-    ("TI", "Costa Rica", "CR"), ("HP", "Panama", "PA"), ("YS", "El Salvador", "SV"),
-    ("TG", "Guatemala", "GT"), ("HR", "Honduras", "HN"), ("YN", "Nicaragua", "NI"),
-    ("V3", "Belize", "BZ"), ("8P", "Barbados", "BB"), ("J3", "Grenada", "GD"), ("J6", "St. Lucia", "LC"),
-    ("J7", "Dominica", "DM"), ("J8", "St. Vincent", "VC"), ("VP9", "Bermuda", "BM"),
-    ("FG", "Guadeloupe", "FR"), ("FM", "Martinique", "FR"), ("ZF", "Cayman Is.", "KY"),
-    // ---- South America ----
-    ("PY", "Brazil", "BR"), ("PP", "Brazil", "BR"), ("PT", "Brazil", "BR"), ("PR", "Brazil", "BR"),
-    ("PU", "Brazil", "BR"), ("LU", "Argentina", "AR"), ("LW", "Argentina", "AR"),
-    ("CE", "Chile", "CL"), ("CA", "Chile", "CL"), ("HK", "Colombia", "CO"), ("HC", "Ecuador", "EC"),
-    ("OA", "Peru", "PE"), ("CP", "Bolivia", "BO"), ("CX", "Uruguay", "UY"), ("ZP", "Paraguay", "PY"),
-    ("YV", "Venezuela", "VE"), ("8R", "Guyana", "GY"), ("PZ", "Suriname", "SR"), ("HJ", "Colombia", "CO"),
-    // ---- Western Europe ----
-    ("G", "England", "GB"), ("M", "England", "GB"), ("2E", "England", "GB"),
-    ("MM", "Scotland", "GB"), ("GM", "Scotland", "GB"), ("2M", "Scotland", "GB"),
-    ("MW", "Wales", "GB"), ("GW", "Wales", "GB"), ("2W", "Wales", "GB"),
-    ("MI", "N. Ireland", "GB"), ("GI", "N. Ireland", "GB"), ("2I", "N. Ireland", "GB"),
-    ("MD", "Isle of Man", "IM"), ("GD", "Isle of Man", "IM"), ("MJ", "Jersey", "JE"), ("GJ", "Jersey", "JE"),
-    ("MU", "Guernsey", "GG"), ("GU", "Guernsey", "GG"),
-    ("EI", "Ireland", "IE"), ("EJ", "Ireland", "IE"),
-    ("DL", "Germany", "DE"), ("DA", "Germany", "DE"), ("DB", "Germany", "DE"), ("DC", "Germany", "DE"),
-    ("DD", "Germany", "DE"), ("DF", "Germany", "DE"), ("DG", "Germany", "DE"), ("DH", "Germany", "DE"),
-    ("DJ", "Germany", "DE"), ("DK", "Germany", "DE"), ("DM", "Germany", "DE"), ("DO", "Germany", "DE"),
-    ("F", "France", "FR"), ("TM", "France", "FR"),
-    ("I", "Italy", "IT"), ("IZ", "Italy", "IT"), ("IK", "Italy", "IT"), ("IW", "Italy", "IT"),
-    ("EA", "Spain", "ES"), ("EB", "Spain", "ES"), ("EC", "Spain", "ES"), ("ED", "Spain", "ES"),
-    ("EH", "Spain", "ES"), ("CT", "Portugal", "PT"), ("CR", "Portugal", "PT"), ("CQ", "Portugal", "PT"),
-    ("PA", "Netherlands", "NL"), ("PB", "Netherlands", "NL"), ("PC", "Netherlands", "NL"),
-    ("PD", "Netherlands", "NL"), ("PE", "Netherlands", "NL"), ("PI", "Netherlands", "NL"),
-    ("ON", "Belgium", "BE"), ("OO", "Belgium", "BE"), ("OT", "Belgium", "BE"),
-    ("LX", "Luxembourg", "LU"), ("HB", "Switzerland", "CH"), ("HB0", "Liechtenstein", "LI"),
-    ("OE", "Austria", "AT"),
-    // ---- Nordics ----
-    ("SM", "Sweden", "SE"), ("SA", "Sweden", "SE"), ("SK", "Sweden", "SE"), ("8S", "Sweden", "SE"),
-    ("LA", "Norway", "NO"), ("LB", "Norway", "NO"), ("LN", "Norway", "NO"),
-    ("OZ", "Denmark", "DK"), ("OU", "Denmark", "DK"), ("5P", "Denmark", "DK"),
-    ("OH", "Finland", "FI"), ("OF", "Finland", "FI"), ("OG", "Finland", "FI"),
-    ("TF", "Iceland", "IS"),
-    // ---- Central / Eastern Europe ----
-    ("SP", "Poland", "PL"), ("SQ", "Poland", "PL"), ("SO", "Poland", "PL"), ("3Z", "Poland", "PL"),
-    ("OK", "Czech Rep.", "CZ"), ("OL", "Czech Rep.", "CZ"), ("OM", "Slovakia", "SK"),
-    ("HA", "Hungary", "HU"), ("HG", "Hungary", "HU"), ("YO", "Romania", "RO"), ("YP", "Romania", "RO"),
-    ("LZ", "Bulgaria", "BG"), ("S5", "Slovenia", "SI"), ("9A", "Croatia", "HR"), ("E7", "Bosnia", "BA"),
-    ("YT", "Serbia", "RS"), ("YU", "Serbia", "RS"), ("Z3", "N. Macedonia", "MK"), ("ZA", "Albania", "AL"),
-    ("SV", "Greece", "GR"), ("SW", "Greece", "GR"), ("Z6", "Kosovo", "XK"), ("4O", "Montenegro", "ME"),
-    ("ES", "Estonia", "EE"), ("YL", "Latvia", "LV"), ("LY", "Lithuania", "LT"),
-    ("UR", "Ukraine", "UA"), ("UT", "Ukraine", "UA"), ("UU", "Ukraine", "UA"), ("EW", "Belarus", "BY"),
-    ("ER", "Moldova", "MD"),
-    // ---- Russia & neighbours ----
-    ("UA", "Russia", "RU"), ("UB", "Russia", "RU"), ("RA", "Russia", "RU"), ("RU", "Russia", "RU"),
-    ("RV", "Russia", "RU"), ("RW", "Russia", "RU"), ("RK", "Russia", "RU"), ("RN", "Russia", "RU"),
-    ("R", "Russia", "RU"), ("UN", "Kazakhstan", "KZ"), ("EX", "Kyrgyzstan", "KG"), ("EY", "Tajikistan", "TJ"),
-    ("EZ", "Turkmenistan", "TM"), ("UK", "Uzbekistan", "UZ"), ("4L", "Georgia", "GE"),
-    ("EK", "Armenia", "AM"), ("4J", "Azerbaijan", "AZ"), ("4K", "Azerbaijan", "AZ"),
-    // ---- Mediterranean / Middle East ----
-    ("9H", "Malta", "MT"), ("5B", "Cyprus", "CY"), ("TA", "Turkey", "TR"), ("TB", "Turkey", "TR"),
-    ("YM", "Turkey", "TR"), ("4X", "Israel", "IL"), ("4Z", "Israel", "IL"), ("JY", "Jordan", "JO"),
-    ("OD", "Lebanon", "LB"), ("YK", "Syria", "SY"), ("YI", "Iraq", "IQ"), ("EP", "Iran", "IR"),
-    ("A4", "Oman", "OM"), ("A6", "United Arab Emirates", "AE"), ("A7", "Qatar", "QA"),
-    ("A9", "Bahrain", "BH"), ("9K", "Kuwait", "KW"), ("HZ", "Saudi Arabia", "SA"), ("7Z", "Saudi Arabia", "SA"),
-    ("A2", "Botswana", "BW"),
-    // ---- Africa ----
-    ("ZS", "South Africa", "ZA"), ("ZR", "South Africa", "ZA"), ("ZT", "South Africa", "ZA"),
-    ("SU", "Egypt", "EG"), ("CN", "Morocco", "MA"), ("7X", "Algeria", "DZ"), ("3V", "Tunisia", "TN"),
-    ("5A", "Libya", "LY"), ("5H", "Tanzania", "TZ"), ("5Z", "Kenya", "KE"), ("5N", "Nigeria", "NG"),
-    ("9G", "Ghana", "GH"), ("EL", "Liberia", "LR"), ("D2", "Angola", "AO"), ("C9", "Mozambique", "MZ"),
-    ("Z2", "Zimbabwe", "ZW"), ("9J", "Zambia", "ZM"), ("5R", "Madagascar", "MG"), ("3B8", "Mauritius", "MU"),
-    ("FR", "Reunion", "FR"), ("FT", "France (Africa)", "FR"),
-    // ---- Asia ----
-    ("JA", "Japan", "JP"), ("JE", "Japan", "JP"), ("JF", "Japan", "JP"), ("JG", "Japan", "JP"),
-    ("JH", "Japan", "JP"), ("JI", "Japan", "JP"), ("JJ", "Japan", "JP"), ("JK", "Japan", "JP"),
-    ("JR", "Japan", "JP"), ("JL", "Japan", "JP"), ("7K", "Japan", "JP"), ("7N", "Japan", "JP"),
-    ("HL", "South Korea", "KR"), ("DS", "South Korea", "KR"), ("6K", "South Korea", "KR"),
-    ("BY", "China", "CN"), ("BA", "China", "CN"), ("BD", "China", "CN"), ("BG", "China", "CN"),
-    ("BH", "China", "CN"), ("BV", "Taiwan", "TW"), ("BU", "Taiwan", "TW"), ("VR", "Hong Kong", "HK"),
-    ("XX9", "Macau", "MO"), ("VU", "India", "IN"), ("AT", "India", "IN"), ("AP", "Pakistan", "PK"),
-    ("S2", "Bangladesh", "BD"), ("4S", "Sri Lanka", "LK"), ("9N", "Nepal", "NP"), ("XW", "Laos", "LA"),
-    ("XZ", "Myanmar", "MM"), ("HS", "Thailand", "TH"), ("E2", "Thailand", "TH"), ("XV", "Vietnam", "VN"),
-    ("9M", "Malaysia", "MY"), ("9V", "Singapore", "SG"), ("YB", "Indonesia", "ID"), ("YC", "Indonesia", "ID"),
-    ("YD", "Indonesia", "ID"), ("DU", "Philippines", "PH"), ("DV", "Philippines", "PH"), ("DW", "Philippines", "PH"),
-    // ---- Oceania ----
-    ("VK", "Australia", "AU"), ("AX", "Australia", "AU"), ("VI", "Australia", "AU"),
-    ("ZL", "New Zealand", "NZ"), ("ZM", "New Zealand", "NZ"), ("ZK", "New Zealand", "NZ"),
-    ("FK", "New Caledonia", "FR"), ("FO", "Fr. Polynesia", "FR"), ("E5", "Cook Is.", "CK"),
-    ("3D2", "Fiji", "FJ"), ("KH6", "Hawaii", "US"), ("KH2", "Guam", "GU"), ("KH8", "Amer. Samoa", "AS"),
-];
+// Generated at compile time from data/cty.dat by build.rs.
+include!(concat!(env!("OUT_DIR"), "/table.rs"));
 
 #[cfg(test)]
 mod tests {
@@ -224,12 +119,45 @@ mod tests {
         assert_eq!(iso("G3ABC/P"), Some("GB")); // suffix dropped
         assert_eq!(iso("W1AW/4"), Some("US")); // digit suffix dropped
         assert_eq!(lookup("F/W1AW").map(|c| c.name), Some("France")); // reassigned prefix
-        assert_eq!(lookup("DL/N0JDC/M").map(|c| c.name), Some("Germany"));
+        assert_eq!(
+            lookup("DL/N0JDC/M").map(|c| c.name),
+            Some("Fed. Rep. of Germany")
+        );
     }
 
     #[test]
     fn unknown_returns_none() {
         assert_eq!(lookup(""), None);
         assert_eq!(lookup("///"), None);
+    }
+
+    #[test]
+    fn previously_missing_prefixes() {
+        assert_eq!(iso("XQ3SK"), Some("CL")); // Chile via XQ
+        assert_eq!(iso("JO1LVZ"), Some("JP")); // Japan via JO
+    }
+
+    #[test]
+    fn logbook_calls() {
+        let cases: &[(&str, &str)] = &[
+            ("5Z4VJ", "KE"), ("AA7VG", "US"), ("AD9GE", "US"), ("D2UY", "AO"),
+            ("HB9EFK", "CH"), ("JO1LVZ", "JP"), ("K3UCQ", "US"), ("K6GBZ", "US"),
+            ("K6LUM", "US"), ("K7CTV", "US"), ("K7IOC", "US"), ("K7MHI", "US"),
+            ("K9RRW", "US"), ("KB6JFL", "US"), ("KB7RUQ", "US"), ("KB9ELS", "US"),
+            ("KE0KUL", "US"), ("KE8ZKN", "US"), ("KF9UG", "US"), ("KG8FM", "US"),
+            ("KJ5MRD", "US"), ("KO6DGV", "US"), ("KV1F", "US"), ("N1FAM", "US"),
+            ("N3FMC", "US"), ("N5IF", "US"), ("N6ACA", "US"), ("N7PAW", "US"),
+            ("N7XAK", "US"), ("N8QA", "US"), ("N8WRC", "US"), ("N9OZ", "US"),
+            ("NA6JD", "US"), ("NC7I", "US"), ("NI5B", "US"), ("PI4DX", "NL"),
+            ("RW0AR", "RU"), ("SP3QDM", "PL"), ("VA3WL", "CA"), ("VE7SAY", "CA"),
+            ("W0HU", "US"), ("W1ABC", "US"), ("W6ACT", "US"), ("W7AIA", "US"),
+            ("W7LDE", "US"), ("W7OTV", "US"), ("W7RPS", "US"), ("W7WHO", "US"),
+            ("WA0LXY", "US"), ("WH6S", "US"), ("WR3X", "US"), ("WY7AA", "US"),
+            ("XQ3SK", "CL"),
+        ];
+        for (call, expected_iso) in cases {
+            let result = lookup(call).map(|c| c.iso);
+            assert_eq!(result, Some(*expected_iso), "failed for {call}");
+        }
     }
 }
