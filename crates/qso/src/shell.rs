@@ -23,7 +23,8 @@ use std::time::Duration;
 
 use bus::types::{
     AbsHz, Band, ClockStatus, Decode, InterlockReply, InterlockRequest, LogEntry, OffsetHz,
-    OverAirMode, QsoCommand, QsoId, QsoPhase, QsoState, RadioId, Selection, SlotId, StationId,
+    OverAirMode, QsoCommand, QsoId, QsoPhase, QsoState, RadioId, RigState, Selection, SlotId,
+    StationId,
     Timestamp, TxAck, TxRequest,
 };
 use bus::{BusHandle, BusMessage, DeliveryClass, Topic, TopicSelector};
@@ -139,6 +140,14 @@ async fn run(
             return;
         }
     };
+    let mut rig_state =
+        match bus.subscribe::<RigState>(TopicSelector::Exact(Topic::RigState(radio.clone()))) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("qso: cannot subscribe rig state: {e:?}");
+                return;
+            }
+        };
 
     // Publish an initial Idle state so late-joining UIs render immediately.
     let _ = bus.publish(&Topic::QsoState(radio.clone()), engine.state());
@@ -157,6 +166,9 @@ async fn run(
     // post-restart contacts were silently dropped (never persisted). now_ms at
     // startup is strictly greater than any prior session's seqs, so no collision.
     let mut seq: u64 = now_ms();
+    // The rig's last-seen VFO frequency, used to stamp the real band/freq on a
+    // completed contact (replacing the old hardcoded 20 m placeholder).
+    let mut last_vfo: Option<AbsHz> = None;
 
     loop {
         // Pick up any live station-config change before handling the next event.
@@ -200,6 +212,13 @@ async fn run(
                 }
                 Err(_) => continue,
             },
+            r = rig_state.recv() => match r {
+                Ok(rs) => {
+                    last_vfo = Some(rs.vfo);
+                    continue;
+                }
+                Err(_) => continue,
+            },
             else => break,
         };
 
@@ -211,11 +230,15 @@ async fn run(
             step,
             allow_transmit,
             mode,
+            last_vfo,
         );
     }
 }
 
 /// Publish the new state and act on the engine's TX / log outputs.
+// Threads the loop's live mode/freq state in; the single-owner producer refactor
+// (Phase 2 of the stabilization plan) will collapse these into a context struct.
+#[allow(clippy::too_many_arguments)]
 fn apply(
     bus: &BusHandle,
     radio: &RadioId,
@@ -224,6 +247,7 @@ fn apply(
     step: Step,
     allow_transmit: bool,
     mode: OverAirMode,
+    vfo: Option<AbsHz>,
 ) {
     // For a final TX (RR73/73): the engine transitions to Idle at the moment it
     // issues the TxIntent, before PTT is keyed or audio starts. Publishing Idle
@@ -262,7 +286,7 @@ fn apply(
         *seq += 1;
         let _ = bus.publish(
             &Topic::LogbookEntries,
-            build_log(done, radio.clone(), my_station.clone(), *seq, mode),
+            build_log(done, radio.clone(), my_station.clone(), *seq, mode, vfo),
         );
     }
 }
@@ -345,17 +369,20 @@ fn spawn_transmit(
 }
 
 /// Build a [`LogEntry`] from a completed contact. `mode` is the real on-air mode
-/// (tracked from the partner's decodes); band/freq remain placeholders until the
-/// engine subscribes to `RigState`. Logging is dormant while TX is blocked (no QSO
-/// can complete on the air), so this is wired for correctness, not yet exercised.
-/// TODO: stamp real band/freq/time.
+/// (tracked from the partner's decodes); `vfo` is the rig's last-seen dial
+/// frequency, from which the real band is classified. Falls back to 20 m / 14.074
+/// MHz only if no `RigState` has been seen yet — which can't happen for a contact
+/// that completed on the air, since TX requires a live rig.
 fn build_log(
     done: CompletedQso,
     radio: RadioId,
     origin: StationId,
     seq: u64,
     mode: OverAirMode,
+    vfo: Option<AbsHz>,
 ) -> LogEntry {
+    let freq = vfo.unwrap_or(AbsHz(14_074_000));
+    let band = Band::from_hz(freq).unwrap_or(Band::B20m);
     LogEntry {
         id: QsoId {
             origin: origin.clone(),
@@ -365,8 +392,8 @@ fn build_log(
         radio: Some(radio),
         call: done.call,
         mode,
-        band: Band::B20m,
-        freq: AbsHz(14_074_000),
+        band,
+        freq,
         time: Timestamp(now_ms() as i64),
         exchange_sent: done.exchange_sent,
         exchange_rcvd: done.exchange_rcvd,
@@ -385,4 +412,51 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bus::types::Callsign;
+
+    fn done() -> CompletedQso {
+        CompletedQso {
+            call: Callsign("K1ABC".into()),
+            grid: None,
+            section: None,
+            exchange_sent: "5NN".into(),
+            exchange_rcvd: "5NN".into(),
+        }
+    }
+
+    /// The logged contact records the band/freq of the rig's VFO — not the old
+    /// hardcoded 20 m / 14.074 MHz that broke per-band Field Day scoring.
+    #[test]
+    fn build_log_stamps_band_and_freq_from_vfo() {
+        let e = build_log(
+            done(),
+            RadioId("rig0".into()),
+            StationId("me".into()),
+            1,
+            OverAirMode::Ft8,
+            Some(AbsHz(7_074_000)), // 40 m FT8
+        );
+        assert_eq!(e.band, Band::B40m);
+        assert_eq!(e.freq, AbsHz(7_074_000));
+    }
+
+    /// With no `RigState` seen, fall back to the 20 m placeholder.
+    #[test]
+    fn build_log_falls_back_without_rig_state() {
+        let e = build_log(
+            done(),
+            RadioId("rig0".into()),
+            StationId("me".into()),
+            2,
+            OverAirMode::Ft8,
+            None,
+        );
+        assert_eq!(e.band, Band::B20m);
+        assert_eq!(e.freq, AbsHz(14_074_000));
+    }
 }
