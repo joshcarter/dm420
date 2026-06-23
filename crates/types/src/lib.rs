@@ -368,6 +368,27 @@ pub fn calling_freq(band: Band, mode: OverAirMode) -> Option<AbsHz> {
     Some(AbsHz(hz))
 }
 
+impl Band {
+    /// Classify a dial/VFO frequency into its amateur band — the inverse of
+    /// [`calling_freq`]. Returns `None` for a frequency outside the HF/6 m
+    /// amateur allocations (e.g. in a gap between bands).
+    pub fn from_hz(freq: AbsHz) -> Option<Band> {
+        Some(match freq.0 {
+            1_800_000..=2_000_000 => Band::B160m,
+            3_500_000..=4_000_000 => Band::B80m,
+            7_000_000..=7_300_000 => Band::B40m,
+            10_100_000..=10_150_000 => Band::B30m,
+            14_000_000..=14_350_000 => Band::B20m,
+            18_068_000..=18_168_000 => Band::B17m,
+            21_000_000..=21_450_000 => Band::B15m,
+            24_890_000..=24_990_000 => Band::B12m,
+            28_000_000..=29_700_000 => Band::B10m,
+            50_000_000..=54_000_000 => Band::B6m,
+            _ => return None,
+        })
+    }
+}
+
 // =====================================================================
 // §5  Selection + QSO
 // =====================================================================
@@ -909,6 +930,34 @@ mod tests {
         round_trip(ContestProfile::ArrlFieldDay);
         round_trip(SignalSource::Received);
         round_trip(SignalSource::OwnTx);
+    }
+
+    #[test]
+    fn band_from_hz_classifies_and_round_trips() {
+        // Every band's standard FT8/FT4 calling frequency classifies back to it.
+        for b in [
+            Band::B160m,
+            Band::B80m,
+            Band::B40m,
+            Band::B30m,
+            Band::B20m,
+            Band::B17m,
+            Band::B15m,
+            Band::B12m,
+            Band::B10m,
+            Band::B6m,
+        ] {
+            for m in [OverAirMode::Ft8, OverAirMode::Ft4] {
+                if let Some(f) = calling_freq(b, m) {
+                    assert_eq!(Band::from_hz(f), Some(b), "{b:?} {m:?} @ {}", f.0);
+                }
+            }
+        }
+        assert_eq!(Band::from_hz(AbsHz(14_074_000)), Some(Band::B20m));
+        assert_eq!(Band::from_hz(AbsHz(7_000_000)), Some(Band::B40m)); // lower edge
+        assert_eq!(Band::from_hz(AbsHz(7_300_000)), Some(Band::B40m)); // upper edge
+        assert_eq!(Band::from_hz(AbsHz(5_000_000)), None); // between 80 m and 40 m
+        assert_eq!(Band::from_hz(AbsHz(100_000_000)), None); // above 6 m
     }
 
     #[test]
