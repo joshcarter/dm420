@@ -1,12 +1,8 @@
 # Next
 
+When someone hops on the RR73 with a call, answer instead of calling CQ
+
 Audio option: RX clipping indicator
-
-Need an option for calling a specific station.
-
-When a station answers my CQ, highlight them on the map
-
-Does not seem to handle a station answering on another offset
 
 
 
@@ -17,6 +13,10 @@ Double-click to lock audio offset? Click again to unlock.
 How can we tell if two stations are communicating at different offsets?
 
 # Soon
+
+Map Panel: Once QSO is cleared, turn off crosshairs
+
+Map Panel: When a station answers my CQ, highlight them on the map
 
 I'm not sure what to do when a station I'm trying to work goes and chases other stations. Cancel? Or just wait? Wait on same offset?
 

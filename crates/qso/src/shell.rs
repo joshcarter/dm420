@@ -23,8 +23,8 @@ use std::time::Duration;
 
 use bus::types::{
     AbsHz, Band, ClockStatus, Decode, InterlockReply, InterlockRequest, LogEntry, OffsetHz,
-    OverAirMode, QsoCommand, QsoId, RadioId, Selection, SlotId, StationId, Timestamp, TxAck,
-    TxRequest,
+    OverAirMode, QsoCommand, QsoId, QsoPhase, QsoState, RadioId, Selection, SlotId, StationId,
+    Timestamp, TxAck, TxRequest,
 };
 use bus::{BusHandle, BusMessage, DeliveryClass, Topic, TopicSelector};
 use serde::{Deserialize, Serialize};
@@ -225,15 +225,31 @@ fn apply(
     allow_transmit: bool,
     mode: OverAirMode,
 ) {
-    let _ = bus.publish(&Topic::QsoState(radio.clone()), step.state);
+    // For a final TX (RR73/73): the engine transitions to Idle at the moment it
+    // issues the TxIntent, before PTT is keyed or audio starts. Publishing Idle
+    // immediately would cause the GUI to flash amber between the Armed and
+    // Transmitting accents. Instead, defer the Idle publication to after the over
+    // plays out — spawn_transmit publishes it once TxAck arrives so the bus stays
+    // Armed throughout. For all other TX messages the engine stays Active, so this
+    // path is never taken; and if TX is gated off we publish now since no task will.
+    let final_state = if matches!(step.state.phase, QsoPhase::Idle) && step.tx.is_some() {
+        Some(step.state.clone())
+    } else {
+        let _ = bus.publish(&Topic::QsoState(radio.clone()), step.state);
+        None
+    };
 
     if let Some(tx) = step.tx {
         if allow_transmit {
             // Hand the over to the audio-TX codec on its own task (acquire token →
             // request TxRequest → release). The engine loop keeps running so it
             // still services decodes/clock during the ~13 s transmission.
-            spawn_transmit(bus.clone(), radio.clone(), tx, mode);
+            spawn_transmit(bus.clone(), radio.clone(), tx, mode, final_state);
         } else {
+            // TX gated: publish the deferred state now since no task will.
+            if let Some(state) = final_state {
+                let _ = bus.publish(&Topic::QsoState(radio.clone()), state);
+            }
             tracing::debug!(
                 "qso: TX gated off; would send {:?} @ {:?}",
                 tx.message.text,
@@ -255,7 +271,16 @@ fn apply(
 /// the message to the audio-TX codec (which keys, plays, and reports on
 /// `tx_report`), then release the token so the next slot can acquire it. Spawned so
 /// the engine loop keeps servicing decodes/clock through the ~13 s over.
-fn spawn_transmit(bus: BusHandle, radio: RadioId, tx: TxIntent, mode: OverAirMode) {
+fn spawn_transmit(
+    bus: BusHandle,
+    radio: RadioId,
+    tx: TxIntent,
+    mode: OverAirMode,
+    // State to publish after the over finishes — deferred when the engine already
+    // transitioned to Idle before the TxIntent fired (RR73/73 final TX), so the
+    // bus stays Armed while audio is on the air rather than flashing idle.
+    final_state: Option<QsoState>,
+) {
     tokio::spawn(async move {
         tracing::debug!(
             offset = ?tx.offset, slot = ?tx.slot, message = %tx.message.text,
@@ -272,10 +297,16 @@ fn spawn_transmit(bus: BusHandle, radio: RadioId, tx: TxIntent, mode: OverAirMod
             Ok(InterlockReply::Granted { token, .. }) => token,
             Ok(other) => {
                 tracing::warn!("qso: PTT interlock not granted: {other:?}");
+                if let Some(state) = final_state {
+                    let _ = bus.publish(&Topic::QsoState(radio.clone()), state);
+                }
                 return;
             }
             Err(e) => {
                 tracing::warn!("qso: interlock request failed: {e:?}");
+                if let Some(state) = final_state {
+                    let _ = bus.publish(&Topic::QsoState(radio.clone()), state);
+                }
                 return;
             }
         };
@@ -306,6 +337,10 @@ fn spawn_transmit(bus: BusHandle, radio: RadioId, tx: TxIntent, mode: OverAirMod
                 Duration::from_secs(2),
             )
             .await;
+        // Publish the deferred final state now that the over is done.
+        if let Some(state) = final_state {
+            let _ = bus.publish(&Topic::QsoState(radio.clone()), state);
+        }
     });
 }
 
