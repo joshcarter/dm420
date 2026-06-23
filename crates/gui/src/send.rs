@@ -36,6 +36,8 @@ pub enum Command {
     /// for that band in the *current* mode — resolved at apply time via
     /// [`calling_freq_hz`], since the parser doesn't know the mode.
     SetBand(Band),
+    /// Jump the TX audio offset to the clearest CQ lane (`/clear`).
+    ClearQsy,
 }
 
 /// Parse a slash/colon command. Returns `None` if it isn't a command or the
@@ -53,6 +55,7 @@ pub fn parse_command(input: &str) -> Option<Command> {
             (mhz.is_finite() && mhz > 0.0).then_some(Command::SetFrequency(mhz))
         }
         "b" | "band" => parse_band(tokens.next()?).map(Command::SetBand),
+        "clear" => Some(Command::ClearQsy),
         _ => None,
     }
 }

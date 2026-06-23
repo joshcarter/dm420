@@ -153,6 +153,11 @@ pub struct Waterfall {
     /// `true` widens the decode side to 2/3 (`WS_DECODE_WIDE_FRAC`). Loaded from
     /// the config file at startup, toggled live from the unlocked EDIT surface.
     wide_decode: bool,
+    /// When true, the TX audio offset is locked: clicks on the waterslide, auto-QSY
+    /// hops, and the `q`/`/clear` shortcut cannot move it. Toggled with Tab or the
+    /// padlock button on the TX band. (egui 0.34 drops NamedKey::CapsLock; Tab is
+    /// used instead.)
+    offset_locked: bool,
     /// Frequency-axis view window (Hz): the lowest visible audio offset and the
     /// span shown top-to-bottom. The decode side and the spectrogram share it.
     /// Default is the full `[0, WS_MAX_HZ]`; scroll-wheel zooms (to the cursor),
@@ -187,6 +192,7 @@ impl Waterfall {
             cq_shortcuts: vec![None; 10],
             last_next_tx: None,
             wide_decode: crate::settings::read_waterslide_wide(),
+            offset_locked: false,
             view_lo_hz: 0.0,
             view_span_hz: WS_MAX_HZ,
             auto_hop: false,
@@ -228,13 +234,44 @@ impl Waterfall {
                 .qso_state()
                 .is_none_or(|s| matches!(s.phase, QsoPhase::Idle));
 
+        // `now_ms` is hoisted here (rather than after the QSO block below) so the
+        // Tab and Q key handlers can pass it to `best_cq_offset` synchronously.
+        let now_ms = chrono::Utc::now().timestamp_millis();
+
         let mut activate = false;
         if ctx.active {
             let events = ctx.ui.input(|i| i.events.clone());
-            // Track whether a digit was consumed as a shortcut so its companion
+            // Track whether a key was consumed as a shortcut so its companion
             // Event::Text doesn't also flow into the slash-command buffer.
             let mut digit_consumed = false;
+            let mut tab_consumed = false;
             for ev in &events {
+                // Tab — toggle the TX offset lock.
+                // Guard: no modifiers, NOT mid-command, not armed (shortcuts_active).
+                if let egui::Event::Key { key: egui::Key::Tab, pressed: true, modifiers, .. } = ev
+                    && !modifiers.any()
+                    && !self.send.entering
+                    && shortcuts_active
+                {
+                    self.offset_locked = !self.offset_locked;
+                    tab_consumed = true;
+                    digit_consumed = true;
+                    continue;
+                }
+                // Q — Clear QSY: jump offset to the clearest available lane.
+                // Guard: no modifiers, NOT mid-command, not armed, offset not locked.
+                if let egui::Event::Key { key: egui::Key::Q, pressed: true, modifiers, .. } = ev
+                    && !modifiers.any()
+                    && !self.send.entering
+                    && shortcuts_active
+                    && !self.offset_locked
+                {
+                    if let Some(off) = Self::best_cq_offset(ctx, now_ms) {
+                        self.real_sel = RealSel { offset: off, target: None, resume: None };
+                    }
+                    digit_consumed = true;
+                    continue;
+                }
                 // Digit shortcut: no modifiers, not mid-command, not armed.
                 if let egui::Event::Key { key, pressed: true, modifiers, .. } = ev
                     && !modifiers.any()
@@ -246,12 +283,16 @@ impl Waterfall {
                     if let Some(d) = self.cq_shortcuts[idx].clone()
                         && let Some((call, slot)) = decode_station(&d)
                     {
+                        // When the offset is locked, keep our TX frequency and arm
+                        // there; the station's offset only matters for who we target.
+                        let arm_off =
+                            if self.offset_locked { self.real_sel.offset } else { d.offset.0 };
                         self.real_sel = RealSel {
-                            offset: d.offset.0,
+                            offset: arm_off,
                             target: Some((call.clone(), slot)),
                             resume: None,
                         };
-                        ctx.bus.answer_station(d.offset.0, call, slot);
+                        ctx.bus.answer_station(arm_off, call, slot);
                     }
                     continue;
                 }
@@ -274,6 +315,14 @@ impl Waterfall {
                     } => self.send.escape(),
                     _ => {}
                 }
+            }
+            // Remove Tab from egui's input queue so focus traversal doesn't also
+            // fire and move focus to a header button when we handled Tab as a lock.
+            if tab_consumed {
+                ctx.ui.input_mut(|i| {
+                    i.events
+                        .retain(|e| !matches!(e, egui::Event::Key { key: egui::Key::Tab, pressed: true, .. }));
+                });
             }
         }
 
@@ -322,7 +371,6 @@ impl Waterfall {
         // over we latch the message being sent — preferring the live `next_tx`,
         // else the one shown last frame, since by the time the own-TX column reaches
         // the GUI the engine may already have stepped to idle (the final 73/RR73).
-        let now_ms = chrono::Utc::now().timestamp_millis();
         let transmitting = ctx.bus.tx_spectrum().is_some_and(|r| now_ms - r.t.0 < 500);
         if transmitting {
             if self.tx_hold.is_none() {
@@ -352,35 +400,14 @@ impl Waterfall {
         let pal = ctx.pal;
         let painter = ctx.painter;
 
-        // Layout: [ AUTO QSY ] [ FIND CQ ] [Send:] [────── box ──────] [ SEND ]
+        // Layout: [Send:] [────── box ──────] [ SEND ]
+        // AUTO QSY moved to unlocked config form; QSY CLEAR is now Tab/q/`/clear`.
         let pad = 8.0;
         let label = "Send:";
         let label_font = mono(11.0);
         let label_w = measure(painter, label, label_font.clone());
         let cy = row.center().y;
-
-        // Operating affordances at the far left, before the Send: label. AUTO QSY is
-        // a square checkbox (a mode toggle — matches the Contacts footer toggles);
-        // QSY CLEAR is a momentary lit key that jumps the TX offset to the clearest
-        // lane. Both show whenever there's a live radio + callsign (they read the live
-        // RX spectrum); QSY CLEAR is disabled (dim) during a contact — you pick a CQ
-        // lane when about to start one, not mid-QSO.
-        let show_keys = ctx.bus.is_real() && call_set;
-        let mut x = row.left() + pad;
-        let auto_box = show_keys.then(|| {
-            let sq =
-                Rect::from_center_size(Pos2::new(x + TOGGLE_SQ * 0.5, cy), egui::Vec2::splat(TOGGLE_SQ));
-            let label_w = measure(painter, &tracked("AUTO QSY"), heading(8.5));
-            x = sq.right() + 6.0 + label_w + pad;
-            sq
-        });
-        let find_track = show_keys.then(|| {
-            let w = measure(painter, &tracked("QSY CLEAR"), heading_bold(9.0)) + 22.0 + 4.0;
-            let t = Rect::from_min_max(Pos2::new(x, cy - 11.0), Pos2::new(x + w, cy + 11.0));
-            x = t.right() + pad;
-            t
-        });
-        let label_x = x;
+        let label_x = row.left() + pad;
 
         painter.text(
             Pos2::new(label_x, cy),
@@ -494,78 +521,10 @@ impl Waterfall {
             }
         }
 
-        // QSY CLEAR: jump the outgoing offset to the clearest CQ lane. Opinionated —
-        // it moves straight to the single best lane (no menu); the operator then
-        // presses SEND. Lit and clickable while idle; drawn dim and inert during a
-        // contact (you pick a lane before a CQ, not mid-QSO).
-        if let Some(ftrack) = find_track {
-            let enabled = !active_qso;
-            lcd_panel(painter, ftrack, pal, 4);
-            let fcell = Rect::from_min_max(
-                Pos2::new(ftrack.left() + 2.0, ftrack.top() + 2.0),
-                Pos2::new(ftrack.right() - 2.0, ftrack.bottom() - 2.0),
-            );
-            let fbtn = key_cell_accent(
-                ctx.ui,
-                painter,
-                pal,
-                fcell,
-                "QSY CLEAR",
-                enabled,
-                pal.accent,
-                ctx.ui.id().with("ft8_qsy_clear_btn"),
-            );
-            if enabled
-                && fbtn.clicked()
-                && let Some(off) = Self::best_cq_offset(ctx, now_ms)
-            {
-                // Bare CQ offset — clear any clicked-station selection.
-                self.real_sel = RealSel {
-                    offset: off,
-                    target: None,
-                    resume: None,
-                };
-            }
-        }
-
-        // AUTO QSY: a square checkbox (solid = on, hollow = off), matching the
-        // Contacts footer toggles. When on, the engine moves to a clearer lane after
-        // 3 unanswered CQs — it owns the timing so the hop lands right before the next
-        // CQ, and a reply still cancels it. We mirror the flag here and push it over
-        // the bus to the engine.
-        if let Some(sq) = auto_box {
-            let resp = ctx.ui.interact(
-                sq.expand(2.0),
-                ctx.ui.id().with("ft8_auto_qsy_toggle"),
-                egui::Sense::click(),
-            );
-            if resp.clicked() {
-                self.auto_hop = !self.auto_hop;
-                ctx.bus.set_auto_hop(self.auto_hop);
-            }
-            if self.auto_hop {
-                painter.rect_filled(sq, egui::CornerRadius::ZERO, pal.accent);
-            } else {
-                painter.rect_stroke(
-                    sq,
-                    egui::CornerRadius::ZERO,
-                    egui::Stroke::new(TOGGLE_STROKE, pal.sub),
-                    egui::StrokeKind::Inside,
-                );
-            }
-            painter.text(
-                Pos2::new(sq.right() + 6.0, cy),
-                Align2::LEFT_CENTER,
-                tracked("AUTO QSY"),
-                heading(8.5),
-                if self.auto_hop { pal.legend } else { pal.sub },
-            );
-        }
-
-        // While auto-QSY is on, keep the engine's hop target fresh: feed it the
-        // current best CQ lane once per clock slot (after that slot's decodes
-        // settle), not every frame.
-        if self.auto_hop {
+        // While auto-QSY is on and the offset is unlocked, keep the engine's hop
+        // target fresh: feed it the current best CQ lane once per clock slot (after
+        // that slot's decodes settle), not every frame.
+        if self.auto_hop && !self.offset_locked {
             let slot = ctx.bus.clock().map(|c| c.slot);
             if slot != self.last_hop_feed_slot {
                 self.last_hop_feed_slot = slot;
@@ -582,22 +541,35 @@ impl Waterfall {
     /// is retuned and the header tracks the resulting `RigState`; in mock mode
     /// there's no rig, so we set the local display override for feedback.
     fn apply_command(&mut self, ctx: &PanelCtx, cmd: Command) {
-        let hz = match cmd {
-            Command::SetFrequency(mhz) => Some((mhz * 1_000_000.0).round() as u64),
-            Command::SetBand(band) => {
-                let mode = ctx
-                    .bus
-                    .spectrum()
-                    .map(|s| s.mode)
-                    .unwrap_or(OverAirMode::Ft8);
-                crate::send::calling_freq_hz(band, mode)
+        match cmd {
+            Command::ClearQsy => {
+                if !self.offset_locked {
+                    let now_ms = chrono::Utc::now().timestamp_millis();
+                    if let Some(off) = Self::best_cq_offset(ctx, now_ms) {
+                        self.real_sel = RealSel { offset: off, target: None, resume: None };
+                    }
+                }
             }
-        };
-        if let Some(hz) = hz {
-            if ctx.bus.is_real() {
-                ctx.bus.set_freq(hz);
-            } else {
-                self.vfo_override_hz = Some(hz);
+            cmd => {
+                let hz = match cmd {
+                    Command::SetFrequency(mhz) => Some((mhz * 1_000_000.0).round() as u64),
+                    Command::SetBand(band) => {
+                        let mode = ctx
+                            .bus
+                            .spectrum()
+                            .map(|s| s.mode)
+                            .unwrap_or(OverAirMode::Ft8);
+                        crate::send::calling_freq_hz(band, mode)
+                    }
+                    Command::ClearQsy => unreachable!(),
+                };
+                if let Some(hz) = hz {
+                    if ctx.bus.is_real() {
+                        ctx.bus.set_freq(hz);
+                    } else {
+                        self.vfo_override_hz = Some(hz);
+                    }
+                }
             }
         }
     }
@@ -615,7 +587,7 @@ impl Panel for Waterfall {
         // we only adopt the display selection here (no re-arm — Enter still arms).
         if let Some(pick) = ctx.map_pick.take() {
             self.real_sel.target = Some((pick.call, pick.slot));
-            if let Some(off) = pick.offset {
+            if let Some(off) = pick.offset && !self.offset_locked {
                 self.real_sel.offset = off;
             }
         }
@@ -757,7 +729,7 @@ impl Panel for Waterfall {
                             .layout(egui::Layout::top_down(egui::Align::Min)),
                     );
                     child.set_clip_rect(screen.shrink(2.0));
-                    self.form.ui(&mut child, ctx.bus, pal, &mut self.wide_decode);
+                    self.form.ui(&mut child, ctx.bus, pal, &mut self.wide_decode, &mut self.auto_hop);
                 } else {
                     draw_centered_note(
                         painter,
@@ -876,6 +848,18 @@ impl Panel for Waterfall {
                         self.real_sel.resume = None;
                     }
 
+                    // Keep real_sel.offset in sync with the engine's actual TX offset
+                    // when unlocked, so auto-QSY hops are reflected in the cursor.
+                    // When locked, real_sel.offset is authoritative — the engine is
+                    // never allowed to move it.
+                    if !self.offset_locked {
+                        if let Some(engine_off) =
+                            ctx.bus.qso_state().and_then(|q| q.tx_offset)
+                        {
+                            self.real_sel.offset = engine_off.0;
+                        }
+                    }
+
                     // Click-to-select on the live waterslide (mock mode selects via
                     // the sim's own `ui()`; the real waterslide is draw-only). We
                     // hit-test via the body interaction above and let `draw_waterslide`
@@ -921,14 +905,10 @@ impl Panel for Waterfall {
                         .and_then(band_for_hz)
                         .map(|b| ctx.bus.worked_calls_on_band(b))
                         .unwrap_or_default();
-                    // The TX-lane indicator follows the engine's actual offset while
-                    // it's calling / in a contact (so it tracks an auto-QSY hop), and
-                    // the local click selection only when idle.
-                    let tx_off = ctx
-                        .bus
-                        .qso_state()
-                        .and_then(|q| q.tx_offset)
-                        .map_or(self.real_sel.offset, |o| o.0);
+                    // real_sel.offset is the single source of truth for the TX lane.
+                    // The engine's tx_offset is synced back into it above (when
+                    // unlocked), so auto-QSY hops are reflected without switching sources.
+                    let tx_off = self.real_sel.offset;
 
                     // Slot-locked CQ shortcuts. Assignments are updated once per
                     // slot boundary (drop aged/worked, fill freed slots with new
@@ -975,7 +955,7 @@ impl Panel for Waterfall {
                         slots
                     };
 
-                    if let Some(sel) = draw_waterslide(
+                    if let Some(mut sel) = draw_waterslide(
                         painter,
                         body,
                         pal,
@@ -998,8 +978,58 @@ impl Panel for Waterfall {
                         self.view_lo_hz,
                         self.view_span_hz,
                     ) {
+                        // When the offset is locked, allow station selection/QSO
+                        // initiation to proceed normally — only protect the TX Hz.
+                        if self.offset_locked {
+                            sel.offset = self.real_sel.offset;
+                        }
                         self.real_sel = sel;
                     }
+
+                    // When locked, show a "LOCKED" key button at the right edge of
+                    // the TX band. Clicking it unlocks. Nothing is shown when unlocked.
+                    if self.offset_locked
+                        && tx_off < self.view_lo_hz + self.view_span_hz
+                        && tx_off + bandwidth_hz > self.view_lo_hz
+                    {
+                        let y_bot = (body.bottom()
+                            - ((tx_off - self.view_lo_hz) / self.view_span_hz)
+                                * body.height())
+                        .min(body.bottom());
+                        let y_top = (body.bottom()
+                            - ((tx_off + bandwidth_hz - self.view_lo_hz)
+                                / self.view_span_hz)
+                                * body.height())
+                        .max(body.top())
+                        .min(y_bot - 3.0);
+                        let band_cy = (y_top + y_bot) * 0.5;
+                        let cell_w =
+                            measure(painter, &tracked("LOCKED"), heading_bold(9.0)) + 14.0;
+                        let track_w = cell_w + 4.0;
+                        let track = Rect::from_center_size(
+                            Pos2::new(body.right() - track_w * 0.5 - 4.0, band_cy),
+                            egui::Vec2::new(track_w, 16.0),
+                        );
+                        lcd_panel(painter, track, pal, 3);
+                        let cell = Rect::from_min_max(
+                            Pos2::new(track.left() + 2.0, track.top() + 2.0),
+                            Pos2::new(track.right() - 2.0, track.bottom() - 2.0),
+                        );
+                        let locked_btn = key_cell_accent(
+                            ctx.ui,
+                            painter,
+                            pal,
+                            cell,
+                            "LOCKED",
+                            true,
+                            op_accent,
+                            ctx.ui.id().with("offset_lock_btn"),
+                        );
+                        if locked_btn.clicked() {
+                            self.offset_locked = false;
+                        }
+                    }
+
                     ctx.ui
                         .ctx()
                         .request_repaint_after(std::time::Duration::from_millis(33));
@@ -1980,9 +2010,12 @@ fn draw_waterslide(
     if let Some(cp) = click {
         return Some(hit.unwrap_or_else(|| {
             // Inverse of the windowed `y_of`: read the offset off the vertical click
-            // position against the current view, then clamp to the full band.
-            let off =
-                (view_lo + (rect.bottom() - cp.y) / rect.height() * view_span).clamp(0.0, WS_MAX_HZ);
+            // position against the current view. The offset is the signal's *lowest*
+            // tone, so its energy center sits `bandwidth/2` above it — subtract half
+            // to land the band center on the click point, then clamp to the full band.
+            let off = (view_lo + (rect.bottom() - cp.y) / rect.height() * view_span
+                - bandwidth_hz / 2.0)
+                .clamp(0.0, WS_MAX_HZ);
             RealSel {
                 offset: off,
                 target: None,
@@ -2079,7 +2112,7 @@ impl ConfigForm {
         }
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, bus: &BusView, pal: &Palette, wide: &mut bool) {
+    fn ui(&mut self, ui: &mut egui::Ui, bus: &BusView, pal: &Palette, wide: &mut bool, auto_hop: &mut bool) {
         if !self.loaded {
             self.load(bus);
         }
@@ -2268,6 +2301,16 @@ impl ConfigForm {
                     .color(pal.sub)
                     .italics(),
                 );
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.label(egui::RichText::new("OPERATING").color(pal.legend).strong());
+                ui.add_space(4.0);
+                let prev_hop = *auto_hop;
+                ui.checkbox(auto_hop, "Auto QSY — hop to clearest lane after 3 unanswered CQs");
+                if *auto_hop != prev_hop {
+                    bus.set_auto_hop(*auto_hop);
+                }
             });
     }
 }

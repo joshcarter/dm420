@@ -306,21 +306,24 @@ impl Engine {
     }
 
     /// Armed → answering: commit when the target calls CQ.
-    fn commit_from_armed(&mut self, msg: &ParsedMessage, offset: &OffsetHz, slot: SlotId, snr: i8) {
+    fn commit_from_armed(&mut self, msg: &ParsedMessage, _their_offset: &OffsetHz, slot: SlotId, snr: i8) {
         let State::Armed { target, .. } = &self.state else {
             return;
         };
         let target = target.clone();
         match msg {
-            // The target called CQ — snap to it and answer in the opposite slot.
+            // The target called CQ — answer in the opposite slot at our chosen TX
+            // offset (self.outgoing), which the UI set via the Selection topic when
+            // the operator armed. Using the target's decoded offset here would
+            // ignore a locked audio offset and transmit on the wrong frequency.
             ParsedMessage::Cq { caller, grid, .. } if Some(caller) == target.call.as_ref() => {
-                tracing::info!(target = ?caller, "qso engine: target called CQ → answering");
+                tracing::info!(target = ?caller, tx_offset = ?self.outgoing, "qso engine: target called CQ → answering");
                 let opener = self.opener(caller);
                 self.state = State::Active(Box::new(Active {
                     role: Role::Answering,
                     partner: caller.clone(),
                     target: Some(target),
-                    offset: *offset,
+                    offset: self.outgoing,
                     tx_parity: parity_after(slot),
                     next: Some(opener),
                     finish_after_tx: None,

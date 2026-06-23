@@ -1,5 +1,7 @@
 # Next
 
+Once QSO finishes, unhighlight that station's traffic and set our "send" box back to CQ
+
 When someone hops on the RR73 with a call, answer instead of calling CQ
 
 Audio option: RX clipping indicator
@@ -8,9 +10,12 @@ Audio option: RX clipping indicator
 
 # Split audio offset
 
-Double-click to lock audio offset? Click again to unlock.
+Caps lock to lock audio offset. Also display a locked button at the right of the offset indicator which will unlock if clicked.
 
-How can we tell if two stations are communicating at different offsets?
+Add "a" and "/clear" to find a clear QSY, replace the "clear qsy" button
+
+Add "auto QSY" option to the unlocked panel
+
 
 # Soon
 
@@ -25,7 +30,7 @@ Review if hashed callsigns are properly implemented.
 Need to determine actual limits of audio offset for
 transmit--currently a hard window, something like 1000-2000Hz.
 
-
+Remember FT4/FT8 last operating mode.
 
 # Field Day Specific
 
