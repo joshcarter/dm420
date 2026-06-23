@@ -703,10 +703,8 @@ impl Panel for Waterfall {
             .map(|s| s.phase)
             .unwrap_or(QsoPhase::Idle);
         let op_armed = !matches!(op_phase, QsoPhase::Idle);
-        let op_transmitting = {
-            let now = chrono::Utc::now().timestamp_millis();
-            ctx.bus.tx_spectrum().is_some_and(|r| now - r.t.0 < 500)
-        };
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let op_transmitting = ctx.bus.tx_spectrum().is_some_and(|r| now_ms - r.t.0 < 500);
         let op_accent = if ctx.unlocked {
             pal.accent
         } else if op_transmitting {
