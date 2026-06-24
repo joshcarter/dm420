@@ -1221,6 +1221,15 @@ fn signal_bandwidth_hz(protocol: Protocol) -> f32 {
 const SPECTRO_COLS: usize = 512;
 const SPECTRO_MAX_H: usize = 512;
 
+/// How long (seconds) a single spectrum column may be sample-and-held *forward* of
+/// its own timestamp in `fill_from_rows`. A column is a ~50 ms FFT; ~1 s comfortably
+/// bridges the normal inter-row cadence plus dropped-frame jitter, yet stays far below
+/// the multi-second no-TX gap *between* own-TX overs (≥ ~7.5 s FT4 / ~15 s FT8, since a
+/// QSO always has the other station's whole slot between my overs). Bounding the hold to
+/// this horizon stops a stale over's last column being smeared across the other station's
+/// response slot (which used to blank his RX on the spectrogram).
+const SPECTRO_MAX_HOLD_SECS: f64 = 1.0;
+
 /// A scrolling spectrogram texture for the right side. Newest column sits at the
 /// NOW line; older columns flow right, brightness = signal intensity. It always
 /// spans `history_secs` across its rect — equal to the decode side's time window —
@@ -1279,6 +1288,13 @@ impl Spectrogram {
     /// NOW line — what the RX side wants, since live capture always reaches NOW. The
     /// TX side passes `false`: an over's columns must stop at the over's leading edge,
     /// leaving the post-over RX visible in front rather than smearing TX up to NOW.
+    ///
+    /// The forward hold is capped at `SPECTRO_MAX_HOLD_SECS`: a row never paints more
+    /// than `max_hold_cols` columns ahead of its own timestamp. Without that cap, a
+    /// bursty source (own-TX, which leaves a multi-second gap between overs) would hold
+    /// one over's last column forward across the entire inter-over interval — overpainting
+    /// the other station's response. The cap is well above the within-over row cadence and
+    /// well below the inter-over gap, so it expires stale columns without leaving holes.
     fn fill_from_rows(
         &mut self,
         rows: &[SpectrumRow],
@@ -1286,6 +1302,8 @@ impl Spectrogram {
         cols_per_sec: f64,
         fill_to_now: bool,
     ) {
+        // Most columns a single row may sample-and-hold forward of its own timestamp.
+        let max_hold_cols = ((SPECTRO_MAX_HOLD_SECS * cols_per_sec).ceil() as usize).max(1);
         // Column index of the previous (newer) row already painted, so this row fills
         // only the gap behind it.
         let mut newer_col: Option<usize> = None;
@@ -1303,6 +1321,9 @@ impl Spectrogram {
                 None if fill_to_now => 0, // RX: newest column reaches the NOW line
                 None => col,              // TX: newest column stops at the over's edge
             };
+            // Cap the forward hold: never paint further ahead than the horizon, so a
+            // stale column expires instead of bridging an inter-over gap.
+            let lo = lo.max(col.saturating_sub(max_hold_cols));
             if lo > col {
                 continue; // a newer row already owns this column
             }
@@ -2501,5 +2522,79 @@ mod tests {
         assert_eq!(display_call(&Callsign("W4LL".into()), raw), "W4LL");
         // An unresolved hash is already `<...>` as the call itself; leave it be.
         assert_eq!(display_call(&Callsign("<...>".into()), "W4LL <...> -10"), "<...>");
+    }
+
+    /// `fill_from_rows` must not bridge the multi-second no-TX gap between two own-TX
+    /// overs: the older over's columns must stay parked on their own span (plus the
+    /// bounded forward hold) and not smear across the other station's response slot.
+    /// Within a single over a one-row gap is still sample-and-held.
+    #[test]
+    fn fill_from_rows_does_not_bridge_inter_over_gap() {
+        use types::{OffsetHz, RadioId, SignalSource, Timestamp};
+
+        const NOW_MS: i64 = 1_000_000;
+        const H: usize = 4;
+        const A_VAL: u8 = 200; // first (CQ) over
+        const B_VAL: u8 = 100; // second over
+
+        // A constant-magnitude own-TX column stamped `age_s` seconds before NOW.
+        let tx_row = |age_s: f64, val: u8| SpectrumRow {
+            radio: RadioId("rig0".into()),
+            mode: OverAirMode::Ft8,
+            t: Timestamp(NOW_MS - (age_s * 1000.0).round() as i64),
+            bin0_offset: OffsetHz(0.0),
+            bin_hz: 6.25,
+            mags: vec![val; H],
+            source: SignalSource::OwnTx,
+        };
+
+        // 20 cols/s → 50 ms per column, so max_hold = ceil(1.0 * 20) = 20 columns.
+        let cols_per_sec = 20.0;
+
+        // Over A at ages 8.0–8.5 s (cols 160–170); over B at ages 0.0–0.5 s (cols 0–10),
+        // with the age-0.3 row (col 6) deliberately dropped to exercise the within-over
+        // hold. The ~7.5 s no-TX gap between them dwarfs the 1 s / 20-col hold horizon.
+        let rows = vec![
+            // over A, oldest→newest
+            tx_row(8.5, A_VAL),
+            tx_row(8.4, A_VAL),
+            tx_row(8.3, A_VAL),
+            tx_row(8.2, A_VAL),
+            tx_row(8.1, A_VAL),
+            tx_row(8.0, A_VAL),
+            // over B, oldest→newest, age-0.3 (col 6) omitted
+            tx_row(0.5, B_VAL),
+            tx_row(0.4, B_VAL),
+            tx_row(0.2, B_VAL),
+            tx_row(0.1, B_VAL),
+            tx_row(0.0, B_VAL),
+        ];
+
+        let mut spec = Spectrogram::new();
+        spec.ensure_size(H);
+        // TX semantics: fill_to_now = false (the newest over must not bleed to NOW).
+        spec.fill_from_rows(&rows, NOW_MS, cols_per_sec, false);
+
+        // intensity[col] is row 0 of `col`; for a constant column it equals the painted
+        // magnitude (0 when the column was never painted).
+        let at = |col: usize| spec.intensity[col];
+
+        // Over B is painted across cols 0..=10 — including col 6, the one-missing-row
+        // within-over gap that sample-and-hold still bridges.
+        for c in 0..=10 {
+            assert_eq!(at(c), B_VAL, "over B col {c} should be painted");
+        }
+        assert_eq!(at(6), B_VAL, "within-over one-row gap (col 6) must still be filled");
+
+        // Over A is painted across its own cols 160..=170.
+        for c in 160..=170 {
+            assert_eq!(at(c), A_VAL, "over A col {c} should be painted");
+        }
+
+        // The inter-over gap, well beyond over A's 20-col forward hold (reaches col 140)
+        // and well ahead of over B (ends col 10), stays cleared — the smear is gone.
+        for c in [30usize, 60, 90, 120] {
+            assert_eq!(at(c), 0, "inter-over gap col {c} must stay unpainted");
+        }
     }
 }
