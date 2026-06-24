@@ -404,12 +404,6 @@ fn spawn_tx_spectrum(
             if stop.load(Ordering::Acquire) {
                 break;
             }
-            // Sample the playback clock once per poll: `played` audio frames have
-            // played as of wall-clock `now`. Each column below is then stamped by
-            // its *own* audio position (`tx_col_time_ms`), not by publish time — so
-            // a burst published in one wake (after a scheduler hiccup) keeps its real
-            // ~50 ms column spacing instead of collapsing onto a single timestamp.
-            let now = now_ms();
             let played = progress.load(Ordering::Relaxed) as usize;
             while end <= played && end <= samples.len() {
                 let mags = dsp::spectrum_column(&samples[end - FFT_SIZE..end], FFT_SIZE, max_bins);
@@ -418,7 +412,7 @@ fn spawn_tx_spectrum(
                     t::SpectrumRow {
                         radio: radio.clone(),
                         mode,
-                        t: t::Timestamp(tx_col_time_ms(now, played, end, TX_SAMPLE_RATE)),
+                        t: t::Timestamp(now_ms()),
                         bin0_offset: t::OffsetHz(0.0),
                         bin_hz,
                         mags,
@@ -430,14 +424,6 @@ fn spawn_tx_spectrum(
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     });
-}
-
-/// Wall-clock ms at which the audio sample at index `end` reached the stream, given
-/// that `played` samples have played as of `now_ms`. Stamps a TX spectrogram column
-/// by its true audio position (not publish time), so burst-published columns keep
-/// their real spacing instead of collapsing onto one timestamp.
-fn tx_col_time_ms(now_ms: i64, played: usize, end: usize, sample_rate: u32) -> i64 {
-    now_ms - (played as i64 - end as i64) * 1000 / sample_rate as i64
 }
 
 /// Milliseconds since the Unix epoch (wall clock), for stamping spectrum columns.
@@ -455,39 +441,5 @@ fn slot_period_ms(mode: t::OverAirMode) -> i64 {
     match mode {
         t::OverAirMode::Ft4 => 7_500,
         _ => 15_000,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// `tx_col_time_ms` stamps each TX spectrogram column by its audio position, so a
-    /// burst published in one poll keeps its real column spacing instead of collapsing.
-    #[test]
-    fn tx_col_time_stamps_by_audio_position() {
-        let now = 1_000_000_i64;
-        let hop = (TX_SAMPLE_RATE as f64 * SPECTRUM_HOP_S) as usize;
-
-        // 1. A column at the play head (`end == played`) is stamped `now` exactly.
-        let played = 50_000_usize;
-        assert_eq!(tx_col_time_ms(now, played, played, TX_SAMPLE_RATE), now);
-
-        // 2. Two columns from the *same* (now, played) burst with right edges `end`
-        //    and `end + hop` are spaced `hop*1000/rate` ms apart, with the older
-        //    (smaller-`end`) column earlier — proving a burst no longer collapses.
-        let end = 20_000_usize;
-        let t0 = tx_col_time_ms(now, played, end, TX_SAMPLE_RATE);
-        let t1 = tx_col_time_ms(now, played, end + hop, TX_SAMPLE_RATE);
-        let expected_delta = hop as i64 * 1000 / TX_SAMPLE_RATE as i64;
-        assert_eq!(t1 - t0, expected_delta);
-        assert!(t0 < t1, "older (smaller-end) column must be earlier");
-
-        // 3. A column whose audio played 1 s ago is stamped `now - 1000`.
-        let end_1s_ago = played - TX_SAMPLE_RATE as usize;
-        assert_eq!(
-            tx_col_time_ms(now, played, end_1s_ago, TX_SAMPLE_RATE),
-            now - 1000
-        );
     }
 }
