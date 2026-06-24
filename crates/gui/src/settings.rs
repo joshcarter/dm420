@@ -157,9 +157,6 @@ impl Station {
 
 /// Parsed startup configuration. Built once at launch by [`Settings::from_env`].
 pub struct Settings {
-    /// Run the real producers rather than the mocks. Real is the default; set
-    /// `DM420_MOCK` to run the mocks instead.
-    pub real: bool,
     /// Capture device name; `None` ⇒ system default input.
     pub audio_input: Option<String>,
     /// How to reach the rig.
@@ -185,8 +182,6 @@ impl Settings {
         // still wins for the input, for quick overrides.
         let (toml_in, toml_out) = read_audio_config(&config_path());
         Settings {
-            // Real producers are the default now; `DM420_MOCK` opts back into mocks.
-            real: !env_flag("DM420_MOCK"),
             audio_input: env_nonempty("DM420_AUDIO_INPUT").or(toml_in),
             serial: serial_from_env(),
             protocol: protocol_from_env(),
@@ -194,11 +189,6 @@ impl Settings {
             audio_output: toml_out,
             tx_gain: read_tx_gain(&config_path()),
         }
-    }
-
-    /// Whether the real producers should drive the bus.
-    pub fn is_real(&self) -> bool {
-        self.real
     }
 
     /// The live-editable hardware bindings (rig + audio), as the UI first sees
@@ -228,7 +218,7 @@ impl Settings {
             },
         };
         CoreConfig {
-            radio: mocks::radio_id(),
+            radio: app_core::radio_id(),
             allow_transmit: true,
             decode,
             serial: Some(self.serial.clone()),
@@ -261,13 +251,6 @@ fn logbook_path() -> PathBuf {
 fn read_archive_config(path: &Path) -> Option<PathBuf> {
     let text = std::fs::read_to_string(path).ok()?;
     parse_table_value(&text, "archive", "decodes").map(PathBuf::from)
-}
-
-/// True if the var is set to a non-empty value other than `"0"`.
-fn env_flag(key: &str) -> bool {
-    std::env::var(key)
-        .map(|v| !v.is_empty() && v != "0")
-        .unwrap_or(false)
 }
 
 /// The var's value if set and non-empty, else `None`.

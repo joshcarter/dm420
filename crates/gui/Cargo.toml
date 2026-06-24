@@ -24,10 +24,8 @@ chrono.workspace = true
 bus.workspace = true
 types.workspace = true
 
-# Background async runtime for the bus bridge, and the mock producers that feed
-# it until the real rig/dsp/scanner/logbook crates take over.
+# Background async runtime for the bus bridge.
 tokio.workspace = true
-mocks.workspace = true
 
 # The QSO engine (contact state machine). Spawned onto the bus by `BusView`;
 # publishes `QsoState`, serves `qso/{id}/command`.
@@ -37,8 +35,7 @@ qso.workspace = true
 callbook.workspace = true
 
 # The real rig/decode producers (vendored Joel + bus adapters). Renamed to avoid
-# shadowing the std `core` crate. Used at runtime by default (`DM420_MOCK=1` opts
-# into mocks instead).
+# shadowing the std `core` crate.
 app_core = { package = "core", path = "../core" }
 
 # Structured logging. Every crate emits through the `tracing` facade; the binary

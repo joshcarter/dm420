@@ -1639,7 +1639,6 @@ dependencies = [
  "egui",
  "egui_tiles",
  "image",
- "mocks",
  "objc2 0.6.4",
  "objc2-foundation 0.3.2",
  "qso",
@@ -2247,15 +2246,6 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "mocks"
-version = "0.1.0"
-dependencies = [
- "bus",
- "tokio",
- "types",
 ]
 
 [[package]]

@@ -28,7 +28,7 @@ const LOG_FILE: &str = "dm420.log";
 /// DM420's own crates — the ones the `[logging] level` applies to. Everything
 /// not listed stays at `warn`, keeping the log free of framework chatter.
 const OUR_CRATES: &[&str] = &[
-    "dm420", "gui", "core", "rig", "audio", "dsp", "modes", "qso", "bus", "mocks", "types",
+    "dm420", "gui", "core", "rig", "audio", "dsp", "modes", "qso", "bus", "types",
 ];
 
 /// Install the file logger. Returns a [`WorkerGuard`] that **must be held for the

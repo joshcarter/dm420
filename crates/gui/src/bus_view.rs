@@ -152,11 +152,6 @@ pub struct BusView {
     /// fault display when a device is missing or disconnected.
     health: Arc<Mutex<HashMap<SubsystemId, SubsystemHealth>>>,
 
-    /// Whether real producers are driving the bus (the default; `DM420_MOCK=1`
-    /// opts into mocks). Panels use this to avoid presenting mock-only visuals
-    /// (e.g. the simulated FFT) as if they were live radio data.
-    real: bool,
-
     /// Handle for live reconfiguration of the running producers (real mode only;
     /// empty otherwise).
     control: app_core::CoreControl,
@@ -210,9 +205,7 @@ impl BusView {
         // `tokio::spawn` (used by the producers and the pump helpers) needs an
         // active runtime context; hold the guard while we wire everything up.
         let settings = crate::settings::Settings::from_env();
-        let real = settings.is_real();
         tracing::info!(
-            mode = if real { "real" } else { "mock" },
             audio_input = ?settings.audio_input,
             audio_output = ?settings.audio_output,
             protocol = ?settings.protocol,
@@ -220,37 +213,31 @@ impl BusView {
         );
         let applied = Arc::new(Mutex::new(settings.hardware()));
         let _guard = rt.enter();
-        let control = if real {
-            // Real rig + decode + clock + logbook + band-scanner producers —
-            // `core::spawn` covers them all now (the scanner is real too), so no mock
-            // support is needed in real mode. The decode stream is the real decoder's.
-            app_core::spawn(&bus, settings.core_config())
-        } else {
-            mocks::spawn(&bus);
-            app_core::CoreControl::default()
-        };
+        // Real rig + decode + clock + logbook + band-scanner producers — `core::spawn`
+        // covers them all (the scanner is real too). The decode stream is the real decoder's.
+        let control = app_core::spawn(&bus, settings.core_config());
 
         // The QSO engine is logic, not hardware — it runs in both modes, driven
         // by whichever decode/clock producers are live, serving `qso/{id}/command`
         // and publishing `QsoState`. It auto-sends in real mode (a rig + the PTT
         // interlock are present); in mock mode it sequences but never keys.
-        let qso_control = qso::spawn(&bus, mocks::radio_id(), station, real);
+        let qso_control = qso::spawn(&bus, app_core::radio_id(), station, true);
 
         pump_state(
             &bus,
-            Topic::QsoState(mocks::radio_id()),
+            Topic::QsoState(app_core::radio_id()),
             qso.clone(),
             egui_ctx.clone(),
         );
         pump_state(
             &bus,
-            Topic::RigState(mocks::radio_id()),
+            Topic::RigState(app_core::radio_id()),
             rig.clone(),
             egui_ctx.clone(),
         );
         pump_spectrum(
             &bus,
-            Topic::Spectrum(mocks::radio_id()),
+            Topic::Spectrum(app_core::radio_id()),
             spectrum.clone(),
             spectrum_tx.clone(),
             spectrum_hist.clone(),
@@ -267,7 +254,7 @@ impl BusView {
         );
         pump_stream(
             &bus,
-            TopicSelector::Exact(Topic::Decodes(mocks::radio_id())),
+            TopicSelector::Exact(Topic::Decodes(app_core::radio_id())),
             decodes.clone(),
             egui_ctx.clone(),
         );
@@ -275,12 +262,9 @@ impl BusView {
         // longer-lived (call → grid) map than the bounded `decodes` ring. Runs in
         // both modes — heard spots come from whatever decoder is live.
         pump_heard(&bus, heard.clone(), rig.clone(), egui_ctx.clone());
-        // Health is only produced in real mode (by `core`); in mock mode the map
-        // stays empty and panels treat everything as healthy.
-        if real {
-            for id in [SubsystemId::Rig, SubsystemId::Audio] {
-                pump_health(&bus, id, health.clone(), egui_ctx.clone());
-            }
+        // Health for the rig + audio subsystems — drives the panels' fault display.
+        for id in [SubsystemId::Rig, SubsystemId::Audio] {
+            pump_health(&bus, id, health.clone(), egui_ctx.clone());
         }
         drop(_guard);
 
@@ -297,7 +281,6 @@ impl BusView {
             heard,
             qso,
             health,
-            real,
             control,
             qso_control,
             applied,
@@ -306,10 +289,10 @@ impl BusView {
         }
     }
 
-    /// True when real producers are driving the bus (the default; `DM420_MOCK=1`
-    /// opts into mocks).
+    /// Always true now that the mock producer path is gone. Retained because some
+    /// Digital-panel branches still call it; those collapse in a later cleanup.
     pub fn is_real(&self) -> bool {
-        self.real
+        true
     }
 
     // ----------------------------------------------------------------- reads
@@ -555,7 +538,7 @@ impl BusView {
     /// when it commits, but the ref now carries the true slot for selection/gossip.)
     pub fn answer_station(&self, offset_hz: f32, call: String, slot: SlotId) {
         let target = DecodeRef {
-            radio: mocks::radio_id(),
+            radio: app_core::radio_id(),
             slot,
             call: Some(Callsign(call)),
         };
@@ -577,7 +560,7 @@ impl BusView {
         snr: i8,
     ) {
         let target = DecodeRef {
-            radio: mocks::radio_id(),
+            radio: app_core::radio_id(),
             slot,
             call: Some(Callsign(call)),
         };
@@ -605,7 +588,7 @@ impl BusView {
         self._rt.spawn(async move {
             let _ = bus
                 .request::<RigCommand, app_core::CommandResult>(
-                    &Topic::RigCommand(mocks::radio_id()),
+                    &Topic::RigCommand(app_core::radio_id()),
                     RigCommand::SetFreq(AbsHz(hz)),
                     Duration::from_secs(1),
                 )
@@ -658,13 +641,10 @@ impl BusView {
     /// server to answer, and the 1 s bound keeps a wedged/absent rig from hanging the
     /// quit.
     pub fn unkey_for_shutdown(&self) {
-        if !self.real {
-            return;
-        }
         let bus = self.bus.clone();
         let res = self._rt.block_on(async move {
             bus.request::<RigCommand, app_core::CommandResult>(
-                &Topic::RigCommand(mocks::radio_id()),
+                &Topic::RigCommand(app_core::radio_id()),
                 RigCommand::PttRequest {
                     on: false,
                     token: InterlockToken(0),
@@ -683,9 +663,9 @@ impl BusView {
     /// `selection/{id}/active` State topic.
     fn publish_selection(&self, offset_hz: f32, target: Option<DecodeRef>) {
         let _ = self.bus.publish(
-            &Topic::Selection(mocks::radio_id()),
+            &Topic::Selection(app_core::radio_id()),
             Selection {
-                radio: mocks::radio_id(),
+                radio: app_core::radio_id(),
                 outgoing: OffsetHz(offset_hz),
                 target,
             },
@@ -700,7 +680,7 @@ impl BusView {
         self._rt.spawn(async move {
             let _ = bus
                 .request::<QsoCommand, qso::QsoAck>(
-                    &Topic::QsoCommand(mocks::radio_id()),
+                    &Topic::QsoCommand(app_core::radio_id()),
                     cmd,
                     Duration::from_secs(1),
                 )
@@ -877,7 +857,7 @@ fn pump_heard(
     ctx: egui::Context,
 ) {
     let mut sub =
-        match bus.subscribe::<Decode>(TopicSelector::Exact(Topic::Decodes(mocks::radio_id()))) {
+        match bus.subscribe::<Decode>(TopicSelector::Exact(Topic::Decodes(app_core::radio_id()))) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("bus_view: heard subscribe failed: {e:?}");

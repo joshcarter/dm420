@@ -28,7 +28,6 @@ logbook = { path = "crates/logbook" }
 archive = { path = "crates/archive" }
 scanner = { path = "crates/scanner" }
 net = { path = "crates/net" }
-mocks = { path = "crates/mocks" }
 
 # --- GUI stack (pinned exactly per docs/FEASIBILITY.md; the spike validated these) ---
 eframe = "0.34.3"
