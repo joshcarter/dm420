@@ -176,6 +176,11 @@ pub struct Engine {
     /// publishes `QsoPhase::TimedOut` once (then `step` clears it and we're already
     /// back in `Calling`/`Idle`). Only set on a genuine timeout, not a clean finish.
     timed_out: Option<Callsign>,
+    /// TX offset frozen by the operator. The engine is the **sole owner** of the
+    /// offset; this is the **one place** the lock is enforced — while set, the engine
+    /// ignores every offset write (operator [`Event::Select`] / [`QsoCommand::SetTxOffset`])
+    /// *and* its own auto-QSY hop, so a locked offset never moves. "Freeze everything."
+    offset_locked: bool,
 }
 
 impl Engine {
@@ -190,6 +195,7 @@ impl Engine {
             auto_hop: false,
             next_cq_offset: None,
             timed_out: None,
+            offset_locked: false,
         }
     }
 
@@ -219,7 +225,14 @@ impl Engine {
         let mut log = None;
         match event {
             Event::Command(cmd) => log = self.on_command(cmd),
-            Event::Select(sel) => self.outgoing = sel.outgoing,
+            // The Selection topic is also an offset write, so it obeys the same lock:
+            // the engine is the sole enforcer, so no offset path (selection gesture or
+            // command) can move a frozen offset.
+            Event::Select(sel) => {
+                if !self.offset_locked {
+                    self.outgoing = sel.outgoing;
+                }
+            }
             Event::Decode(d) => log = self.on_decode(d),
             Event::Tick { slot } => {
                 let out = self.on_tick(slot);
@@ -269,9 +282,26 @@ impl Engine {
                 self.state = State::Idle;
                 None
             }
-            // Step 1 vocabulary placeholders — wired in step 2 (the engine becomes the
-            // sole owner + enforcer of the TX offset and its lock). Inert for now.
-            QsoCommand::SetTxOffset(_) | QsoCommand::SetOffsetLock(_) => None,
+            // The engine owns the TX offset; this is the one place the lock is
+            // enforced for an operator write. While locked we ignore it entirely
+            // ("freeze everything") — operator-facing behaviour is identical to a
+            // click while locked today: nothing moves. When unlocked, update
+            // `outgoing` (where the next CQ/answer transmits) and, if we're already
+            // calling CQ, the live `Calling.offset` too, so the move takes effect on
+            // the very next CQ rather than waiting for a re-arm.
+            QsoCommand::SetTxOffset(hz) => {
+                if !self.offset_locked {
+                    self.outgoing = hz;
+                    if let State::Calling { offset, .. } = &mut self.state {
+                        *offset = hz;
+                    }
+                }
+                None
+            }
+            QsoCommand::SetOffsetLock(locked) => {
+                self.offset_locked = locked;
+                None
+            }
         }
     }
 
@@ -752,7 +782,10 @@ impl Engine {
         slot: SlotId,
         parity: u8,
     ) -> (Option<TxIntent>, Option<CompletedQso>) {
-        let auto_hop = self.auto_hop;
+        // A locked offset freezes everything — the engine's own auto-QSY must not
+        // hop either (the headline fix: a locked auto-QSY hop used to transmit on a
+        // frequency the operator believed was frozen).
+        let auto_hop = self.auto_hop && !self.offset_locked;
         let next = self.next_cq_offset;
         let mut hopped_to = None;
         let offset = match &mut self.state {
@@ -955,12 +988,8 @@ impl Engine {
                 phase: QsoPhase::TimedOut,
                 partner: Some(call.clone()),
                 next_tx: None,
-                tx_offset: match &self.state {
-                    State::Calling { offset, .. } => Some(*offset),
-                    State::Active(a) => Some(a.offset),
-                    _ => None,
-                },
-                offset_locked: false,
+                tx_offset: Some(self.tx_offset()),
+                offset_locked: self.offset_locked,
             };
         }
         let (phase, partner, next_tx) = match &self.state {
@@ -977,20 +1006,26 @@ impl Engine {
                 a.next.clone(),
             ),
         };
-        // The offset the engine is actually transmitting on (calling or active), so
-        // the UI's TX-lane indicator tracks an auto-QSY hop it didn't set by hand.
-        let tx_offset = match &self.state {
-            State::Calling { offset, .. } => Some(*offset),
-            State::Active(a) => Some(a.offset),
-            _ => None,
-        };
         QsoState {
             radio: self.radio.clone(),
             phase,
             partner,
             next_tx,
-            tx_offset,
-            offset_locked: false,
+            // Always `Some`: the engine owns the offset even when idle, so the UI can
+            // render the TX lane before a QSO and track an auto-QSY hop it didn't set.
+            tx_offset: Some(self.tx_offset()),
+            offset_locked: self.offset_locked,
+        }
+    }
+
+    /// The engine's current TX audio offset — where it is (or would be) transmitting.
+    /// During a contact/CQ this is the live `Calling`/`Active` offset; otherwise the
+    /// owned `outgoing` the next CQ/answer will use. The radio transmits here.
+    fn tx_offset(&self) -> OffsetHz {
+        match &self.state {
+            State::Calling { offset, .. } => *offset,
+            State::Active(a) => a.offset,
+            _ => self.outgoing,
         }
     }
 }
@@ -1355,6 +1390,107 @@ mod tests {
         let tx = e.step(Event::Tick { slot: SlotId(6) }).tx.unwrap();
         assert!(tx.message.text.contains(HIM));
         assert_ne!(tx.offset, OffsetHz(900.0));
+    }
+
+    // ------------------------------------------------- TX-offset ownership + lock
+
+    /// The headline fix: while the offset is locked, auto-QSY must not hop — even
+    /// after the threshold of unanswered CQs. A locked offset never moves, so the
+    /// engine keeps transmitting where the operator froze it.
+    #[test]
+    fn locked_blocks_auto_qsy_after_unanswered_cqs() {
+        let mut e = engine(ContestProfile::Standard);
+        e.set_auto_hop(true);
+        e.set_next_cq_offset(Some(OffsetHz(900.0)));
+        e.step(Event::Command(QsoCommand::SetOffsetLock(true)));
+        e.step(Event::Command(QsoCommand::CallCq));
+        // Past the hop threshold (3) and beyond: every CQ stays on the frozen lane.
+        for slot in [0, 2, 4, 6, 8, 10] {
+            assert_eq!(cq_offset(&mut e, slot), OffsetHz(1500.0));
+        }
+        assert_eq!(e.state().tx_offset, Some(OffsetHz(1500.0)));
+    }
+
+    /// An operator offset write (`SetTxOffset`) is ignored while locked — identical
+    /// to a click while locked today: nothing moves.
+    #[test]
+    fn locked_ignores_set_tx_offset() {
+        let mut e = engine(ContestProfile::Standard);
+        e.step(Event::Command(QsoCommand::SetOffsetLock(true)));
+        e.step(Event::Command(QsoCommand::SetTxOffset(OffsetHz(2000.0))));
+        assert_eq!(e.state().tx_offset, Some(OffsetHz(1500.0)), "write ignored while locked");
+        // And the next CQ still transmits on the frozen offset, not the rejected write.
+        e.step(Event::Command(QsoCommand::CallCq));
+        assert_eq!(cq_offset(&mut e, 0), OffsetHz(1500.0));
+    }
+
+    /// Unlocked, auto-QSY moves the offset after the threshold *and* the published
+    /// `QsoState.tx_offset` reflects the new lane (so the UI's TX indicator tracks a
+    /// hop the operator didn't set by hand).
+    #[test]
+    fn unlocked_auto_qsy_moves_and_state_reflects_it() {
+        let mut e = engine(ContestProfile::Standard);
+        e.set_auto_hop(true);
+        e.set_next_cq_offset(Some(OffsetHz(900.0)));
+        e.step(Event::Command(QsoCommand::CallCq));
+        assert_eq!(cq_offset(&mut e, 0), OffsetHz(1500.0));
+        assert_eq!(cq_offset(&mut e, 2), OffsetHz(1500.0));
+        assert_eq!(cq_offset(&mut e, 4), OffsetHz(1500.0));
+        // The 4th CQ hops; both the TX intent and the published state follow.
+        let s = e.step(Event::Tick { slot: SlotId(6) });
+        assert_eq!(s.tx.expect("a CQ").offset, OffsetHz(900.0));
+        assert_eq!(s.state.tx_offset, Some(OffsetHz(900.0)), "QsoState reflects the hop");
+    }
+
+    /// Unlocked, `SetTxOffset(x)` sets `outgoing` so the next CQ transmits at `x`.
+    #[test]
+    fn unlocked_set_tx_offset_drives_next_cq() {
+        let mut e = engine(ContestProfile::Standard);
+        e.step(Event::Command(QsoCommand::SetTxOffset(OffsetHz(2000.0))));
+        assert_eq!(e.state().tx_offset, Some(OffsetHz(2000.0)));
+        e.step(Event::Command(QsoCommand::CallCq));
+        assert_eq!(cq_offset(&mut e, 0), OffsetHz(2000.0), "next CQ transmits at the set offset");
+    }
+
+    /// `tx_offset` is always `Some` — including while Idle and Armed — so the UI can
+    /// render the TX lane before any QSO begins.
+    #[test]
+    fn tx_offset_is_some_while_idle_and_armed() {
+        let mut e = engine(ContestProfile::Standard);
+        // Idle: the owned `outgoing`.
+        let idle = e.state();
+        assert_eq!(idle.phase, QsoPhase::Idle);
+        assert_eq!(idle.tx_offset, Some(OffsetHz(1500.0)));
+        // Armed: still Some (the offset is owned even while waiting for a CQ).
+        e.step(Event::Command(start_target()));
+        let armed = e.state();
+        assert_eq!(armed.phase, QsoPhase::Armed);
+        assert_eq!(armed.tx_offset, Some(OffsetHz(1500.0)));
+    }
+
+    /// `SetTxOffset` while calling CQ moves the *live* `Calling.offset`, so the move
+    /// takes effect on the very next CQ rather than waiting for a re-arm.
+    #[test]
+    fn set_tx_offset_while_calling_moves_live_offset() {
+        let mut e = engine(ContestProfile::Standard);
+        e.step(Event::Command(QsoCommand::CallCq));
+        assert_eq!(cq_offset(&mut e, 0), OffsetHz(1500.0));
+        e.step(Event::Command(QsoCommand::SetTxOffset(OffsetHz(1800.0))));
+        assert_eq!(cq_offset(&mut e, 2), OffsetHz(1800.0), "live Calling.offset moved");
+        assert_eq!(e.state().tx_offset, Some(OffsetHz(1800.0)));
+    }
+
+    /// Unlocking re-enables movement: a write rejected while locked applies once the
+    /// lock is released.
+    #[test]
+    fn unlock_re_enables_offset_writes() {
+        let mut e = engine(ContestProfile::Standard);
+        e.step(Event::Command(QsoCommand::SetOffsetLock(true)));
+        e.step(Event::Command(QsoCommand::SetTxOffset(OffsetHz(2200.0))));
+        assert_eq!(e.state().tx_offset, Some(OffsetHz(1500.0)));
+        e.step(Event::Command(QsoCommand::SetOffsetLock(false)));
+        e.step(Event::Command(QsoCommand::SetTxOffset(OffsetHz(2200.0))));
+        assert_eq!(e.state().tx_offset, Some(OffsetHz(2200.0)), "write applies after unlock");
     }
 
     #[test]
