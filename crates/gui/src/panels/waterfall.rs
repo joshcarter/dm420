@@ -860,7 +860,7 @@ impl Panel for Waterfall {
                     // signal at its true offset, in place of the meaningless RX
                     // capture), so the timeline still reads RX … my over … RX as it
                     // scrolls.
-                    let rx_rows = ctx.bus.recent_spectrum();
+                    let rx_rows = ctx.bus.recent_spectrum_disp();
                     let tx_rows = ctx.bus.recent_tx_spectrum();
                     self.spectro.update_and_paint(
                         ctx.ui,
