@@ -6,7 +6,7 @@ use egui::{Align2, Color32, ColorImage, Pos2, Rect, TextureHandle, TextureOption
 use std::collections::{HashMap, HashSet};
 
 use types::{
-    Band, Callsign, Decode, DecodeContent, ExchangePayload, HealthState, OverAirMode,
+    AbsHz, Band, Callsign, Decode, DecodeContent, ExchangePayload, HealthState, OverAirMode,
     ParsedMessage, QsoPhase, Signoff, SlotId, SpectrumRow, SubsystemHealth, SubsystemId,
 };
 
@@ -682,7 +682,7 @@ impl Panel for Waterfall {
             let vfo_hz = self
                 .vfo_override_hz
                 .or_else(|| ctx.bus.rig_state().map(|r| r.vfo.0));
-            if let Some(band) = vfo_hz.and_then(band_for_hz)
+            if let Some(band) = vfo_hz.and_then(|hz| Band::from_hz(AbsHz(hz)))
                 && let Some(hz) = crate::send::calling_freq_hz(band, new_mode) {
                     if ctx.bus.is_real() {
                         ctx.bus.set_freq(hz);
@@ -945,7 +945,7 @@ impl Panel for Waterfall {
                         .rig_state()
                         .map(|r| r.vfo.0)
                         .or(self.vfo_override_hz)
-                        .and_then(band_for_hz)
+                        .and_then(|hz| Band::from_hz(AbsHz(hz)))
                         .map(|b| ctx.bus.worked_calls_on_band(b))
                         .unwrap_or_default();
                     // real_sel.offset is the single source of truth for the TX lane.
@@ -1502,26 +1502,6 @@ fn resume_intent(d: &Decode, my_call: Option<&str>) -> Option<(ParsedMessage, i8
         return None;
     }
     Some((message.clone(), d.snr_db.unwrap_or(0)))
-}
-
-/// The ham band a dial frequency falls in, for deciding which logged contacts
-/// count as "worked" on the band we're currently on. `None` outside the amateur
-/// allocations (e.g. while tuned to WWV). Edges are the full band limits, so any
-/// in-band dial frequency resolves.
-pub(crate) fn band_for_hz(hz: u64) -> Option<Band> {
-    Some(match hz {
-        1_800_000..=2_000_000 => Band::B160m,
-        3_500_000..=4_000_000 => Band::B80m,
-        7_000_000..=7_300_000 => Band::B40m,
-        10_100_000..=10_150_000 => Band::B30m,
-        14_000_000..=14_350_000 => Band::B20m,
-        18_068_000..=18_168_000 => Band::B17m,
-        21_000_000..=21_450_000 => Band::B15m,
-        24_890_000..=24_990_000 => Band::B12m,
-        28_000_000..=29_700_000 => Band::B10m,
-        50_000_000..=54_000_000 => Band::B6m,
-        _ => return None,
-    })
 }
 
 /// Update CQ shortcut assignments at a slot boundary.

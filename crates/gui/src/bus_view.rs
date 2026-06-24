@@ -936,7 +936,7 @@ fn pump_heard(
                         // was heard on and the absolute frequency we saw it at
                         // (dial + audio offset). `None` if the rig state isn't known.
                         let vfo = rig.lock().unwrap().as_ref().map(|r| r.vfo.0);
-                        let band = vfo.and_then(crate::panels::waterfall::band_for_hz);
+                        let band = vfo.and_then(|hz| Band::from_hz(AbsHz(hz)));
                         let abs = vfo.map(|v| AbsHz(v + d.offset.0.round().max(0.0) as u64));
                         // The slot this decode landed in (for a click-built DecodeRef).
                         let slot = match &d.content {
