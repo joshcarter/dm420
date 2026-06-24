@@ -69,13 +69,18 @@ async fn run(bus: BusHandle, radio: t::RadioId, audio: Option<Arc<AudioControl>>
                 return;
             }
         };
-    let mut logs = match bus.subscribe::<t::LogEntry>(TopicSelector::Exact(Topic::LogbookEntries)) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!("scanner: cannot subscribe logbook: {e:?}");
-            return;
-        }
-    };
+    // Worked-status comes from the single owner (`core::worked`), not the raw log:
+    // it folds `logbook/entries` through the canonical `worked_key` and publishes the
+    // full `WorkedSet` here (State, latest-wins), so the scanner's unworked tally keys
+    // identically to every other panel instead of re-deriving the dupe rule.
+    let mut worked =
+        match bus.subscribe::<t::WorkedSet>(TopicSelector::Exact(Topic::Worked(radio.clone()))) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("scanner: cannot subscribe worked-status: {e:?}");
+                return;
+            }
+        };
     let mut rig = match bus.subscribe::<t::RigState>(TopicSelector::Exact(Topic::RigState(radio.clone()))) {
         Ok(s) => s,
         Err(e) => {
@@ -213,9 +218,12 @@ async fn run(bus: BusHandle, radio: t::RadioId, audio: Option<Arc<AudioControl>>
                     }
                 }
             }
-            r = logs.recv() => {
-                let Ok(e) = r else { continue };
-                engine.on_logged(e.call, e.band);
+            r = worked.recv() => {
+                let Ok(set) = r else { continue };
+                // Mirror the authoritative worked set into the engine wholesale. The
+                // producer keys it `(call, band)` (mode dropped, call normalized), so the
+                // tally's dupe rule matches the GUI map/waterslide exactly.
+                engine.set_worked(set.entries.into_iter().map(|w| (w.call, w.band)).collect());
             }
             r = rig.recv() => {
                 let Ok(s) = r else { continue };
