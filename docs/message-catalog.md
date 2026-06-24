@@ -161,9 +161,11 @@ pub enum SessionCommand {
 
 ```rust
 // selection/{id}/active  (State) — gesture, not action; the mode service interprets it.
+// `outgoing` is an offset *write*: the qso engine owns the TX offset and ignores this
+// (like SetTxOffset) while the offset is locked, so no path can move a frozen offset.
 pub struct Selection {
     pub radio: RadioId,
-    pub outgoing: OffsetHz,        // where the next TX audio is tuned
+    pub outgoing: OffsetHz,        // where the next TX audio is tuned (engine-gated by the lock)
     pub target: Option<DecodeRef>, // None = bare retune (click in FFT);
                                    // Some = intent to work that decode (click on text)
 }
@@ -180,6 +182,11 @@ pub enum QsoCommand {
                                                  //   to us (no CQ wait) — clicked `<me> <them> …`
     CallCq,
     Abort,
+    SetTxOffset(OffsetHz),                       // move the outgoing TX offset (click / /clear /
+                                                 //   map-pick); ignored by the engine while locked
+    SetOffsetLock(bool),                         // freeze/unfreeze the TX offset (Tab / LOCKED).
+                                                 //   While locked NO offset move happens — not a
+                                                 //   write, not auto-QSY. Enforced in the engine.
 }
 
 pub struct QsoState {
@@ -187,7 +194,11 @@ pub struct QsoState {
     pub phase: QsoPhase,
     pub partner: Option<Callsign>,
     pub next_tx: Option<OutgoingMessage>, // what the engine will send next slot
-    pub tx_offset: Option<OffsetHz>,      // engine's current TX offset (calling/active); None when idle
+    pub tx_offset: Option<OffsetHz>,      // engine's current TX offset — ALWAYS Some (the engine
+                                          //   owns the offset even when idle, so the UI renders the
+                                          //   TX lane before a QSO and tracks an auto-QSY hop)
+    pub offset_locked: bool,              // whether the operator froze the TX offset (the engine
+                                          //   alone enforces it; the UI just renders LOCKED)
 }
 pub enum QsoPhase { Idle, Calling, InExchange { step: u8 }, Complete, TimedOut }
 
@@ -197,6 +208,14 @@ pub struct OutgoingMessage { pub text: String, pub structured: ParsedMessage }
 
 The "send on next interval" timing is the core's job (QSO engine + clock), not the UI's — the
 send button emits `QsoCommand` and the panel reflects `QsoState`.
+
+The **TX audio offset has a single owner: the QSO engine** — it's the only component that both
+reads the offset (to transmit: `TxIntent.offset` ← `Calling`/`Active` offset) and moves it
+autonomously (auto-QSY after unanswered CQs). Every offset writer (waterslide click, `/clear`,
+map-pick → `SetTxOffset`; arming gestures → `Selection.outgoing`) flows to the engine, which is the
+one place the lock is enforced: while `SetOffsetLock(true)`, **no** offset move happens — operator
+write *or* auto-QSY hop. The UI holds no offset of its own; it renders `QsoState.tx_offset` /
+`offset_locked`.
 
 ## 6. TX handoff  —  `radio/{id}/audio_tx` (intent on the bus; codec co-located with rig mgr)
 
