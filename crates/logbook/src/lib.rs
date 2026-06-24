@@ -17,7 +17,7 @@
 //! sessions — see `qso::shell`, which seeds the sequence from the wall clock.)
 //!
 //! Not yet built: ADIF import/export and the G-set merge that folds in gossiped
-//! peer contacts (OVERVIEW §7). An ADIF exporter can read the same store later.
+//! peer contacts. An ADIF exporter can read the same store later.
 //!
 //! Specs: `docs/log_book.md`, `docs/message-catalog.md` §7.
 
