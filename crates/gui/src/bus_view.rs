@@ -36,32 +36,8 @@ const DECODE_RING_CAP: usize = 8192;
 /// Capacity of the recent-RX-spectrum ring that backs the clear-lane finder
 /// (`lane_finder`). The finder weights rows by recency (~8 s half-life), so this
 /// only needs the last several seconds of frames; 512 is comfortably more than
-/// that at any plausible spectrum cadence (~20 rows/s → ~25 s). Kept small on
-/// purpose: the finder snapshots (clones) the whole ring every frame, so this must
-/// not balloon. The spectrogram's deeper history lives in a separate ring (see
-/// [`SPECTRUM_DISP_CAP`]).
+/// that at any plausible spectrum cadence (~20 rows/s → ~25 s).
 const SPECTRUM_HIST_CAP: usize = 512;
-
-/// Approximate spectrum-row cadence (rows/s). The decoder emits a column every
-/// ~50 ms (`SPECTRUM_HOP_S` in `core::decode`), i.e. ~20/s. Used only to size the
-/// display-history rings below in terms of seconds of coverage.
-const SPECTRUM_ROWS_PER_SEC: usize = 20;
-
-/// Seconds of spectrum history the waterslide spectrogram can reconstruct. It
-/// rebuilds its whole texture each frame from the rows still in the ring, placing
-/// every column by its `SpectrumRow.t`, so the ring must hold at least as many
-/// seconds as the widest on-screen time window the panel can ask for
-/// (`ws_history_secs()` grows with panel width and has no fixed cap). Anything
-/// older than the ring renders as a black band at the old (right) edge — the
-/// regression this guards against. 240 s (4 min) covers a 4K monitor at FT8's
-/// 15 s slots with margin.
-const SPECTRUM_DISP_SECS: usize = 240;
-
-/// Capacity of the display-history rings that back the spectrogram rebuild (RX and
-/// own-TX). Sized for [`SPECTRUM_DISP_SECS`] of coverage at the spectrum cadence:
-/// ~4800 rows. Each `SpectrumRow.mags` is a few hundred bytes to ~2 KB, so the two
-/// rings together stay well under ~10 MB — memory is not a constraint here.
-const SPECTRUM_DISP_CAP: usize = SPECTRUM_DISP_SECS * SPECTRUM_ROWS_PER_SEC;
 
 /// A rolling window for a stream topic: the pump pushes, dropping the oldest past
 /// `cap`; the GUI snapshots the tail it wants each frame.
@@ -151,24 +127,10 @@ pub struct BusView {
     /// separate from `spectrum` so RX columns don't race it onto one cell; the
     /// panel shows it in place of the RX waterfall during an over.
     spectrum_tx: Cell<SpectrumRow>,
-    /// Short rolling window of recent RX spectrum rows feeding the clear-lane finder
-    /// (`lane_finder`). Capped small ([`SPECTRUM_HIST_CAP`]) because the finder
-    /// snapshots the whole ring every frame and only weighs the last several seconds
-    /// (~8 s half-life). The spectrogram's deeper history is `spectrum_disp_hist`.
+    /// Rolling window of recent RX spectrum rows, feeding the clear-lane finder
+    /// (`lane_finder`). Short-term and in-memory by design — distinct from any
+    /// long-term decode archive (`JOELS_ROADMAP.md` Now-#10).
     spectrum_hist: Ring<SpectrumRow>,
-    /// Deep rolling window of recent RX spectrum rows backing the waterslide
-    /// spectrogram, which rebuilds its texture from this window by timestamp each
-    /// frame. Sized ([`SPECTRUM_DISP_CAP`]) to cover the widest on-screen time window
-    /// so no history older than the ring shows as a black band. Short-term and
-    /// in-memory by design — distinct from any long-term decode archive
-    /// (`JOELS_ROADMAP.md` Now-#10).
-    spectrum_disp_hist: Ring<SpectrumRow>,
-    /// Rolling window of recent own-TX columns — the TX-side twin of
-    /// `spectrum_disp_hist`. Lets the spectrogram place each over's columns by their
-    /// `SpectrumRow.t` while keyed (they were latest-only before, so a TX over
-    /// couldn't be reconstructed from timestamps). Read only by the spectrogram (not
-    /// the lane finder), so it carries the same deep display sizing as the RX window.
-    spectrum_tx_hist: Ring<SpectrumRow>,
     // `scanner`/`clock` are pumped and exposed now; their panel consumers (idle
     // scan status, slot clock in the top bar) land in the next wiring pass.
     #[allow(dead_code)]
@@ -235,8 +197,6 @@ impl BusView {
         // a wide monitor + crowded band never drops still-visible decodes. ~1 MB.
         let decodes = Ring::new(DECODE_RING_CAP);
         let spectrum_hist = Ring::new(SPECTRUM_HIST_CAP);
-        let spectrum_disp_hist = Ring::new(SPECTRUM_DISP_CAP);
-        let spectrum_tx_hist = Ring::new(SPECTRUM_DISP_CAP);
         let heard: Arc<Mutex<HashMap<String, HeardEntry>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let health: Arc<Mutex<HashMap<SubsystemId, SubsystemHealth>>> =
@@ -281,8 +241,6 @@ impl BusView {
             spectrum.clone(),
             spectrum_tx.clone(),
             spectrum_hist.clone(),
-            spectrum_disp_hist.clone(),
-            spectrum_tx_hist.clone(),
             egui_ctx.clone(),
         );
         pump_state(&bus, Topic::ScannerState, scanner.clone(), egui_ctx.clone());
@@ -315,8 +273,6 @@ impl BusView {
             spectrum,
             spectrum_tx,
             spectrum_hist,
-            spectrum_disp_hist,
-            spectrum_tx_hist,
             scanner,
             clock,
             bands,
@@ -352,26 +308,10 @@ impl BusView {
         self.spectrum_tx.lock().unwrap().clone()
     }
 
-    /// Recent RX spectrum rows (oldest→newest) for the clear-lane finder. A short,
-    /// bounded window — see [`SPECTRUM_HIST_CAP`]. The spectrogram uses the deeper
-    /// [`Self::recent_spectrum_disp`] instead so this stays cheap to clone per frame.
+    /// Recent RX spectrum rows (oldest→newest) for the clear-lane finder. A bounded,
+    /// in-memory window — see [`SPECTRUM_HIST_CAP`].
     pub fn recent_spectrum(&self) -> Vec<SpectrumRow> {
         self.spectrum_hist.snapshot()
-    }
-
-    /// Recent RX spectrum rows (oldest→newest) for the waterslide spectrogram, which
-    /// rebuilds its texture from this window by timestamp each frame. A deeper window
-    /// than [`Self::recent_spectrum`] — see [`SPECTRUM_DISP_CAP`] — so the spectrogram
-    /// can fill the widest on-screen time window without a black band at the old edge.
-    pub fn recent_spectrum_disp(&self) -> Vec<SpectrumRow> {
-        self.spectrum_disp_hist.snapshot()
-    }
-
-    /// Recent own-TX columns (oldest→newest) — the spectrogram places each over's
-    /// columns by their timestamp, mirroring [`Self::recent_spectrum_disp`]. Empty
-    /// until the first over; holds the last [`SPECTRUM_DISP_CAP`] TX columns.
-    pub fn recent_tx_spectrum(&self) -> Vec<SpectrumRow> {
-        self.spectrum_tx_hist.snapshot()
     }
 
     /// Enable/disable auto-QSY (the AUTO QSY toggle): after 3 unanswered CQs the
@@ -825,15 +765,12 @@ fn pump_state<T: BusMessage>(bus: &BusHandle, topic: Topic, cell: Cell<T>, ctx: 
 /// cell by its `source`. Splitting them keeps RX columns (still produced by the
 /// decoder while we transmit) from racing the own-TX columns onto one cell, so the
 /// panel can cleanly swap to the outgoing-signal waterfall while keyed.
-#[allow(clippy::too_many_arguments)]
 fn pump_spectrum(
     bus: &BusHandle,
     topic: Topic,
     rx: Cell<SpectrumRow>,
     tx: Cell<SpectrumRow>,
     hist: Ring<SpectrumRow>,
-    disp_hist: Ring<SpectrumRow>,
-    tx_hist: Ring<SpectrumRow>,
     ctx: egui::Context,
 ) {
     let mut sub = match bus.subscribe::<SpectrumRow>(TopicSelector::Exact(topic)) {
@@ -848,19 +785,12 @@ fn pump_spectrum(
             match sub.recv().await {
                 Ok(v) => {
                     match v.source {
-                        // RX columns feed both the lane finder's short window (`hist`)
-                        // and the spectrogram's deep one (`disp_hist`).
+                        // RX columns also feed the lane finder's recency window.
                         SignalSource::Received => {
                             hist.push(v.clone());
-                            disp_hist.push(v.clone());
                             *rx.lock().unwrap() = Some(v);
                         }
-                        // TX columns ring too, so the spectrogram can place an over's
-                        // columns by their timestamp (not just the latest one).
-                        SignalSource::OwnTx => {
-                            tx_hist.push(v.clone());
-                            *tx.lock().unwrap() = Some(v);
-                        }
+                        SignalSource::OwnTx => *tx.lock().unwrap() = Some(v),
                     }
                     ctx.request_repaint();
                 }
