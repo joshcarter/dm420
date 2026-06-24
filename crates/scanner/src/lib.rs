@@ -240,6 +240,17 @@ impl Scanner {
         self.worked.insert((call, band));
     }
 
+    /// Replace the worked set with the authoritative snapshot from the worked-status
+    /// producer (`radio/{id}/worked`). This is how the scanner *reads* worked-status
+    /// instead of deriving it: the `core::scan` shell subscribes to the single owner
+    /// and feeds the canonical `(call, band)` set here, rather than the scanner
+    /// folding raw `logbook/entries` itself with its own key. Keys are normalized
+    /// (trimmed + ASCII upper-cased) by `worked_key` upstream, so [`Scanner::tallies`]
+    /// upper-cases the heard call to match.
+    pub fn set_worked(&mut self, worked: HashSet<(Callsign, Band)>) {
+        self.worked = worked;
+    }
+
     /// Per-(band, mode) tallies, one per planned stop in sweep order.
     pub fn tallies(&self) -> Vec<BandTally> {
         self.plan
@@ -248,9 +259,16 @@ impl Scanner {
                 let heard_set = self.heard.get(&(band, mode));
                 let heard = heard_set.map_or(0, |h| h.len()) as u32;
                 let cq = self.cq.get(&(band, mode)).map_or(0, |c| c.len()) as u32;
+                // Upper-case the heard call to match the worked set's normalized keys
+                // (`worked_key` trims + upper-cases), so case-folding can't make a
+                // worked station read unworked.
                 let unworked = heard_set.map_or(0, |h| {
                     h.iter()
-                        .filter(|&c| !self.worked.contains(&(c.clone(), band)))
+                        .filter(|&c| {
+                            !self
+                                .worked
+                                .contains(&(Callsign(c.0.to_ascii_uppercase()), band))
+                        })
                         .count()
                 }) as u32;
                 BandTally {
@@ -386,10 +404,12 @@ mod tests {
         s.on_decode(Band::B20m, OverAirMode::Ft8, &cq("W1ABC"));
         s.on_decode(Band::B20m, OverAirMode::Ft4, &cq("W1ABC"));
         s.on_decode(Band::B20m, OverAirMode::Ft4, &cq("K2DEF"));
-        // Work W1ABC on 20m. Field Day counts all digital modes as one, so it's worked
-        // on 20m regardless of mode — and therefore not unworked on FT4 either. K2DEF
-        // stays unworked. heard/CQ remain split per (band, mode).
-        s.on_logged(call("W1ABC"), Band::B20m);
+        // Work W1ABC on 20m. The worked set arrives wholesale from the worked-status
+        // producer (keyed `(call, band)`, mode dropped — Field Day counts all digital
+        // modes as one), so W1ABC is worked on 20m regardless of mode and therefore not
+        // unworked on FT4 either. K2DEF stays unworked. heard/CQ remain split per
+        // (band, mode).
+        s.set_worked(HashSet::from([(call("W1ABC"), Band::B20m)]));
         let ft8 = tally(&s, Band::B20m, OverAirMode::Ft8);
         let ft4 = tally(&s, Band::B20m, OverAirMode::Ft4);
         assert_eq!((ft8.heard, ft8.cq, ft8.unworked), (1, 1, 0));
