@@ -250,7 +250,7 @@ async fn apply_stop(
 ) {
     if let Some(a) = audio {
         let (input, cur) = a.snapshot();
-        let want = proto_of(mode);
+        let want = crate::decode::protocol_of(mode).unwrap_or(Protocol::Ft8);
         if cur != want {
             a.set(input, want);
         }
@@ -328,13 +328,4 @@ fn publish_snapshot(bus: &BusHandle, engine: &Scanner) {
         })
         .collect();
     let _ = bus.publish(&Topic::ScannerCandidates, snapshot);
-}
-
-/// Map an over-air mode to the capture protocol. FT8/FT4 are direct; the
-/// architecture-only modes fall back to FT8 (the scanner only sweeps FT8/FT4).
-fn proto_of(mode: t::OverAirMode) -> Protocol {
-    match mode {
-        t::OverAirMode::Ft4 => Protocol::Ft4,
-        _ => Protocol::Ft8,
-    }
 }
