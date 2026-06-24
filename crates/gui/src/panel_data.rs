@@ -1,7 +1,5 @@
 //! Martian FT8 console — exact layout, palette, and fake-data tables.
 //!
-#![allow(dead_code)] // a few constants/helpers here are for future live-data wiring
-//!
 //! Pure data + small helpers, no dependencies. Everything here is lifted 1:1
 //! from the HTML prototype (`MartianHybrid.dc.html`) so the egui port matches.
 //! The geometry is in the prototype's logical pixels at a 960×600 panel; keep
@@ -17,6 +15,7 @@ pub const PANEL_W: f32 = 960.0;
 pub const PANEL_H: f32 = 600.0;
 pub const TOPBAR_H: f32 = 46.0; // full-width metal top bar
 pub const GROOVE_H: f32 = 2.0; // accent groove under the top bar
+#[allow(dead_code)] // documents the 600px body-height budget; not yet read at runtime
 pub const MAIN_H: f32 = 552.0; // body height (TOPBAR_H + GROOVE_H + MAIN_H = 600)
 
 pub const LEFT_COL_W: f32 = 470.0; // waterfall column; padding 8/10/8/14 (t/r/b/l)
@@ -187,6 +186,7 @@ fn spread(call: &str, loc: GridLoc) -> (f32, f32) {
 }
 
 /// Position a station from its callsign + grid. `None` if the grid can't be parsed.
+#[allow(dead_code)] // exercised by the unit tests; live callers go through `place_station`
 pub fn station_lonlat(call: &str, grid: &str) -> Option<(f32, f32)> {
     place(call, &Locator::Grid(grid.to_string()))
 }
@@ -458,128 +458,8 @@ fn fnv1a(s: &str, seed: u32) -> u32 {
     h
 }
 
-// ============================================================ LOG BOOK SPOTS (fake)
-/// A worked station as it appears on the map; position is inferred from `grid`.
-pub struct LogSpot {
-    pub call: &'static str,
-    pub grid: &'static str,
-}
-// Phase 1: all entries are worked (filled marker). ~13 stations spread across
-// North America. Phase 2 adds a separate unworked/heard list with last-heard times.
-pub const WORKED: &[LogSpot] = &[
-    LogSpot {
-        call: "K7RA",
-        grid: "CN87",
-    }, // Seattle, WA
-    LogSpot {
-        call: "K6XX",
-        grid: "CM97",
-    }, // Bay Area, CA
-    LogSpot {
-        call: "W7PH",
-        grid: "DM33",
-    }, // Phoenix, AZ
-    LogSpot {
-        call: "K0DEN",
-        grid: "DM79",
-    }, // Denver, CO
-    LogSpot {
-        call: "K5ED",
-        grid: "EM12",
-    }, // Dallas, TX
-    LogSpot {
-        call: "N5JR",
-        grid: "EL29",
-    }, // Houston, TX
-    LogSpot {
-        call: "W9XYZ",
-        grid: "EN61",
-    }, // Detroit, MI
-    LogSpot {
-        call: "K1ABC",
-        grid: "FN31",
-    }, // Connecticut
-    LogSpot {
-        call: "W2NYC",
-        grid: "FN20",
-    }, // New York, NY
-    LogSpot {
-        call: "N4FL",
-        grid: "EL96",
-    }, // Miami, FL
-    LogSpot {
-        call: "VE3EN",
-        grid: "FN25",
-    }, // Toronto, ON
-    LogSpot {
-        call: "VE6AO",
-        grid: "DO21",
-    }, // Calgary, AB
-    LogSpot {
-        call: "XE2OK",
-        grid: "DL95",
-    }, // Monterrey, MX
-    LogSpot {
-        call: "XE1RC",
-        grid: "EK09",
-    }, // Mexico City, MX
-];
-
-/// Great-circle distance (km) — used to label "Best DX".
-pub fn haversine_km(la1: f32, lo1: f32, la2: f32, lo2: f32) -> f32 {
-    let re = 6371.0_f32;
-    let dl = (la2 - la1).to_radians();
-    let dn = (lo2 - lo1).to_radians();
-    let a = (dl * 0.5).sin().powi(2)
-        + la1.to_radians().cos() * la2.to_radians().cos() * (dn * 0.5).sin().powi(2);
-    2.0 * re * a.sqrt().min(1.0).asin()
-}
-
 // Coastline/land/lakes geometry now lives in `geo_data.rs` (Natural Earth 10m,
 // pre-triangulated). See `tools/gen_geo.py` to regenerate.
-
-// ============================================================ WATERFALL DECODE RAIL (fake)
-// Left panel: a sideways waterfall image with a decode rail down its right edge.
-// Each decode sits at a vertical position derived from its audio frequency (Hz):
-//   y_px = ((1 − f / 3000) * RAILH − 7).clamp(2, RAILH − 16)   with RAILH = 438
-pub const FMAX_HZ: f32 = 3000.0;
-pub const RAILH: f32 = 438.0;
-pub const DECODES: &[(f32, &str, &str)] = &[
-    // (audio_hz, callsign, snr)
-    (2680.0, "OH8X", "−08"),
-    (2510.0, "JA1NUT", "−15"),
-    (2360.0, "K1ABC", "−02"),
-    (2200.0, "DL3XYZ", "−19"),
-    (2050.0, "VK3WE", "−21"),
-    (1880.0, "W7GH", "−11"),
-    (1720.0, "EA7KW", "−17"),
-    (1560.0, "N5JR", "−05"),
-    (1400.0, "PY2OG", "−23"),
-    (1240.0, "G4ABC", "−13"),
-    (1080.0, "VE3EN", "−09"),
-    (920.0, "ZL2AB", "−24"),
-    (600.0, "UA9XYZ", "−18"),
-];
-
-// ============================================================ LOG BOOK (fake, last 4)
-pub const LOGS: &[(&str, &str, &str, &str, &str)] = &[
-    // (utc, call, grid, sent, rcvd)
-    ("2358", "W7GH", "CN94", "−11", "−09"),
-    ("2355", "JA1NUT", "PM95", "−15", "−13"),
-    ("2351", "G4ABC", "IO91", "−13", "−07"),
-    ("2347", "VE3EN", "FN25", "−09", "−02"),
-];
-
-// ============================================================ BAND SCAN (fake)
-pub const BANDS: &[(&str, u32, u32)] = &[
-    // (band, heard, unworked)
-    ("40m", 23, 7),
-    ("20m", 41, 12),
-    ("15m", 18, 9),
-    ("10m", 6, 4),
-];
-// Columns: left = [40m, 20m], right = [15m, 10m].
-// Scan cycles activeBand 0→3 every 2.5 s, then returns to idle ("Last scan: just now").
 
 #[cfg(test)]
 mod tests {
