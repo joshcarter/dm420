@@ -121,10 +121,6 @@ pub struct Waterfall {
     /// Send-row text-box / slash-command state. The transmit lifecycle itself
     /// lives in the QSO engine (`QsoState`), which this row renders and commands.
     send: SendState,
-    /// Dial frequency set via the `/f` / `/b` commands (Hz), shown in the header
-    /// in place of the rig readout. Mock-mode feedback only — in real mode those
-    /// commands retune the rig and the header tracks the resulting `RigState`.
-    vfo_override_hz: Option<u64>,
     /// Real-mode selection (offset + optional station). Mock mode reads `slide`.
     real_sel: RealSel,
     /// The message latched on the air for the current over, held in the Send box
@@ -180,7 +176,6 @@ impl Waterfall {
             spectro: Spectrogram::new(),
             form: ConfigForm::default(),
             send: SendState::default(),
-            vfo_override_hz: None,
             real_sel: RealSel {
                 offset: 1500.0,
                 target: None,
@@ -537,9 +532,8 @@ impl Waterfall {
 
     /// Apply a parsed slash command. `/f` takes an explicit dial frequency; `/b`
     /// resolves a band to its calling frequency for the *current* over-air mode
-    /// (FT8 and FT4 differ — e.g. 20 m is 14.074 vs 14.080). In real mode the rig
-    /// is retuned and the header tracks the resulting `RigState`; in mock mode
-    /// there's no rig, so we set the local display override for feedback.
+    /// (FT8 and FT4 differ — e.g. 20 m is 14.074 vs 14.080). The rig is retuned and
+    /// the header tracks the resulting `RigState`.
     fn apply_command(&mut self, ctx: &PanelCtx, cmd: Command) {
         match cmd {
             Command::ClearQsy => {
@@ -564,11 +558,7 @@ impl Waterfall {
                     Command::ClearQsy => unreachable!(),
                 };
                 if let Some(hz) = hz {
-                    if ctx.bus.is_real() {
-                        ctx.bus.set_freq(hz);
-                    } else {
-                        self.vfo_override_hz = Some(hz);
-                    }
+                    ctx.bus.set_freq(hz);
                 }
             }
         }
@@ -679,34 +669,28 @@ impl Panel for Waterfall {
         };
         if let Some((new_proto, new_mode)) = new_mode_if_changed {
             ctx.bus.set_protocol(new_proto);
-            let vfo_hz = self
-                .vfo_override_hz
-                .or_else(|| ctx.bus.rig_state().map(|r| r.vfo.0));
+            let vfo_hz = ctx.bus.rig_state().map(|r| r.vfo.0);
             if let Some(band) = vfo_hz.and_then(|hz| Band::from_hz(AbsHz(hz)))
                 && let Some(hz) = crate::send::calling_freq_hz(band, new_mode) {
-                    if ctx.bus.is_real() {
-                        ctx.bus.set_freq(hz);
-                    } else {
-                        self.vfo_override_hz = Some(hz);
-                    }
+                    ctx.bus.set_freq(hz);
                 }
         }
 
         // Tuned-frequency readout (FREQ chip), centered in the header bar like the
         // top-bar clocks. When the rig is faulted, show a dashed placeholder rather
         // than a stale freq.
-        let rig_fault = ctx.bus.is_real()
-            && ctx
-                .bus
-                .health(SubsystemId::Rig)
-                .map(|h| h.is_faulted())
-                .unwrap_or(false);
+        let rig_fault = ctx
+            .bus
+            .health(SubsystemId::Rig)
+            .map(|h| h.is_faulted())
+            .unwrap_or(false);
         let vfo_text = if rig_fault {
             "---.---.--".to_string()
         } else {
-            let hz = self
-                .vfo_override_hz
-                .or_else(|| ctx.bus.rig_state().map(|r| r.vfo.0))
+            let hz = ctx
+                .bus
+                .rig_state()
+                .map(|r| r.vfo.0)
                 .unwrap_or(14_074_000);
             // MHz.kHz.daHz grouping, matching the rig's front panel (10 Hz step).
             format!(
@@ -759,27 +743,16 @@ impl Panel for Waterfall {
 
         if ctx.unlocked {
             // Unlocked (GUI EDIT): the screen body becomes the radio/audio settings
-            // form. Real mode only — the form drives live hardware; under mocks
-            // there's nothing to configure.
+            // form, which drives live hardware.
             if body_big {
-                if ctx.bus.is_real() {
-                    let body = screen.shrink(10.0);
-                    let mut child = ctx.ui.new_child(
-                        egui::UiBuilder::new()
-                            .max_rect(body)
-                            .layout(egui::Layout::top_down(egui::Align::Min)),
-                    );
-                    child.set_clip_rect(screen.shrink(2.0));
-                    self.form.ui(&mut child, ctx.bus, pal, &mut self.wide_decode, &mut self.auto_hop);
-                } else {
-                    draw_centered_note(
-                        painter,
-                        screen,
-                        pal,
-                        "RADIO SETUP",
-                        "available in real mode — relaunch without DM420_MOCK=1",
-                    );
-                }
+                let body = screen.shrink(10.0);
+                let mut child = ctx.ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(body)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                child.set_clip_rect(screen.shrink(2.0));
+                self.form.ui(&mut child, ctx.bus, pal, &mut self.wide_decode, &mut self.auto_hop);
             }
         } else {
             // Locked: re-locking the GUI commits any edits made while unlocked.
@@ -944,7 +917,6 @@ impl Panel for Waterfall {
                         .bus
                         .rig_state()
                         .map(|r| r.vfo.0)
-                        .or(self.vfo_override_hz)
                         .and_then(|hz| Band::from_hz(AbsHz(hz)))
                         .map(|b| ctx.bus.worked_calls_on_band(b))
                         .unwrap_or_default();
@@ -2432,33 +2404,6 @@ fn profile_label(p: LineProfile) -> &'static str {
         LineProfile::AssertDtrRts => "DTR/RTS",
         LineProfile::HardwareFlow => "RTS/CTS (hardware)",
     }
-}
-
-/// A simple two-line centred note in the screen body (used when the settings form
-/// has nothing to drive, e.g. mock mode).
-fn draw_centered_note(
-    painter: &egui::Painter,
-    screen: Rect,
-    pal: &Palette,
-    title: &str,
-    detail: &str,
-) {
-    let painter = painter.with_clip_rect(screen.shrink(6.0));
-    let c = screen.center();
-    painter.text(
-        Pos2::new(c.x, c.y - 8.0),
-        Align2::CENTER_CENTER,
-        title,
-        heading_bold(14.0),
-        pal.accent,
-    );
-    painter.text(
-        Pos2::new(c.x, c.y + 12.0),
-        Align2::CENTER_CENTER,
-        detail,
-        mono(9.5),
-        pal.sub,
-    );
 }
 
 /// Fault placeholder for the screen body: a centred status line plus the
