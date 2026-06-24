@@ -7,16 +7,6 @@ When someone hops on the RR73 with a call, answer instead of calling CQ
 Audio option: RX clipping indicator
 
 
-
-# Split audio offset
-
-Caps lock to lock audio offset. Also display a locked button at the right of the offset indicator which will unlock if clicked.
-
-Add "a" and "/clear" to find a clear QSY, replace the "clear qsy" button
-
-Add "auto QSY" option to the unlocked panel
-
-
 # Soon
 
 Map Panel: Once QSO is cleared, turn off crosshairs

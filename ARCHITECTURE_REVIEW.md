@@ -49,13 +49,13 @@ The fixes are tractable and mostly additive (build the owner producers; subscrib
 - **On-air mode** lives in `AudioControl.cfg.Protocol` (canonical driver), `BusView.applied.protocol` (form/header, persisted to disk), `ClockStatus.mode` (slot length), and the `qso::shell` `mode` local (TX synth). During a switch these update asynchronously, so a boundary slot can be decoded/keyed at the wrong protocol. In mock/WAV mode `control.audio` is `None`, so `set_protocol` no-ops the real mode while the UI and config still flip — UI and reality diverge and the divergence is persisted.
 - **Current band** has no owner; it is reclassified from `RigState.vfo` with a private hz→band table in the waterslide (`waterfall.rs:1437`), tracked separately in the scanner (`scan.rs:93`), and carried independently on `HeardEntry`/`LogEntry`/`BandActivity`. A band-edge frequency can classify differently per panel.
 
-**Root cause.** `radio/{id}/decodes_enriched` + `WorkedStatus` (the single worked-status owner) and `radio/{id}/operating` (`OperatingState`, the single mode+band+posture owner) are defined in `types`, routed in `bus/topic.rs`, listed in the catalog — and **never produced**. With no single owner, every consumer reconstructs the fact from raw streams with its own rule.
+**Root cause.** `radio/{id}/decodes_enriched` + `WorkedStatus` (the single worked-status owner) and `radio/{id}/operating` (`OperatingState`, the single mode+band owner — its originally-designed `posture` field moves to the control lease; see the *Radio Ownership* addendum) are defined in `types`, routed in `bus/topic.rs`, listed in the catalog — and **never produced**. With no single owner, every consumer reconstructs the fact from raw streams with its own rule.
 
 **Fix (stage it).**
 1. Subscribe `qso::shell` to `RigState` and stamp real band/freq/time in `build_log` (small, unblocks everything below).
 2. Add `Band::from_hz(AbsHz) -> Option<Band>` in `types` next to `calling_freq` and route the waterslide, scanner, and map through it (one band table).
 3. Build the enrichment producer in `core`: subscribe `decodes` + `logbook/entries` (+ future peer snapshots), maintain the canonical worked set keyed *once* and carrying `origin: Mine|Peer`, publish `EnrichedDecode`/`WorkedStatus`. Convert the three GUI/scanner re-derivations into subscribers.
-4. Publish `OperatingState` (mode+band+posture) from one owner; the GUI form/header and the qso shell become *observers* of mode, not co-owners. This also fixes the mock/WAV mode-no-op honestly (the owner can report "not applied").
+4. Publish `OperatingState` (mode+band) from one owner; the GUI form/header and the qso shell become *observers* of mode, not co-owners. This also fixes the mock/WAV mode-no-op honestly (the owner can report "not applied"). (Posture — Operate/Scanning/Configuring — is owned separately by the control lease, Phase 3b, not by `OperatingState`.)
 
 ---
 
@@ -202,11 +202,11 @@ A couple of bus-internal sharp edges to fix opportunistically: wildcard `State` 
 
 **SPLIT** (god-files / multi-responsibility modules to break up):
 
-1. **`crates/gui/src/panels/waterfall.rs` (2,458)** → `waterslide_render.rs` (`Spectrogram` + `draw_waterslide` + hatch/history), `send_row.rs` (`draw_send_row` + `apply_command` + slash parsing), `config_form.rs` (`ConfigForm`, pairs with settings), `cq_shortcuts.rs` (assignment logic); move format helpers + `band_for_hz` to their shared homes. `Waterfall` becomes a thin orchestrator; `draw_waterslide`'s 22 args become a `WaterslideView` struct.
+1. **`crates/gui/src/panels/waterfall.rs` (2,458) — the *Digital* panel; rename `waterfall.rs` → `digital.rs` (or a `digital/` module) and `struct Waterfall` → `Digital`** → `waterslide_render.rs` (the waterslide *view*: `Spectrogram` + `draw_waterslide` + hatch/history), `send_row.rs` (`draw_send_row` + `apply_command` + slash parsing), `config_form.rs` (`ConfigForm`, pairs with settings), `cq_shortcuts.rs` (assignment logic), `scan_mode.rs` (the active-scan mode of the Digital panel — see the *Radio Ownership* addendum); move format helpers + `band_for_hz` to their shared homes. the renamed `Digital` struct becomes a thin orchestrator; `draw_waterslide`'s 22 args become a `WaterslideView` struct.
 2. **`crates/gui/src/bus_view.rs` (988)** → `pumps.rs` (the `pump_*` tasks + `Ring`/`Cell`/`HeardEntry`), `derive.rs` (worked/heard derivation — ultimately migrates into the enrichment producer); `bus_view.rs` keeps the struct + accessor/command API. Extract the config-apply/`applied` state into a `Config` holder.
 3. **`crates/gui/src/settings.rs` (957)** → `config_toml.rs` (the hand-rolled TOML codec + its tests; better, adopt `toml_edit`), leaving `settings.rs` with the `Settings`/`HardwareConfig`/`Station` model + env reading.
 4. **`crates/gui/src/main.rs` (891)** → `layout.rs` (`Tactical` behavior + `build_tree`/`enforce_min_width`/`pin_band_height`/`TreeIds`), `top_bar.rs` (`top_bar`/`segmented`/`lcd_clock`); `main.rs` keeps entry + the `eframe::App` lifecycle.
-5. **`crates/gui/src/panels/contacts.rs` (852)** → `map_render.rs` (`Projection` + `draw_map` + `Marker`/polyline/ellipse primitives), leaving `contacts.rs` as the Panel.
+5. **`crates/gui/src/panels/contacts.rs` (852) — the *Map* panel (renamed from *Contacts*); rename `contacts.rs` → `map.rs` and `struct Contacts` → `Map`** → `map_render.rs` (`Projection` + `draw_map` + `Marker`/polyline/ellipse primitives), leaving `map.rs` as the Panel.
 6. **`crates/core/src/decode.rs::run_stream` (372-508 god-function)** → a `SpectrogramColumnizer` (window+hop+publish) and a `SlotAccumulator` (buffer+boundary+two-pass scheduling) the loop drives; `run_stream` becomes supervision (recv/health/reconnect) only.
 
 **Do NOT split:** `scanner`/`core::scan` (healthy pure-core/shell split); `types`/`qso::engine` live code (they read large but are ~30–45% tests — relocate the `#[cfg(test)]` blocks into `tests/` files for navigability only, do not restructure).
@@ -214,6 +214,8 @@ A couple of bus-internal sharp edges to fix opportunistically: wildcard `State` 
 ---
 
 ### Recommended Refactor Sequence
+
+> **⚠ Superseded** by the **Revised refactor sequence** in the *Mock Removal & Multi-Operator Sequencing* addendum below (re-ordered + renumbered — e.g. old `1b` → `A3`). This original is kept for its rationale; **follow the Revised sequence for phase numbers** (including where the *Unblocking summary* below still uses the old `1b`).
 
 The ordering maximizes stability per unit effort: safety first, then a cheap shared-foundation pass that unblocks the big wins, then the single-owner conversions, then structural splits done opportunistically alongside.
 
@@ -229,7 +231,7 @@ The ordering maximizes stability per unit effort: safety first, then a cheap sha
 **Phase 2 — Single owners (kills duplication classes) (S → L):**
 - **2a.** Subscribe `qso::shell` to `RigState`; stamp real band/freq/time in `build_log`. Small, unblocks all per-band correctness. *(prerequisite for #2)*
 - **2b.** Build the enrichment producer (`WorkedStatus`/`EnrichedDecode`) carrying `origin`; convert the three GUI/scanner derivations to subscribers; make `net`'s peer snapshots flow into it. *(driver #2 — the meta-fix)*
-- **2c.** Publish `OperatingState` (mode+band+posture); GUI form/header and qso shell become observers; honest mock/WAV no-op reporting. *(driver #2 / #5)*
+- **2c.** Publish `OperatingState` (mode+band); GUI form/header and qso shell become observers; honest mock/WAV no-op reporting. *(driver #2 / #5; posture is owned by the control lease — Phase 3b — not OperatingState)*
 - **2d.** One TX-offset owner + publish `offset_locked`; delete the per-frame back-copy. *(driver #3)*
 - **2e.** One `Selection` owner; merge display string with `real_sel.target`; drop `map_pick`. *(driver #8)*
 
@@ -304,7 +306,7 @@ De-risking facts confirmed against the tree: `mocks` is a dependency of **`crate
 
 **Screenshot path — RESOLVED:** daylight-color screenshots (`MARTIAN_SHOT`/`MARTIAN_LIGHT`) are captured against a **real radio**, not mock-seeded data — and the code path is already decoupled from `DM420_MOCK`. So mock deletes outright; no fixture-replacement feed is needed.
 
-**Bonus:** removing the mock branch shrinks the `Option<AudioControl> == None` "silently no-op" surface that drivers #2 and #5 named as a divergence source. WAV still yields `control.audio = None`, but driver #2c's `OperatingState` owner turns that into an *honest* "not applied" instead of a silent UI-vs-reality divergence.
+**Bonus:** removing the mock branch shrinks the `Option<AudioControl> == None` "silently no-op" surface that drivers #2 and #5 named as a divergence source. WAV still yields `control.audio = None`, but Phase 2c's `OperatingState` owner turns that into an *honest* "not applied" instead of a silent UI-vs-reality divergence.
 
 ### Multi-op substrate — what to KEEP & BUILD (don't un-plumb)
 
@@ -314,7 +316,7 @@ Cross-referencing `networking.md`'s wiring against the main report's "dead/unbui
 |---|---|---|---|---|
 | `EnrichedDecode` / `WorkedStatus` (incl. `WorkedByNetwork(StationId)`) | `types` lib.rs:268 / 578 | `net` derives shared `HeardStation` from `decodes_enriched`; engine excludes `WorkedByNetwork` from auto-pick | #2 | **BUILD** — produce the network variant + `origin` from day one |
 | `origin: Mine\|Peer` on `MapSpot`/`HeardEntry` | missing (`LogEntry` already has it) | peer log entries injected on `logbook/entries`; UI must render mine ≠ peer | #2/#8 | **BUILD/EXTEND** (multi-op step 2 UI) |
-| `OperatingState` (mode/band/posture) | `types` lib.rs:303 | upstream of `WorkingTarget.band` + snapshot `band_activity` | #2/#5 | **BUILD** (local owner) |
+| `OperatingState` (mode/band; **posture → lease**) | `types` lib.rs:303 | upstream of `WorkingTarget.band` + snapshot `band_activity` | #2/#5 | **BUILD** (local owner; posture lives in the control lease, Phase 3b) |
 | `SessionCommand` (SetMode/SetContest/TuneBand) | `types` lib.rs:325 | local config-as-bus-command — the clean replacement for the GUI poking `AudioControl` | #5 | **BUILD** (this *is* the driver-#5 fix), not delete |
 | `StationSnapshot` / `HeardStation` / `WorkingTarget` (§9) | `types` lib.rs:684 + spec | the gossip vocabulary on `station/{id}/snapshot` (State) | net steps 1–3 | **KEEP** — `net`'s "zero subscribers" is *expected at step 1*; consumers land in steps 2–3 |
 | `tx_report` consumer / closed TX loop | `types` / `core::tx` | trustworthy `qso/{id}/state` → trustworthy shared `WorkingTarget` | #1 | **BUILD** — an open-loop FSM would gossip *wrong* working-intent to peers |
@@ -335,8 +337,8 @@ Re-ordered from the main report to (a) pull dead-weight removal forward so every
   - **A2.** Carve dead prototype tables from `panel_data.rs`; delete the mock-only waterslide block; audit/remove `waterslide_sim.rs`.
   - **A3.** Shared-utility pass (was 1b): `now_ms` / `Band::from_hz` / `OverAirMode↔Protocol` / format / `geo::distance_km` — also deletes the mock copies as a side effect.
 - **Phase 1 — Close the loops:** 1a TX outcome loop (#1); 1c clock unification (#6).
-- **Phase 2 — Single owners, built multi-op-aware (the substrate):** 2a `RigState`→`build_log` band/freq **+ recover the log-`seq` high-water on startup** (resume minting new `QsoId`s from `1 + max(seq where origin == me)` off the replayed log — no sidecar; closes the restart `QsoId` collision that would otherwise silently drop a post-restart contact, per the seq-persistence finding below); **2b enrichment producer = `WorkedStatus`/`EnrichedDecode` carrying `origin` and emitting `WorkedByNetwork` from day one** (#2 + the `net` heard/auto-pick prerequisite); 2c `OperatingState` owner + `SessionCommand` config-as-command (#2/#5); 2d offset owner + publish `offset_locked` (#3, also fixes `WorkingTarget.offset`); 2e `Selection` owner (#8, the single source for "currently-working station" → `WorkingTarget.call`).
-- **Phase 3 — Lifecycle hardening:** 3a `Progress` enum + transition table (#4); 3b config commit decoupled from the lock edge + rig-ownership posture (#5).
+- **Phase 2 — Single owners, built multi-op-aware (the substrate):** 2a `RigState`→`build_log` band/freq **+ recover the log-`seq` high-water on startup** (resume minting new `QsoId`s from `1 + max(seq where origin == me)` off the replayed log — no sidecar; closes the restart `QsoId` collision that would otherwise silently drop a post-restart contact, per the seq-persistence finding below) **+ single-source `station_id`** (from `config.toml` → `CoreConfig` → `net` + logbook; see the *Multi-Op Identity* addendum); **2b enrichment producer = `WorkedStatus`/`EnrichedDecode` carrying `origin` and emitting `WorkedByNetwork` from day one** (#2 + the `net` heard/auto-pick prerequisite); 2c `OperatingState` (mode+band) owner + `SessionCommand` config-as-command (#2/#5; **posture is owned by the Phase-3b control lease, not OperatingState**); 2d offset owner + publish `offset_locked` (#3, also fixes `WorkingTarget.offset`); 2e `Selection` owner — **per-radio, written by the focused panel** (#8, the single source for "currently-working station" → `WorkingTarget.call`; resolves the map-click-with-N-panels question — see the *Radio Ownership* addendum).
+- **Phase 3 — Lifecycle hardening:** 3a `Progress` enum + transition table (#4); 3b config commit decoupled from the lock edge + **rig-ownership posture promoted to a per-radio control lease that gates *tuning* (not only TX), with safe-park-on-loss** (driver #5 / lifecycle #5 + #6; see the *Radio Ownership* addendum) + the **operate⊥configure invariant** (unlock gated on radio-idle; arm/TX gated on locked — the *Configuring* lease posture; see the *Lock Posture* addendum; the GUI-disable layer can ship earlier).
 - **Phase 4 — Bus hardening for gossip + catalog truth:** fix wildcard `State` late-join snapshot (`handle.rs:391-406`, now a multi-op blocker); reconcile `message-catalog.md` with reality (mark each formerly-"dead" topic BUILT or tag the build-step that builds it; delete only `logbook/query`).
 - **Phase 5 — Multi-op feature** (`networking.md` build order, now standing on clean owners): step 2 shared logbook (origin rendering — threading already in place from 2b); step 3 working-intent (`WorkingTarget` from the clean FSM + selection + offset owners); step 4 heard/band aggregation (straight off the 2b enrichment producer). *(Step 1, the `net` skeleton + §9 types + snapshot exchange, is already built.)*
 
@@ -347,3 +349,157 @@ The throughline: **Phase 2's owners are the gossip inputs.** `decodes_enriched` 
 1. ~~Screenshot population~~ — **RESOLVED:** captured against a real radio; mock deletes cleanly.
 2. ~~`logbook/query`~~ — **RESOLVED:** delete it in the Phase-4 catalog reconciliation.
 3. **`seq` persistence** (`networking.md` open Q) — **finding:** the high-water is *already on disk*. `LogEntry.id` is a `QsoId { origin, seq }` (`types` lib.rs:548/571) and the logbook already replays every entry into a `seen: HashSet<QsoId>` on startup (`logbook/lib.rs:50`). So persistence needs **no sidecar** — on startup, resume minting from `1 + max(seq where origin == me)` derived from the replayed log. **Decided — folded into Phase 2 (2a)** (the logbook is already open there for the band/freq fix); deriving from the log can't drift from the log the way a separate high-water file could. The separate, milder restart bug is the **snapshot** `seq` (`net/lib.rs:154` starts at 0 each process), which makes a restarted op look *stale* to peers until `PEER_TTL` ages out their record — fix alongside, but it self-heals where the log `seq` collision silently *loses data*.
+
+---
+
+## Addendum — Radio Ownership & the Scan/Operate Contention (decided)
+
+**Owner decision:** a **per-radio control lease** (foundational), with active band-scan implemented as a **mode of the Digital panel** (modal operate ↔ scan), and band-*activity display* split out as a passive, non-contending panel. The lease is designed so a **standalone Scan panel could hold it later** — the "maybe eventually" dedicated scanning receiver — but that panel is not built now.
+
+### Diagnosis — one missing abstraction, several symptoms
+
+The only arbiter today is the interlock granter's single **PTT (keying)** token. Two radio uses escape it:
+- **VFO / RX tuning is not arbitrated at all.** The scanner issues `SetFreq` retunes "even when [PTT] denied" (lifecycle #5), so it retunes out from under an in-progress QSO. Keying is arbitrated; *tuning* is not.
+- **There is no operating *session*.** A QSO owns the radio for its whole RX→TX→RX lifecycle; a sweep owns it for its duration. Nothing represents "this radio is busy," so the engine "is never told a scan owns the rig, so it keeps sequencing."
+
+Both reported symptoms are the same gap: *scan-mid-QSO / operate-during-scan* = two would-be owners with no lease; *which panel snaps to a clicked map station* = selection has no per-radio owner (driver #8: two panels write `selected_station` every frame, last-writer-wins — identical race with two Digital panels).
+
+### The per-radio control lease (foundational — under either UX)
+
+Generalize the interlock from "who may key" to **"who controls this radio."** At any moment exactly one *controller* holds `radio/{id}` for operating/RX-tuning — covering **tune + key + decode-context** — with the PTT interlock nested inside as the fine-grained keying sub-arbiter. Publish it as `radio/{id}` State so every panel **and** the engine can see it and refuse to act when they don't hold it; the bus is already per-radio scoped. This is the review's "rig-ownership posture (Operate | Scanning | Configuring)" (lifecycle #5), **promoted to gate RX tuning, not only TX**. Add safe-park-on-lease-loss to also close the VFO save/restore-on-crash gap (lifecycle #6). This alone kills the "scanner retunes mid-QSO" class: `SetFreq` is rejected unless the caller holds the lease, and a sweep cannot hold it while a QSO does.
+
+> **Design constraint (from "maybe eventually"):** the lease holder is a *controller*, not specifically "the Digital panel." Do **not** bake panel identity or "only an operating panel can own a radio" into the lease — so a future standalone Scan panel (or a dedicated scan-only rig/SDR) can hold the same lease without rework.
+
+### UX now: active scan = a mode of the Digital panel
+
+The Digital panel holds the lease for its bound radio and switches internally between **operate** and **scan**; they are mutually exclusive *by physics* on one receiver, so scan is a *mode of the radio*, not a peer instrument. Entering scan while a QSO is active is **gated on idle, exactly as unlocking-to-configure is** — you Stop the QSO first (which uses `Granter::revoke`, Phase 0b); scan never silently auto-aborts a live QSO. One uniform rule: **operate ⊥ {scan, configure}**. The saved operating frequency is the panel's mode-state, so restore-on-exit and crash recovery are local (folds in lifecycle #6). Per-radio by construction: two transceivers = two Digital panels, each independently operate-or-scan.
+
+### Band-activity display = a passive panel (no radio ownership)
+
+The "where's the action" view — aggregated from your own decodes, and later peers' heard-data (multi-op) — owns **no** radio and never contends. This is the legitimate "separate instrument," and where the dynamic-panel intent is satisfied without arbitration.
+
+### Multi-panel selection / map-click
+
+Make selection **per-radio, written by the focused panel** (panel focus already exists: `Cmd/Ctrl+1..5`). A map click targets the focused operating panel's radio (optionally QSYing it); if that radio can't reach the clicked band, prompt or no-op. This is driver #8 / Phase 2e generalized from "one Selection owner" to "one Selection owner *per radio*."
+
+### How it slots into the plan
+
+- **Phase 0b** — `Granter::revoke` is the clean abort path for both QSO-Stop and scan-cancel (already planned).
+- **Phase 2e** — selection becomes per-radio + focused-panel (extends the single-owner work; resolves the map-click question).
+- **Phase 3b** — promote the rig-ownership posture to the per-radio **control lease that gates tuning**, published per-radio, with safe-park-on-loss (folds in lifecycle #6). The lease holder is a generic controller (see constraint above).
+- **Split #1 (interleaved in Phases 1–3, per the main report's Phase-4 note, as `waterfall.rs` is touched)** — active-scan becomes a **`scan_mode.rs` module extracted from `waterfall.rs`**, not a radio-grabbing peer panel. The `scanner` crate stays the pure sweep engine; `core::scan` must **acquire the lease** (not best-effort PTT) before any `SetFreq`, and deny the sweep if it can't.
+
+---
+
+## Addendum — Multi-Op Identity (`StationId` vs callsign; merge-key vs dupe-key)
+
+**Owner decision:** `station_id` lives in `config.toml` (the operator-identity file, alongside `call`/`grid`), single-sourced from there to every consumer.
+
+### "Me" is the `StationId`, never the callsign
+
+`StationId(String)` is *"one operator/core instance — the unit of multi-op gossip"* (`types` lib.rs:53-55); the G-set key is `QsoId { origin: StationId, seq }` (lib.rs:571-574). The on-air callsign is QSO **content** and is deliberately allowed to be **shared** — a club call across all positions in a multi-op. Keying authorship on callsign would collide the moment two positions both send `W1AW`. Four identities to keep distinct:
+
+| Identity | Shared in multi-op? | Role |
+|---|---|---|
+| **On-air callsign** | yes (club call) | QSO content; the DX logs it; config (`engine.me`), applied at TX + export |
+| **Worked call** | n/a | `LogEntry.call` — per-contact data |
+| **`StationId`** | **no** (unique per writer) | authorship/gossip; G-set key `(origin, seq)`; `origin == me` push-guard |
+| **Human operator** *(future)* | no | optional `operator` field; two humans can share one instance |
+
+### Two different "same" — must not be conflated
+
+- **Same record** (idempotent gossip merge) → `(origin, seq)` — the G-set.
+- **Same contact for scoring/dupe** → `(worked_call, band)` (mode excluded — Field Day; see the *Worked-Status Key* addendum) evaluated **over the merged log, across all origins** — the `WorkedStatus`/enrichment layer (driver #2). Two ops working K1ABC on 20m before gossip syncs = two *real records*, one *dupe*: the merge keeps both, the dupe-layer flags it. Build the dupe-key in the driver-#2 enrichment producer, **separate** from the G-set merge key.
+
+### `station_id` in `config.toml` — DECIDED
+
+- **Precedence:** `DM420_STATION_ID` env > `config.toml` > generated default.
+- **Generate-once, write-back:** if absent, generate a collision-resistant, human-labelable default (friendly prefix + random suffix — **not** bare hostname or `<pid>`: hostname collides on a Field-Day Raspberry-Pi stack, `<pid>` changes every restart) and write it back so it's stable next launch.
+- **Single source, threaded down:** `config.toml → CoreConfig.station_id → core::spawn` hands the *same* value to both `net` (gossip `from` + `origin == me` push-guard) and the logbook write-path (stamps `origin`). Retire `net`'s `default_station_id()` = `dm420-<pid>` (`net/lib.rs:66-91`) — today it is both unstable *and* a second identity definition disconnected from `LogEntry.origin` (review domain finding). One canonical id removes both bugs.
+- **Immutable once set:** changing it re-parents future contacts and orphans prior ones (they'd read as *peer* to the new id); the config UI treats a change as a deliberate, warned action.
+
+### seq high-water — computed from the log (no sidecar)
+
+On startup, after the logbook replays, resume minting from `1 + max(seq where origin == me)` over the loaded entries — drift-proof (the log *is* the record; a separate counter can go stale on a crash-after-log). **Ordering:** `station_id` resolves from `config.toml` *before* the logbook computes the high-water (config loads before `core::spawn`), so "me" is known when the per-origin max is taken.
+
+### Smaller gap to pre-empt
+
+`LogEntry` records the *worked* `call` but not the call *you* used (`my_call`). Fine while the club call is uniform; needed for mixed-call operating and clean Cabrillo/ADIF export. Add `my_call: Callsign` (+ optional `operator`) with `#[serde(default)]` while the logbook schema is open in Phase 2 — cheap now, a migration later.
+
+### Plan placement
+
+Phase 2a: persist + single-source `station_id` (config.toml → CoreConfig → net + logbook) alongside the computed seq high-water. Phase 2b (driver #2 enrichment): the `(call, band)` dupe-key carrying `origin` (mode excluded — Field Day; see the *Worked-Status Key* addendum). Optional `my_call`/`operator` on `LogEntry` when the schema is touched.
+
+---
+
+## Addendum — Lock Posture & Config-While-Operating (decided)
+
+**Owner decision:** the unlock (configure) toggle is **gated on the radio being idle**, and the underlying guarantee is a bidirectional invariant enforced by the control lease, not just a greyed button. Folds into driver #5 + the Phase-3b lease.
+
+### Framing: "unlocked / configuring" is a posture that wants the radio
+
+Changing callsign / device / mode / serial port is a *Configuring* activity, so config-while-operating is the **same conflict class** as scan-while-operating — two would-be owners of one radio. It is therefore not a new mechanism: *Configuring* is the third posture in the control lease (**Operate | Scanning | Configuring**, mutually exclusive). The lock toggle is the gateway into Configuring; gate it on "radio idle" exactly as entering Scan is gated.
+
+### The invariant (bidirectional)
+
+> **You operate only when locked; you configure only when idle.**
+
+- **Disable unlock while not-idle** (the owner's ask) — can't start fiddling mid-QSO.
+- **Block arm/TX while unlocked** (the other half) — can't reach a non-idle state from Configuring.
+
+Together the bad state is unreachable. **Bonus:** this *dissolves* the driver-#5 "applies immediately vs. on re-lock" hazard for radio config — there is no window in which a live-applying setting can change under an active QSO, because unlocked and operating are mutually exclusive. **"Armed" counts:** gate on *any* non-idle engine state (armed / calling / in-exchange) + PTT-held + scan-running — i.e. "the control lease is held by Operate or Scanning."
+
+### Two layers (defense in depth)
+
+1. **Quick GUI layer (independent, low-risk, can ship early):** disable the unlock toggle whenever `QsoState.phase != Idle` (the GUI already subscribes to `QsoState`), plus PTT-held / scan-running, with a tooltip pointing at Stop (*"Stop the QSO to configure"*). Pure GUI, reads already-published state.
+2. **Lease-enforced layer (Phase 3b):** make *Configuring* a lease posture the **producers** honor — reject a config-apply unless the caller holds the Configuring lease, and reject arm/TX unless locked. The disabled button is the friendly front door; the lease rejection is the actual lock on the door.
+
+### Refinements so this doesn't over-restrict
+
+- **Split radio/station config from app/display prefs.** Only callsign / grid / device / mode / port are posture-gated. Theme, layout, and the like are not radio-affecting and should not sit behind the lock at all — so gating unlock never traps you from changing cosmetics mid-QSO.
+- **Operate-time adjustments are not behind the lock anyway** (TX offset via a waterslide click, etc.), so gating unlock removes no legitimate mid-QSO control.
+
+### Stranded-user path (correct, not a problem)
+
+If you genuinely must reconfigure mid-QSO: Stop first (→ `Granter::revoke`, Phase 0b) → idle → unlock re-enables. Consciously stopping before reconfiguring is the intended behavior.
+
+### Plan placement
+
+The quick GUI layer can ship **early and independently** (reads `QsoState`, no new infrastructure). The lease-enforced invariant lands in **Phase 3b** alongside the control lease (the Configuring posture is the same lease, third state). Both under driver #5.
+
+---
+
+## Addendum — Worked-Status Key (Field Day dupe rule) (decided)
+
+**Owner clarification (ARRL Field Day):** the dupe rule is *once per band per mode-**category***, where the categories are CW / Phone / **Digital** — and **all** digital modes (FT8, FT4, PSK31, RTTY…) are the single Digital category. dm420 is all-digital, so the category is constant and the worked/dupe key collapses to:
+
+> **Canonical worked-key = `(callsign, band)`** — mode (FT8 vs FT4 …) is **not** part of the uniqueness constraint. Working K1ABC on 20m FT8 makes K1ABC on 20m FT4 a **dupe**, not a new contact.
+
+**Reconciles the inconsistent keys the review flagged — one canonical, both current directions wrong:**
+- `scanner::Scanner.worked` keys `(call, band, OverAirMode)` (`scanner/lib.rs:80,237`) — **drop `OverAirMode`**; today it wrongly treats 20m FT4 as workable after 20m FT8.
+- `bus_view::worked_spots` keys `(call)` globally (`bus_view.rs:385`) — **add band**; today one QSO marks a call worked on *every* band.
+- `bus_view::worked_calls_on_band` keys `(call, band)` (`bus_view.rs:417`) — already correct; becomes a subscriber to the canonical owner.
+
+**Two parts, both required (both already in the plan):**
+1. **Same key shape** — `(call, band)` everywhere, owned once by the driver-#2 enrichment producer (`WorkedStatus`: `New | WorkedByMe | WorkedByNetwork`).
+2. **Same inputs** — band via `Band::from_hz` (Consolidate #4) so a band-edge frequency can't classify differently per panel, and the callsign upper-cased/normalized before keying (the review noted inconsistent case-folding). Without these, `(call, band)` can still disagree across panels.
+
+**Keep the rule contest-defined, not hardcoded.** Put it in a single `worked_key(entry, contest)` in the enrichment producer: Field Day (and the all-digital app) returns `(call, band)`; a future per-mode award view (e.g. "WAS on FT8") becomes a *different query over the log*, not a literal scattered across consumers. `ContestProfile` selects the rule in one place.
+
+---
+
+## Addendum — Panel Naming / Renames (decided)
+
+Retire the historical panel names as part of the restructuring. The key distinction: a panel named **Digital** *contains* a view named **waterslide** — they are not the same thing, and "waterfall" is dropped entirely.
+
+| Concept | Canonical name | Historical / current code |
+|---|---|---|
+| The primary operating panel | **Digital** panel | "Waterfall" / "Waterslide panel"; `panels/waterfall.rs`, `struct Waterfall` |
+| The sideways-spectrogram + decoded-traffic view *inside* it | **waterslide** (a *view*, not a panel) | kept — view helpers (`waterslide_panel.rs` / `waterslide_sim.rs` → `waterslide_render.rs`) |
+| The map panel | **Map** panel | "Contacts"; `panels/contacts.rs`, `struct Contacts` |
+
+- **"Waterfall" is dropped as a panel name.** The **Digital** panel *contains* the **waterslide** view (the sideways spectrogram + decoded lanes). Keep "waterslide" only for that view — `waterslide_render.rs` is correctly named; the misleadingly-named `waterslide_panel.rs` collapses into it.
+- **"Contacts" → "Map."**
+- Apply the file/struct renames *during the splits already planned*: **Split #1** renames `panels/waterfall.rs` → `panels/digital.rs` (`struct Waterfall` → `Digital`); **Split #5** renames `panels/contacts.rs` → `panels/map.rs` (`struct Contacts` → `Map`). Folding the rename into the split keeps the file move + decomposition + identifier churn in one commit per panel.
+- The rename also touches **non-code surfaces**: tile/panel titles, the `Panel` impls and any panel-kind / `Cmd/Ctrl+N` focus-target identifiers, and the docs (`CLAUDE.md`, `docs/waterslide_panel.md` — really the Digital panel's waterslide *view*, `docs/map_panel.md`). Update those in the same pass.
+- **Register note:** elsewhere in this document, `waterfall.rs` / `contacts.rs` are the **current (pre-rename)** filenames cited as evidence; the *target* names are **Digital** / **Map** per this table.
