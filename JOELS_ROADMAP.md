@@ -1,7 +1,7 @@
 # Joel's Roadmap — now / next / later
 
 **Joel's working roadmap** (kept separate from Josh's workflow). This consolidates the
-explicit roadmap items scattered across `TODO.md`, `TODO_NETWORK.md`, `OVERVIEW.md §7`,
+explicit roadmap items scattered across `TODO.md`, `TODO_NETWORK.md`, `README.md`,
 `docs/live_pipeline_notes.md`, and `docs/decoder_sensitivity_plan.md`. Those files stay
 authoritative for their own detail; this file is the prioritized overview.
 
@@ -435,7 +435,7 @@ the clear audio lane. Strategic and data-hungry, so it lands after the scanner, 
 archive, and shared logbook exist.
 
 ### Interop & data
-- **ADIF import/export** (logbook crate; `OVERVIEW.md §7`, `docs/log_book.md`) — the
+- **ADIF import/export** (logbook crate; `docs/log_book.md`) — the
   amateur-radio interchange format; pairs with the merged peer log and the decode archive
   (Now-#2).
 - **Network wire format** — switch JSON → bincode once the schema settles
@@ -444,7 +444,7 @@ archive, and shared logbook exist.
   brightness constants currently require a recompile); broader settings UX beyond station
   identity (config format/persistence is interim/TBD).
 
-### Hardware & mode reach (`OVERVIEW.md §3.5, §6`)
+### Hardware & mode reach (see `README.md`, "Initial hardware, longer arc")
 - **Multi-radio-in-one-box** (Field-Day-timed in the network plan): spawn >1 radio id, a
   radio-selector/add-radio config UI, inter-radio PTT interlock. Bus topics already scope
   by `RadioId`; only `rig0` exists today.
@@ -466,7 +466,7 @@ archive, and shared logbook exist.
 - Shared multi-operator notebook panel (freeform text).
 - Matrix-style "scrolling letter" decode-in-progress effect on the waterslide.
 - **Pick the product name** — the app is still effectively unnamed beyond "DM420 /
-  Dingus Mangler 420" (`OVERVIEW.md §7`).
+  Dingus Mangler 420" (`README.md`).
 
 ---
 
@@ -482,7 +482,7 @@ archive, and shared logbook exist.
   can't hang the quit. Removes the dependence on the rig's ~15 s PTT watchdog as the only
   backstop against a mid-over quit leaving the transmitter keyed.
 
-**Settled `OVERVIEW.md §7` design decisions:** decoder strategy (Rust `ft8_lib` port, with
+**Settled design decisions** (originally open questions): decoder strategy (Rust `ft8_lib` port, with
 shelling out to `jt9` as the documented fallback if full parity is required) · audio/serial
 crates (`cpal` / `serialport`) · network protocol (mDNS + UDP gossip, eventual consistency) ·
 map base data (bundled coastline mesh + land-snapping) · FFT migration to `realfft` in `modes`.
@@ -495,6 +495,6 @@ map base data (bundled coastline mesh + land-snapping) · FFT migration to `real
 - `docs/live_pipeline_notes.md` — severity-tagged live-path shortcuts & known issues
 - `docs/decoder_sensitivity_plan.md` — the FT8/FT4 decode-gap plan
 - `docs/band_scanner.md` — band-scanner spec (extended by Josh's mode-scan note above)
-- `OVERVIEW.md §7` — original open design decisions
+- `README.md` — design objectives, differentiators & principles
 - `joels-notes.md` — running gotchas & the open QSO-sequencing design call
 </content>

@@ -11,8 +11,8 @@ schema, merge semantics, and how the `net` service attaches to the bus — so a
 second instance (e.g. a Raspberry Pi on the bench) sees the first one's log and
 working-intent, and vice versa.
 
-It implements the design intent in `OVERVIEW.md §5` and the deferred message shapes
-in `docs/message-catalog.md §9` / `crates/types/src/lib.rs §9`.
+It implements the LAN-sharing design intent in `README.md` (design principles 4–5) and
+the deferred message shapes in `docs/message-catalog.md §9` / `crates/types/src/lib.rs §9`.
 
 ## Decisions (settled)
 

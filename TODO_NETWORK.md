@@ -111,7 +111,7 @@ Surface what the *whole network* is hearing, not just this receiver.
   type) from the scanner/decode counts.
 - [ ] **Consume.** Map + band-scan panels aggregate peers' heard/activity, aged by
   **local** receive time; distinguish my ears from peers'.
-- [ ] **ADIF import/export** (logbook crate; `docs/log_book.md`, OVERVIEW §7) — the
+- [ ] **ADIF import/export** (logbook crate; `docs/log_book.md`) — the
   amateur-radio interchange format; pairs naturally with the merged log.
 - [ ] **Multi-radio-in-one-box** (Field-Day-timed): spawn >1 radio id, a radio
   selector/added-radio config UI, and inter-radio PTT interlock. Bus topics already
