@@ -15,6 +15,7 @@ mod app;
 mod app_nap;
 mod bus_view;
 mod chrome;
+mod config_toml;
 mod flag;
 mod format;
 mod geo;
