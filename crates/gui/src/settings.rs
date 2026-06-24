@@ -9,9 +9,6 @@
 //!
 //! ## Variables
 //!
-//! - `DM420_MOCK` — run the mock producers instead of the real rig/decode path.
-//!   Real producers are the **default**; set this (`1`/non-empty) when you want
-//!   the GUI to run with no hardware.
 //! - `DM420_AUDIO_INPUT` — capture device name (case-insensitive substring match,
 //!   e.g. `USB PnP`). Unset ⇒ the system default input.
 //! - `DM420_SERIAL_PORT` — rig CAT device, e.g. `/dev/cu.usbserial-120`. Unset ⇒
