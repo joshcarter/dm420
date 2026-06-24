@@ -619,6 +619,35 @@ pub enum WorkedStatus {
     WorkedByNetwork(StationId),
 }
 
+/// The canonical key under which a logged contact counts as "worked" — the single
+/// place the dupe rule lives.
+///
+/// Worked-status is re-derived in several consumers (the band scanner's
+/// `worked: HashSet<(Callsign, Band)>`, the Contacts map in `gui::bus_view`, the
+/// `core::scan` shell) with subtly divergent keys — some upper-case the callsign,
+/// some don't. This function is the canonical definition they should converge on;
+/// it is **additive and not yet consumed** (the consumer migration is a separate,
+/// supervised step because it changes visible dupe behavior).
+///
+/// The key is `(call, band)` with the callsign normalized (trimmed + ASCII
+/// upper-cased), deliberately dropping the [`OverAirMode`]: under ARRL Field Day —
+/// and for this all-digital app generally — every digital mode collapses into a
+/// single "digital" mode, so a station worked on 20 m FT8 is a dupe on 20 m FT4.
+/// Worked-ness is **per band**, so the same station on another band is a new
+/// contact.
+///
+/// `contest` selects the rule in one place. Both shipping profiles collapse modes
+/// today; keeping the parameter means a future per-mode award view (e.g. "WAS on
+/// FT8") is a change here rather than a literal scattered across consumers.
+pub fn worked_key(entry: &LogEntry, contest: ContestProfile) -> (Callsign, Band) {
+    let call = Callsign(entry.call.0.trim().to_ascii_uppercase());
+    match contest {
+        // Field Day collapses every digital mode into one; the Standard profile we
+        // run is likewise all-digital today, so both key on `(call, band)` alone.
+        ContestProfile::ArrlFieldDay | ContestProfile::Standard => (call, entry.band),
+    }
+}
+
 // =====================================================================
 // §8  Scanner + band activity
 // =====================================================================
@@ -1270,5 +1299,78 @@ mod tests {
             }
         }
         assert_eq!(SubsystemId::parse("bogus"), None);
+    }
+
+    /// Build a `LogEntry` for a worked-key test: only `call`, `mode` and `band`
+    /// matter to the key, the rest are filler.
+    fn log_entry(call: &str, mode: OverAirMode, band: Band) -> LogEntry {
+        LogEntry {
+            id: QsoId {
+                origin: StationId("station-a".into()),
+                seq: 1,
+            },
+            origin: StationId("station-a".into()),
+            radio: Some(RadioId("k1".into())),
+            call: Callsign(call.into()),
+            mode,
+            band,
+            freq: AbsHz(14_074_000),
+            time: Timestamp(1_700_000_000_000),
+            exchange_sent: "3A CO".into(),
+            exchange_rcvd: "3A WCF".into(),
+            grid: None,
+            section: None,
+        }
+    }
+
+    #[test]
+    fn worked_key_collapses_digital_modes_per_band() {
+        // The Field Day rule: every digital mode is one mode. A station worked on a
+        // band is a dupe there regardless of FT8 vs FT4 — same key.
+        let ft8 = log_entry("W1ABC", OverAirMode::Ft8, Band::B20m);
+        let ft4 = log_entry("W1ABC", OverAirMode::Ft4, Band::B20m);
+        assert_eq!(
+            worked_key(&ft8, ContestProfile::ArrlFieldDay),
+            worked_key(&ft4, ContestProfile::ArrlFieldDay),
+        );
+        // The mode never appears in the key, so it is dropped, not encoded.
+        assert_eq!(
+            worked_key(&ft8, ContestProfile::ArrlFieldDay),
+            (Callsign("W1ABC".into()), Band::B20m),
+        );
+    }
+
+    #[test]
+    fn worked_key_distinguishes_per_band() {
+        // The same call on a different band is a new contact — distinct keys.
+        let on_20 = log_entry("W1ABC", OverAirMode::Ft8, Band::B20m);
+        let on_40 = log_entry("W1ABC", OverAirMode::Ft8, Band::B40m);
+        assert_ne!(
+            worked_key(&on_20, ContestProfile::ArrlFieldDay),
+            worked_key(&on_40, ContestProfile::ArrlFieldDay),
+        );
+    }
+
+    #[test]
+    fn worked_key_normalizes_callsign_case_and_whitespace() {
+        // Canonical: the callsign is trimmed and upper-cased so two consumers can't
+        // disagree on a dupe over case alone.
+        let messy = log_entry(" w1abc ", OverAirMode::Ft8, Band::B20m);
+        let clean = log_entry("W1ABC", OverAirMode::Ft8, Band::B20m);
+        assert_eq!(
+            worked_key(&messy, ContestProfile::ArrlFieldDay),
+            worked_key(&clean, ContestProfile::ArrlFieldDay),
+        );
+    }
+
+    #[test]
+    fn worked_key_standard_profile_also_collapses_modes() {
+        // The Standard profile is all-digital today, so it keys identically.
+        let ft8 = log_entry("K2DEF", OverAirMode::Ft8, Band::B15m);
+        let ft4 = log_entry("K2DEF", OverAirMode::Ft4, Band::B15m);
+        assert_eq!(
+            worked_key(&ft8, ContestProfile::Standard),
+            worked_key(&ft4, ContestProfile::Standard),
+        );
     }
 }
