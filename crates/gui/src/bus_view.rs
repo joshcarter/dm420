@@ -137,6 +137,11 @@ pub struct BusView {
     scanner: Cell<ScannerState>,
     #[allow(dead_code)]
     clock: Cell<ClockStatus>,
+    /// Latest authoritative worked set from the `core::worked` producer
+    /// (`radio/{id}/worked`) — the single owner of "which `(call, band)` I've worked".
+    /// `worked_spots`/`worked_calls_on_band` read this instead of re-deriving the dupe
+    /// rule from the log.
+    worked: Cell<WorkedSet>,
     bands: Arc<Mutex<Vec<BandActivity>>>,
     logs: Ring<LogEntry>,
     decodes: Ring<Decode>,
@@ -187,6 +192,7 @@ impl BusView {
         let spectrum_tx = cell();
         let scanner = cell();
         let clock = cell();
+        let worked = cell();
         let qso = cell();
         let bands: Arc<Mutex<Vec<BandActivity>>> = Arc::new(Mutex::new(Vec::new()));
         let logs = Ring::new(512);
@@ -245,6 +251,12 @@ impl BusView {
         );
         pump_state(&bus, Topic::ScannerState, scanner.clone(), egui_ctx.clone());
         pump_state(&bus, Topic::ClockStatus, clock.clone(), egui_ctx.clone());
+        pump_state(
+            &bus,
+            Topic::Worked(app_core::radio_id()),
+            worked.clone(),
+            egui_ctx.clone(),
+        );
         pump_bands(&bus, bands.clone(), egui_ctx.clone());
         pump_stream(
             &bus,
@@ -275,6 +287,7 @@ impl BusView {
             spectrum_hist,
             scanner,
             clock,
+            worked,
             bands,
             logs,
             decodes,
@@ -356,47 +369,65 @@ impl BusView {
         self.logs.buf.lock().unwrap().len()
     }
 
-    /// Distinct worked stations that carry a placeable locator (a grid, or — for
-    /// Field Day contacts that carried no grid — an ARRL/RAC section), most-recent
-    /// contact per call. Feeds the Contacts map's "worked" (filled) layer.
-    pub fn worked_spots(&self) -> Vec<MapSpot> {
-        let mut seen = HashSet::new();
-        let mut out = Vec::new();
-        for e in self.logs.snapshot().into_iter().rev() {
-            // Grid is preferred; fall back to the Field Day section.
-            let loc = e
-                .grid
-                .as_ref()
-                .map(|g| Locator::Grid(g.0.clone()))
-                .or_else(|| e.section.as_ref().map(|s| Locator::Section(s.0.clone())));
-            if let Some(loc) = loc
-                && seen.insert(e.call.0.clone())
-            {
-                out.push(MapSpot {
-                    call: e.call.0.clone(),
-                    loc,
-                    last_ms: e.time.0,
-                    worked: true,
-                    band: Some(e.band),
-                    cq: false,
-                    abs: None,
-                    slot: None,
-                });
-            }
-        }
-        out
+    /// The latest authoritative worked set from the `core::worked` producer, or an
+    /// empty set if none has arrived yet (no contacts logged, or the producer hasn't
+    /// published). The single source of worked-status for the GUI; `worked_spots` and
+    /// `worked_calls_on_band` project it.
+    pub fn worked(&self) -> WorkedSet {
+        self.worked.lock().unwrap().clone().unwrap_or_default()
     }
 
-    /// Distinct callsigns already logged on `band`, upper-cased for case-folded
-    /// matching. "Worked" is **per band** (the Field Day rule): the same call on
-    /// another band is still unworked there. Feeds the waterslide's worked-station
-    /// dimming.
+    /// Worked stations that carry a placeable locator (a grid, or — for Field Day
+    /// contacts that carried no grid — an ARRL/RAC section), one per worked
+    /// `(call, band)`. Feeds the Contacts map's "worked" (filled) layer.
+    ///
+    /// *What's* worked comes from the producer's [`WorkedSet`] (keyed `(call, band)`,
+    /// the canonical dupe rule); the log only supplies *where* to plot it — the
+    /// most-recent matching contact's locator and time. Per band, so a station worked
+    /// on two bands plots on each.
+    pub fn worked_spots(&self) -> Vec<MapSpot> {
+        let worked = self.worked();
+        let logs = self.logs.snapshot();
+        worked
+            .entries
+            .iter()
+            .filter_map(|w| {
+                // Most-recent log entry for this worked (call, band) that carries a
+                // placeable locator (grid preferred, else the Field Day section).
+                logs.iter().rev().find_map(|e| {
+                    if e.band != w.band || !e.call.0.eq_ignore_ascii_case(&w.call.0) {
+                        return None;
+                    }
+                    let loc = e
+                        .grid
+                        .as_ref()
+                        .map(|g| Locator::Grid(g.0.clone()))
+                        .or_else(|| e.section.as_ref().map(|s| Locator::Section(s.0.clone())))?;
+                    Some(MapSpot {
+                        call: e.call.0.clone(),
+                        loc,
+                        last_ms: e.time.0,
+                        worked: true,
+                        band: Some(e.band),
+                        cq: false,
+                        abs: None,
+                        slot: None,
+                    })
+                })
+            })
+            .collect()
+    }
+
+    /// Callsigns worked on `band`, upper-cased for case-folded matching. "Worked" is
+    /// **per band** (the Field Day rule): the same call on another band is still
+    /// unworked there. Projects the producer's [`WorkedSet`]; feeds the waterslide's
+    /// worked-station dimming.
     pub fn worked_calls_on_band(&self, band: Band) -> HashSet<String> {
-        self.logs
-            .snapshot()
-            .into_iter()
-            .filter(|e| e.band == band)
-            .map(|e| e.call.0.to_ascii_uppercase())
+        self.worked()
+            .entries
+            .iter()
+            .filter(|w| w.band == band)
+            .map(|w| w.call.0.to_ascii_uppercase())
             .collect()
     }
 
