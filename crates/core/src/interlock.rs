@@ -97,6 +97,28 @@ impl Granter {
         }
     }
 
+    /// Revoke the active grant held by `token`, clearing it immediately. Returns
+    /// `true` if `token` was the live holder (its grant is now dropped), `false`
+    /// otherwise (a stale token, or no active grant). Mirrors [`release`](Self::release)
+    /// — validate the token, then clear the grant — but is the in-process path for an
+    /// interlock-based abort: a supervisor holding the token can tear the grant down
+    /// without a bus round-trip, so a subsequent keying PttRequest stops validating.
+    /// Currently unwired (no caller); reserved for the supervised abort/Stop path.
+    // Intentionally has no caller yet: the supervised abort wiring is a separate
+    // step. `interlock` is a private module, so the unused-but-public method would
+    // otherwise trip `dead_code`.
+    #[allow(dead_code)]
+    pub fn revoke(&self, token: t::InterlockToken) -> bool {
+        let mut s = self.state.lock().unwrap();
+        match s.held {
+            Some((held, _)) if held == token => {
+                s.held = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Whether `token` is the current, unexpired holder — checked on every keying
     /// PttRequest by the rig adapter.
     pub fn validate(&self, token: t::InterlockToken) -> bool {
@@ -179,6 +201,38 @@ mod tests {
         // Already past its TTL: does not validate, and the next acquire succeeds.
         assert!(!g.validate(a));
         assert!(matches!(g.acquire(), t::InterlockReply::Granted { .. }));
+    }
+
+    #[test]
+    fn revoke_clears_the_grant_for_the_holder() {
+        let g = Granter::new(Duration::from_secs(60));
+        let a = token(g.acquire());
+        assert!(g.validate(a));
+        // The holder revokes: grant cleared, token stops validating, and a fresh
+        // distinct token can be acquired.
+        assert!(g.revoke(a));
+        assert!(!g.validate(a));
+        let b = token(g.acquire());
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn revoke_rejects_a_stale_token_and_leaves_the_holder() {
+        let g = Granter::new(Duration::from_secs(60));
+        let a = token(g.acquire());
+        // A token that is not the live holder cannot revoke, and the real grant is
+        // untouched.
+        assert!(!g.revoke(t::InterlockToken(9999)));
+        assert!(g.validate(a));
+        // A token that was the holder but has since been released is also stale.
+        assert!(matches!(g.release(a), t::InterlockReply::Released));
+        assert!(!g.revoke(a));
+    }
+
+    #[test]
+    fn revoke_with_no_active_grant_is_false() {
+        let g = Granter::new(Duration::from_secs(60));
+        assert!(!g.revoke(t::InterlockToken(1)));
     }
 
     #[test]
