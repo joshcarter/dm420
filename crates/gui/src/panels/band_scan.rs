@@ -17,6 +17,7 @@ use types::{Band, BandActivity, OverAirMode, ScanStatus};
 
 use super::{Panel, PanelCtx};
 use crate::chrome::{key_cell, lcd_panel, measure, panel_header, split_block};
+use crate::format::mode_label;
 use crate::theme::*;
 
 /// The fixed band layout (spec: 40/20 left column, 15/10 right column).
@@ -39,15 +40,6 @@ fn band_label(b: Band) -> &'static str {
         Band::B12m => "12m",
         Band::B10m => "10m",
         Band::B6m => "6m",
-    }
-}
-
-fn mode_label(m: OverAirMode) -> &'static str {
-    match m {
-        OverAirMode::Ft8 => "FT8",
-        OverAirMode::Ft4 => "FT4",
-        OverAirMode::Psk31 => "PSK",
-        OverAirMode::Rtty => "RTTY",
     }
 }
 

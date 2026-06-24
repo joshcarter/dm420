@@ -16,6 +16,7 @@ mod app_nap;
 mod bus_view;
 mod chrome;
 mod flag;
+mod format;
 mod geo;
 mod geo_data;
 mod lane_finder;
