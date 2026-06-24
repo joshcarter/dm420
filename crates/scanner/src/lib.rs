@@ -5,7 +5,8 @@
 //! reporting per-(band, mode) heard / calling-CQ / unworked counts. This crate is
 //! the **pure state machine** only — no clock, no bus, no radio. The `core::scan`
 //! shell drives it: it feeds slot boundaries ([`Scanner::on_slot`]), decodes
-//! ([`Scanner::on_decode`]) and logged contacts ([`Scanner::on_logged`]), and acts
+//! ([`Scanner::on_decode`]) and the worked set ([`Scanner::set_worked`], mirrored
+//! from the `core::worked` producer), and acts
 //! on the [`Step`] / [`Scanner::current`] / [`Scanner::tallies`] it reports
 //! (retuning the rig, switching mode, publishing state). Keeping the logic pure
 //! makes the sweep testable without hardware (mirrors `qso::engine`).
@@ -76,9 +77,10 @@ pub struct Scanner {
     heard: HashMap<(Band, OverAirMode), HashSet<Callsign>>,
     /// Distinct CQ callers per `(band, mode)` (a subset of `heard`).
     cq: HashMap<(Band, OverAirMode), HashSet<Callsign>>,
-    /// `(call, band)` already in the logbook — fed from `logbook/entries`. Keyed per
-    /// band, not per mode: under the ARRL Field Day rule all digital modes count as
-    /// one, so a station worked on a band is a dupe there regardless of FT8/FT4.
+    /// `(call, band)` already worked — set wholesale via [`Scanner::set_worked`] from
+    /// the `core::worked` producer (the single owner). Keyed per band, not per mode:
+    /// under the ARRL Field Day rule all digital modes count as one, so a station
+    /// worked on a band is a dupe there regardless of FT8/FT4.
     worked: HashSet<(Callsign, Band)>,
 }
 
@@ -231,13 +233,6 @@ impl Scanner {
                 self.cq.entry((band, mode)).or_default().insert(call.clone());
             }
         }
-    }
-
-    /// Record a logged contact so it counts as worked on its band (drives the unworked
-    /// tally). Mode is intentionally ignored — Field Day counts all digital modes as
-    /// one. Fed from the logbook's startup replay + live `logbook/entries`.
-    pub fn on_logged(&mut self, call: Callsign, band: Band) {
-        self.worked.insert((call, band));
     }
 
     /// Replace the worked set with the authoritative snapshot from the worked-status
