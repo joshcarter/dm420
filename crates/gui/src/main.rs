@@ -25,7 +25,6 @@ mod send;
 mod settings;
 mod theme;
 mod waterslide_panel;
-mod waterslide_sim;
 
 use std::time::Duration;
 

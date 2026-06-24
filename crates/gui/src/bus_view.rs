@@ -333,12 +333,6 @@ impl BusView {
         }
     }
 
-    /// Always true now that the mock producer path is gone. Retained because some
-    /// Digital-panel branches still call it; those collapse in a later cleanup.
-    pub fn is_real(&self) -> bool {
-        true
-    }
-
     // ----------------------------------------------------------------- reads
 
     /// The current rig state (frequency, mode, PTT, meters), if seen yet.

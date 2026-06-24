@@ -19,7 +19,7 @@ use crate::panel_data as pd;
 use crate::send::{Activation, Command, SendState};
 use crate::settings::{DEFAULT_BAUD, HardwareConfig, KENWOOD_BAUDS};
 use crate::theme::*;
-use crate::waterslide_panel::{Target, WaterslidePanel, WaterslideTheme};
+use crate::waterslide_panel::Target;
 
 /// SNR like the rest of the console: Unicode minus, two digits.
 fn fmt_snr(snr: i8) -> String {
@@ -115,13 +115,13 @@ struct RealSel {
 }
 
 pub struct Waterfall {
-    slide: WaterslidePanel,
     spectro: Spectrogram,
     form: ConfigForm,
     /// Send-row text-box / slash-command state. The transmit lifecycle itself
     /// lives in the QSO engine (`QsoState`), which this row renders and commands.
     send: SendState,
-    /// Real-mode selection (offset + optional station). Mock mode reads `slide`.
+    /// Click selection (offset + optional station); the live waterslide is
+    /// draw-only, so the panel records the clicked target itself.
     real_sel: RealSel,
     /// The message latched on the air for the current over, held in the Send box
     /// until the transmission finishes — even after the engine has advanced its
@@ -172,7 +172,6 @@ pub struct Waterfall {
 impl Waterfall {
     pub fn new() -> Self {
         Self {
-            slide: WaterslidePanel::new(7200.0),
             spectro: Spectrogram::new(),
             form: ConfigForm::default(),
             send: SendState::default(),
@@ -321,23 +320,18 @@ impl Waterfall {
             }
         }
 
-        // Where we're pointed. In real mode the panel owns the click selection (the
-        // live waterslide is draw-only); in mock mode the sim does. Resolve to a TX
-        // offset, the station to work (if a decoded line was clicked), and that
-        // decode's slot (threaded into the real `DecodeRef`).
-        let (sel_off, sel_call, sel_slot, sel_resume) = if ctx.bus.is_real() {
-            match &self.real_sel.target {
-                Some((call, slot)) => (
-                    self.real_sel.offset,
-                    Some(call.clone()),
-                    *slot,
-                    self.real_sel.resume.clone(),
-                ),
-                None => (self.real_sel.offset, None, SlotId(0), None),
-            }
-        } else {
-            let t = self.slide.outgoing();
-            (t.off() as f32, t.station().map(str::to_string), SlotId(0), None)
+        // Where we're pointed. The panel owns the click selection (the live
+        // waterslide is draw-only). Resolve to a TX offset, the station to work
+        // (if a decoded line was clicked), and that decode's slot (threaded into
+        // the real `DecodeRef`).
+        let (sel_off, sel_call, sel_slot, sel_resume) = match &self.real_sel.target {
+            Some((call, slot)) => (
+                self.real_sel.offset,
+                Some(call.clone()),
+                *slot,
+                self.real_sel.resume.clone(),
+            ),
+            None => (self.real_sel.offset, None, SlotId(0), None),
         };
 
         // Keep the buffer mirroring the would-be next message as a preview (unless
@@ -774,16 +768,14 @@ impl Panel for Waterfall {
             // frozen or empty screen. The supervisor keeps reconnecting underneath.
             let audio_fault = ctx
                 .bus
-                .is_real()
-                .then(|| ctx.bus.health(SubsystemId::Audio))
-                .flatten()
+                .health(SubsystemId::Audio)
                 .filter(SubsystemHealth::is_faulted);
 
             if let Some(health) = audio_fault {
                 if body_big {
                     draw_fault_body(painter, screen, pal, &health);
                 }
-            } else if ctx.bus.is_real() {
+            } else {
                 // Real mode: no FFT/spectrum producer is wired yet (the decoder
                 // publishes `Decode`s, not `SpectrumRow`s), so we render the decodes
                 // themselves in waterslide form — placed by audio offset (vertical)
@@ -1050,18 +1042,6 @@ impl Panel for Waterfall {
                         .ctx()
                         .request_repaint_after(std::time::Duration::from_millis(33));
                 }
-            } else if body_big {
-                // Mock mode only: Live Waterslide simulation as the screen body
-                // (inset to keep brackets).
-                let body = screen.shrink(8.0);
-                let theme = WaterslideTheme::from_palette(pal);
-                let mut child = ctx.ui.new_child(
-                    egui::UiBuilder::new()
-                        .max_rect(body)
-                        .layout(egui::Layout::top_down(egui::Align::Min)),
-                );
-                child.set_clip_rect(screen.shrink(2.0));
-                self.slide.ui(&mut child, body, ctx.dt, &theme);
             }
         }
 
@@ -1074,22 +1054,17 @@ impl Panel for Waterfall {
         }
 
         // Publish the selected station so other panels (the Contacts map) can
-        // highlight it. Real mode reads the live `real_sel`; mock mode the sim's
-        // outgoing target. `None` when a bare offset or nothing is selected.
-        *ctx.selected_station = self.selected_call(ctx.bus.is_real());
+        // highlight it. Reads the live `real_sel`; `None` when a bare offset or
+        // nothing is selected.
+        *ctx.selected_station = self.selected_call();
     }
 }
 
 impl Waterfall {
     /// The callsign currently selected in the waterslide (the station to work), or
     /// `None` when the selection is a bare spectrum offset or nothing is selected.
-    /// Real mode reads `real_sel`; mock mode the simulation's outgoing target.
-    fn selected_call(&self, real: bool) -> Option<String> {
-        if real {
-            self.real_sel.target.as_ref().map(|(c, _)| c.clone())
-        } else {
-            self.slide.outgoing().station().map(str::to_owned)
-        }
+    fn selected_call(&self) -> Option<String> {
+        self.real_sel.target.as_ref().map(|(c, _)| c.clone())
     }
 
     /// The view window as fractions of the full `[0, WS_MAX_HZ]` range

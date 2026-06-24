@@ -46,6 +46,9 @@ pub struct PanelCtx<'a> {
     pub painter: &'a egui::Painter,
     pub pal: &'a Palette,
     pub relief: &'a TextureHandle,
+    /// Frame delta (seconds). No panel currently reads it; retained in the per-frame
+    /// context after the mock waterslide (its sole reader) was removed.
+    #[allow(dead_code)]
     pub dt: f64,
     pub bus: &'a BusView,
     /// The operator's station call sign (the configured identity, upper-cased).
