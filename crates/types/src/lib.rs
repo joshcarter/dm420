@@ -648,7 +648,7 @@ pub fn worked_key(entry: &LogEntry, contest: ContestProfile) -> (Callsign, Band)
     }
 }
 
-/// `radio/{id}/worked` (State) — the authoritative worked set, owned by the single
+/// `logbook/worked` (State) — the authoritative worked set, owned by the single
 /// `core::worked` producer.
 ///
 /// A latest-wins snapshot of every `(callsign, band)` that counts as worked under

@@ -250,7 +250,7 @@ pub struct QsoId { pub origin: StationId, pub seq: u64 }
 
 pub enum WorkedStatus { New, WorkedByMe, WorkedByNetwork(StationId) }
 
-// radio/{id}/worked (State, latest-wins) — the authoritative worked set, owned by the
+// logbook/worked (State, latest-wins) — the authoritative worked set, owned by the
 // single `core::worked` producer. It folds `logbook/entries` through the canonical
 // `worked_key(entry, contest) -> (Callsign, Band)` once; the band scanner, the GUI
 // Contacts map + waterslide, and the `core::scan` tally all subscribe and read it
@@ -315,7 +315,7 @@ pub enum InterlockError { Denied, Expired, NotHolder }
 | `radio/{id}/spectrum` | rig mgr / dsp | `SpectrumRow` | StreamLossy |
 | `radio/{id}/decodes` | decoder | `Decode` | StreamLossless |
 | `radio/{id}/decodes_enriched` | enrichment | `EnrichedDecode` | StreamLossless |
-| `radio/{id}/worked` | worked-status producer | `WorkedSet` | State |
+| `logbook/worked` | worked-status producer | `WorkedSet` | State |
 | `radio/{id}/rig_state` | rig mgr | `RigState` | State |
 | `radio/{id}/operating` | session svc | `OperatingState` | State |
 | `radio/{id}/command` | (UI/qso) → rig mgr | `RigCommand` | Command |

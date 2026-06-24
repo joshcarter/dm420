@@ -38,7 +38,7 @@ bus_message!(LogEntry, StreamLossless);
 bus_message!(TxLogEntry, StreamLossless);
 
 // --- State ---
-bus_message!(WorkedSet, State); // radio/{id}/worked — the authoritative worked set
+bus_message!(WorkedSet, State); // logbook/worked — the authoritative worked set
 bus_message!(RigState, State);
 bus_message!(OperatingState, State);
 bus_message!(TxReport, State);

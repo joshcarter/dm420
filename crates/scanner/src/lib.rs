@@ -236,7 +236,7 @@ impl Scanner {
     }
 
     /// Replace the worked set with the authoritative snapshot from the worked-status
-    /// producer (`radio/{id}/worked`). This is how the scanner *reads* worked-status
+    /// producer (`logbook/worked`). This is how the scanner *reads* worked-status
     /// instead of deriving it: the `core::scan` shell subscribes to the single owner
     /// and feeds the canonical `(call, band)` set here, rather than the scanner
     /// folding raw `logbook/entries` itself with its own key. Keys are normalized

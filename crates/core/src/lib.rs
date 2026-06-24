@@ -257,8 +257,6 @@ pub fn spawn(bus: &BusHandle, cfg: CoreConfig) -> CoreControl {
     // The band scanner (spawned after the decode match below) needs the radio id,
     // but that match consumes `radio` — clone it here while it's still owned.
     let scanner_radio = radio.clone();
-    // Same for the worked-status producer (spawned alongside the logbook below).
-    let worked_radio = radio.clone();
 
     // The active mode for the slot clock below: live capture follows it through
     // `AudioControl`, so capture this only as the WAV/none fallback.
@@ -301,13 +299,13 @@ pub fn spawn(bus: &BusHandle, cfg: CoreConfig) -> CoreControl {
 
     // The worked-status producer: the single owner of "which (call, band) I've
     // worked". It folds `logbook/entries` through the canonical `worked_key` and
-    // publishes the authoritative `WorkedSet` on `radio/{id}/worked`; the scanner, the
-    // GUI map/waterslide, and the `core::scan` tally all subscribe instead of
-    // re-deriving the dupe rule. Spawned whether or not a logbook is configured — with
+    // publishes the authoritative `WorkedSet` on the global `logbook/worked`; the
+    // scanner, the GUI map/waterslide, and the `core::scan` tally all subscribe instead
+    // of re-deriving the dupe rule. Spawned whether or not a logbook is configured — with
     // no entries it simply publishes nothing and consumers default to "all unworked".
     // Both shipping contest profiles collapse digital modes per band today; thread the
     // selected profile through here when contest selection lands in config.
-    worked::spawn(bus, worked_radio, types::ContestProfile::ArrlFieldDay);
+    worked::spawn(bus, types::ContestProfile::ArrlFieldDay);
 
     // LAN gossip: discover other operators on the network and exchange station
     // snapshots (shared logbook + working-intent ride this in later steps). Config

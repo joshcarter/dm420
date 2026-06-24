@@ -74,7 +74,7 @@ async fn run(bus: BusHandle, radio: t::RadioId, audio: Option<Arc<AudioControl>>
     // full `WorkedSet` here (State, latest-wins), so the scanner's unworked tally keys
     // identically to every other panel instead of re-deriving the dupe rule.
     let mut worked =
-        match bus.subscribe::<t::WorkedSet>(TopicSelector::Exact(Topic::Worked(radio.clone()))) {
+        match bus.subscribe::<t::WorkedSet>(TopicSelector::Exact(Topic::Worked)) {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!("scanner: cannot subscribe worked-status: {e:?}");

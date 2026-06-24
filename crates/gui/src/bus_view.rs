@@ -138,7 +138,7 @@ pub struct BusView {
     #[allow(dead_code)]
     clock: Cell<ClockStatus>,
     /// Latest authoritative worked set from the `core::worked` producer
-    /// (`radio/{id}/worked`) — the single owner of "which `(call, band)` I've worked".
+    /// (`logbook/worked`) — the single owner of "which `(call, band)` I've worked".
     /// `worked_spots`/`worked_calls_on_band` read this instead of re-deriving the dupe
     /// rule from the log.
     worked: Cell<WorkedSet>,
@@ -251,12 +251,7 @@ impl BusView {
         );
         pump_state(&bus, Topic::ScannerState, scanner.clone(), egui_ctx.clone());
         pump_state(&bus, Topic::ClockStatus, clock.clone(), egui_ctx.clone());
-        pump_state(
-            &bus,
-            Topic::Worked(app_core::radio_id()),
-            worked.clone(),
-            egui_ctx.clone(),
-        );
+        pump_state(&bus, Topic::Worked, worked.clone(), egui_ctx.clone());
         pump_bands(&bus, bands.clone(), egui_ctx.clone());
         pump_stream(
             &bus,

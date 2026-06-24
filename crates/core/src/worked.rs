@@ -8,8 +8,12 @@
 //! makes it a single owned fact: it subscribes to `logbook/entries` (the logbook's
 //! replayed history + live contacts), folds every entry through the canonical
 //! [`worked_key`] `(call, band)` rule, and publishes the authoritative [`WorkedSet`]
-//! on `radio/{id}/worked` (State, latest-wins). Every consumer subscribes and reads
+//! on `logbook/worked` (State, latest-wins). Every consumer subscribes and reads
 //! it; none re-derive the dupe rule.
+//!
+//! Worked-status is a station-level fact derived from the global (unscoped) logbook,
+//! so its topic is global too — `logbook/worked`, mirroring `logbook/entries` — not
+//! scoped per radio.
 //!
 //! `worked_key` collapses every digital mode per band (ARRL Field Day / this
 //! all-digital app), so a station worked on 20 m FT8 is a dupe on 20 m FT4, while the
@@ -27,20 +31,19 @@
 use std::collections::HashMap;
 
 use bus::types::{
-    Band, Callsign, ContestProfile, LogEntry, RadioId, WorkedEntry, WorkedSet, WorkedStatus,
-    worked_key,
+    Band, Callsign, ContestProfile, LogEntry, WorkedEntry, WorkedSet, WorkedStatus, worked_key,
 };
 use bus::{BusError, BusHandle, Topic, TopicSelector};
 
-/// Launch the worked-status producer onto `bus`, publishing `radio/{id}/worked`.
+/// Launch the worked-status producer onto `bus`, publishing `logbook/worked`.
 /// `contest` selects the dupe rule applied by [`worked_key`] (both shipping profiles
 /// collapse digital modes per band today). Spawns a detached tokio task, so it must
 /// be called from within a runtime context (like [`crate::spawn`]).
-pub fn spawn(bus: &BusHandle, radio: RadioId, contest: ContestProfile) {
-    tokio::spawn(run(bus.clone(), radio, contest));
+pub fn spawn(bus: &BusHandle, contest: ContestProfile) {
+    tokio::spawn(run(bus.clone(), contest));
 }
 
-async fn run(bus: BusHandle, radio: RadioId, contest: ContestProfile) {
+async fn run(bus: BusHandle, contest: ContestProfile) {
     // Subscribe to the logbook stream. It is `StreamLossless` with a generous replay
     // ring, so the logbook's startup history reaches us even if we subscribe after it
     // replayed — no ordering dependency on `logbook::spawn`.
@@ -52,7 +55,7 @@ async fn run(bus: BusHandle, radio: RadioId, contest: ContestProfile) {
         }
     };
 
-    let topic = Topic::Worked(radio);
+    let topic = Topic::Worked;
     // The canonical worked set, keyed once by `worked_key`. A `HashMap` because
     // `(Callsign, Band)` is `Hash + Eq` (not `Ord`); the published `Vec` order is
     // unspecified — consumers treat it as a set.
@@ -111,7 +114,7 @@ fn to_worked_set(worked: &HashMap<(Callsign, Band), WorkedStatus>) -> WorkedSet 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bus::types::{AbsHz, GridSquare, OverAirMode, QsoId, StationId, Timestamp};
+    use bus::types::{AbsHz, GridSquare, OverAirMode, QsoId, RadioId, StationId, Timestamp};
 
     /// A logged contact; only `call`, `mode`, and `band` matter to the worked key.
     fn log_entry(call: &str, mode: OverAirMode, band: Band) -> LogEntry {
