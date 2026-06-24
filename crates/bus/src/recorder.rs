@@ -90,6 +90,7 @@ fn publish_envelope(bus: &BusHandle, env: &Envelope) -> Result<(), BusError> {
         TopicKind::Spectrum => pub_as!(SpectrumRow),
         TopicKind::Decodes => pub_as!(Decode),
         TopicKind::DecodesEnriched => pub_as!(EnrichedDecode),
+        TopicKind::Worked => pub_as!(WorkedSet),
         TopicKind::RigState => pub_as!(RigState),
         TopicKind::Operating => pub_as!(OperatingState),
         TopicKind::TxReport => pub_as!(TxReport),

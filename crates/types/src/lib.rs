@@ -648,6 +648,45 @@ pub fn worked_key(entry: &LogEntry, contest: ContestProfile) -> (Callsign, Band)
     }
 }
 
+/// `radio/{id}/worked` (State) — the authoritative worked set, owned by the single
+/// `core::worked` producer.
+///
+/// A latest-wins snapshot of every `(callsign, band)` that counts as worked under
+/// [`worked_key`]: Field Day (and this all-digital app) collapses every digital mode
+/// per band, so a station worked on 20 m FT8 is a dupe on 20 m FT4, while the same
+/// call on another band is a new contact. The producer folds `logbook/entries`
+/// through `worked_key` *once*; every consumer — the band scanner, the GUI Contacts
+/// map + waterslide, the `core::scan` tally — subscribes and reads this instead of
+/// re-deriving the dupe rule with its own (previously divergent) key.
+///
+/// Each entry's [`WorkedStatus`] carries the origin dimension: `WorkedByMe` today
+/// (every logged contact originates locally), becoming `WorkedByNetwork(StationId)`
+/// once peer logs merge in over `logbook/entries` (networking — the multi-op
+/// substrate, not built yet). Entry order is unspecified; consumers treat it as a set.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct WorkedSet {
+    pub entries: Vec<WorkedEntry>,
+}
+
+/// One `(callsign, band)` in a [`WorkedSet`], with how it was worked. `call` is
+/// normalized exactly as [`worked_key`] returns it (trimmed + ASCII upper-cased).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct WorkedEntry {
+    pub call: Callsign,
+    pub band: Band,
+    pub status: WorkedStatus,
+}
+
+impl WorkedSet {
+    /// Whether `(call, band)` has been worked. `call` is matched case-insensitively
+    /// against the normalized keys, so a caller needn't pre-upper-case the lookup.
+    pub fn is_worked(&self, call: &Callsign, band: Band) -> bool {
+        self.entries
+            .iter()
+            .any(|e| e.band == band && e.call.0.eq_ignore_ascii_case(&call.0))
+    }
+}
+
 // =====================================================================
 // §8  Scanner + band activity
 // =====================================================================
@@ -1096,6 +1135,21 @@ mod tests {
             grid: Some(GridSquare("DN70".into())),
             worked: WorkedStatus::WorkedByNetwork(StationId("peer-1".into())),
         });
+        round_trip(WorkedSet::default());
+        round_trip(WorkedSet {
+            entries: vec![
+                WorkedEntry {
+                    call: Callsign("W1ABC".into()),
+                    band: Band::B20m,
+                    status: WorkedStatus::WorkedByMe,
+                },
+                WorkedEntry {
+                    call: Callsign("K2DEF".into()),
+                    band: Band::B40m,
+                    status: WorkedStatus::WorkedByNetwork(StationId("peer-1".into())),
+                },
+            ],
+        });
     }
 
     #[test]
@@ -1372,5 +1426,24 @@ mod tests {
             worked_key(&ft8, ContestProfile::Standard),
             worked_key(&ft4, ContestProfile::Standard),
         );
+    }
+
+    #[test]
+    fn worked_set_is_worked_matches_per_band_case_insensitively() {
+        // The published snapshot consumers read: W1ABC worked on 20 m only.
+        let set = WorkedSet {
+            entries: vec![WorkedEntry {
+                call: Callsign("W1ABC".into()),
+                band: Band::B20m,
+                status: WorkedStatus::WorkedByMe,
+            }],
+        };
+        // Worked on 20 m, regardless of the lookup's case (keys are normalized).
+        assert!(set.is_worked(&Callsign("W1ABC".into()), Band::B20m));
+        assert!(set.is_worked(&Callsign("w1abc".into()), Band::B20m));
+        // Worked-ness is per band: the same call on 40 m is still unworked.
+        assert!(!set.is_worked(&Callsign("W1ABC".into()), Band::B40m));
+        // A different call is unworked.
+        assert!(!set.is_worked(&Callsign("K2DEF".into()), Band::B20m));
     }
 }
