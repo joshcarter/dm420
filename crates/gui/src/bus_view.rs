@@ -128,9 +128,16 @@ pub struct BusView {
     /// panel shows it in place of the RX waterfall during an over.
     spectrum_tx: Cell<SpectrumRow>,
     /// Rolling window of recent RX spectrum rows, feeding the clear-lane finder
-    /// (`lane_finder`). Short-term and in-memory by design — distinct from any
-    /// long-term decode archive (`JOELS_ROADMAP.md` Now-#10).
+    /// (`lane_finder`) and the waterslide spectrogram (which rebuilds its texture
+    /// from this window by timestamp each frame). Short-term and in-memory by
+    /// design — distinct from any long-term decode archive (`JOELS_ROADMAP.md`
+    /// Now-#10).
     spectrum_hist: Ring<SpectrumRow>,
+    /// Rolling window of recent own-TX columns — the TX-side twin of
+    /// `spectrum_hist`. Lets the spectrogram place each over's columns by their
+    /// `SpectrumRow.t` while keyed (they were latest-only before, so a TX over
+    /// couldn't be reconstructed from timestamps). Same size as the RX window.
+    spectrum_tx_hist: Ring<SpectrumRow>,
     // `scanner`/`clock` are pumped and exposed now; their panel consumers (idle
     // scan status, slot clock in the top bar) land in the next wiring pass.
     #[allow(dead_code)]
@@ -197,6 +204,7 @@ impl BusView {
         // a wide monitor + crowded band never drops still-visible decodes. ~1 MB.
         let decodes = Ring::new(DECODE_RING_CAP);
         let spectrum_hist = Ring::new(SPECTRUM_HIST_CAP);
+        let spectrum_tx_hist = Ring::new(SPECTRUM_HIST_CAP);
         let heard: Arc<Mutex<HashMap<String, HeardEntry>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let health: Arc<Mutex<HashMap<SubsystemId, SubsystemHealth>>> =
@@ -241,6 +249,7 @@ impl BusView {
             spectrum.clone(),
             spectrum_tx.clone(),
             spectrum_hist.clone(),
+            spectrum_tx_hist.clone(),
             egui_ctx.clone(),
         );
         pump_state(&bus, Topic::ScannerState, scanner.clone(), egui_ctx.clone());
@@ -273,6 +282,7 @@ impl BusView {
             spectrum,
             spectrum_tx,
             spectrum_hist,
+            spectrum_tx_hist,
             scanner,
             clock,
             bands,
@@ -314,10 +324,17 @@ impl BusView {
         self.spectrum_tx.lock().unwrap().clone()
     }
 
-    /// Recent RX spectrum rows (oldest→newest) for the clear-lane finder. A bounded,
-    /// in-memory window — see [`SPECTRUM_HIST_CAP`].
+    /// Recent RX spectrum rows (oldest→newest) for the clear-lane finder and the
+    /// spectrogram rebuild. A bounded, in-memory window — see [`SPECTRUM_HIST_CAP`].
     pub fn recent_spectrum(&self) -> Vec<SpectrumRow> {
         self.spectrum_hist.snapshot()
+    }
+
+    /// Recent own-TX columns (oldest→newest) — the spectrogram places each over's
+    /// columns by their timestamp, mirroring [`Self::recent_spectrum`]. Empty until
+    /// the first over; holds the last [`SPECTRUM_HIST_CAP`] TX columns.
+    pub fn recent_tx_spectrum(&self) -> Vec<SpectrumRow> {
+        self.spectrum_tx_hist.snapshot()
     }
 
     /// Enable/disable auto-QSY (the AUTO QSY toggle): after 3 unanswered CQs the
@@ -785,6 +802,7 @@ fn pump_spectrum(
     rx: Cell<SpectrumRow>,
     tx: Cell<SpectrumRow>,
     hist: Ring<SpectrumRow>,
+    tx_hist: Ring<SpectrumRow>,
     ctx: egui::Context,
 ) {
     let mut sub = match bus.subscribe::<SpectrumRow>(TopicSelector::Exact(topic)) {
@@ -799,12 +817,17 @@ fn pump_spectrum(
             match sub.recv().await {
                 Ok(v) => {
                     match v.source {
-                        // RX columns also feed the lane finder's recency window.
+                        // RX columns also feed the lane finder + spectrogram window.
                         SignalSource::Received => {
                             hist.push(v.clone());
                             *rx.lock().unwrap() = Some(v);
                         }
-                        SignalSource::OwnTx => *tx.lock().unwrap() = Some(v),
+                        // TX columns ring too, so the spectrogram can place an over's
+                        // columns by their timestamp (not just the latest one).
+                        SignalSource::OwnTx => {
+                            tx_hist.push(v.clone());
+                            *tx.lock().unwrap() = Some(v);
+                        }
                     }
                     ctx.request_repaint();
                 }

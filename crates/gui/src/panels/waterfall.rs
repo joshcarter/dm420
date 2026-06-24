@@ -847,25 +847,28 @@ impl Panel for Waterfall {
                     } else {
                         crate::waterslide_panel::martian_cmap_light()
                     };
-                    // While keyed, show our own-TX waterfall (the outgoing signal at
-                    // its true offset) in place of the RX one, which is meaningless
-                    // during an over. A fresh own-TX column means we're transmitting;
-                    // otherwise fall back to the RX waterfall. Both share the buffer,
-                    // so the timeline reads RX … my over … RX as it scrolls.
-                    let tx_col = ctx.bus.tx_spectrum().filter(|r| now_ms - r.t.0 < 500);
-                    let column = tx_col.or_else(|| ctx.bus.spectrum());
-                    // Scroll speed: set so one decode line clears as the next slot's
-                    // lands. Both halves share this time span (the decode side sizes
-                    // it — see `ws_history_secs`); at 1:1 the pixels-per-second match,
-                    // at 2:1 they differ. FT4's shorter slots scroll faster.
+                    // Time window both halves span (the decode side sizes it — see
+                    // `ws_history_secs`); at the 1:1 split the pixels-per-second match
+                    // the decode text, at 2:1 they differ. FT4's shorter slots scroll
+                    // faster.
                     let protocol = ctx.bus.current_config().protocol;
                     let ws_secs = ws_history_secs(painter, body, protocol, now_frac);
+                    // The spectrogram is rebuilt from the row history by timestamp,
+                    // off the same `now_ms`/`ws_secs` clock the decode text uses, so
+                    // the two axes share one time→pixel mapping. The own-TX columns
+                    // overpaint the RX ones over the span of an over (the outgoing
+                    // signal at its true offset, in place of the meaningless RX
+                    // capture), so the timeline still reads RX … my over … RX as it
+                    // scrolls.
+                    let rx_rows = ctx.bus.recent_spectrum();
+                    let tx_rows = ctx.bus.recent_tx_spectrum();
                     self.spectro.update_and_paint(
                         ctx.ui,
                         right,
-                        ctx.dt,
+                        now_ms,
                         ws_secs,
-                        column.as_ref(),
+                        &rx_rows,
+                        &tx_rows,
                         &cmap,
                         lo_frac,
                         hi_frac,
@@ -1230,7 +1233,6 @@ struct Spectrogram {
     intensity: Vec<u8>,
     image: ColorImage,
     tex: Option<TextureHandle>,
-    dx_frac: f64,
 }
 
 impl Spectrogram {
@@ -1241,7 +1243,6 @@ impl Spectrogram {
             intensity: Vec::new(),
             image: ColorImage::new([1, 1], vec![Color32::BLACK]),
             tex: None,
-            dx_frac: 0.0,
         }
     }
 
@@ -1266,16 +1267,76 @@ impl Spectrogram {
         }
     }
 
-    /// Advance the scroll by `dt`, fill the newly-exposed columns with `latest`,
-    /// recolour through `cmap`, and blit into `rect` (the right half).
+    /// Paint `rows` (oldest→newest) into the intensity buffer, each column placed by
+    /// its wall-clock timestamp: a row of age `a` seconds lands at texture column
+    /// `a · cols_per_sec` (col 0 = the NOW line, older columns to the right). We walk
+    /// newest→oldest doing sample-and-hold — each row owns the columns from its own
+    /// timestamp back to the next-newer row — so a row cadence faster than the column
+    /// cadence never leaves gaps, and the newest of several rows landing on one column
+    /// wins. `age · cols_per_sec` is monotonic in age, so the spans never overlap.
+    ///
+    /// With `fill_to_now` the newest row also fills the columns ahead of it up to the
+    /// NOW line — what the RX side wants, since live capture always reaches NOW. The
+    /// TX side passes `false`: an over's columns must stop at the over's leading edge,
+    /// leaving the post-over RX visible in front rather than smearing TX up to NOW.
+    fn fill_from_rows(
+        &mut self,
+        rows: &[SpectrumRow],
+        now_ms: i64,
+        cols_per_sec: f64,
+        fill_to_now: bool,
+    ) {
+        // Column index of the previous (newer) row already painted, so this row fills
+        // only the gap behind it.
+        let mut newer_col: Option<usize> = None;
+        for row in rows.iter().rev() {
+            let age = (now_ms - row.t.0) as f64 / 1000.0;
+            if age < 0.0 {
+                continue; // a clock skew put it in the (off-screen) future — skip
+            }
+            let col = (age * cols_per_sec).round() as usize;
+            if col >= self.w {
+                break; // older than the buffer spans; every remaining row is older still
+            }
+            let lo = match newer_col {
+                Some(p) => p + 1,
+                None if fill_to_now => 0, // RX: newest column reaches the NOW line
+                None => col,              // TX: newest column stops at the over's edge
+            };
+            if lo > col {
+                continue; // a newer row already owns this column
+            }
+            for c in lo..=col {
+                self.write_col(c, &row.mags);
+            }
+            newer_col = Some(col);
+        }
+    }
+
+    /// Rebuild the whole texture from the row history each frame, placing every
+    /// column by its `SpectrumRow.t` wall-clock timestamp, then recolour through
+    /// `cmap` and blit into `rect` (the right half).
+    ///
+    /// This shares one time→pixel mapping with the decode text: a column of age
+    /// `a` (= `(now_ms − row.t)/1000`) lands at texture column `a · w/history_secs`,
+    /// which the blit maps to screen `now_x + a · pps_right` — the same `now_ms` and
+    /// `history_secs` the text uses for `now_x − a · pps`. There is no accumulated
+    /// per-frame `dt` any more, so the two axes cannot drift (and a long-`dt`
+    /// catch-up frame after the window was occluded reconstructs correctly).
     #[allow(clippy::too_many_arguments)]
     fn update_and_paint(
         &mut self,
         ui: &egui::Ui,
         rect: Rect,
-        dt: f64,
+        // Wall-clock NOW (ms since epoch) and the time span the side covers (s) —
+        // the same pair `draw_waterslide` places the decode text against.
+        now_ms: i64,
         history_secs: f32,
-        latest: Option<&SpectrumRow>,
+        // Recent RX columns and own-TX columns, each oldest→newest. Both are placed
+        // by their timestamp; the TX columns overpaint the RX ones over the span of
+        // an over (the RX capture is meaningless while we transmit).
+        rx_rows: &[SpectrumRow],
+        tx_rows: &[SpectrumRow],
         cmap: &[Color32; 256],
         // Frequency-view window as fractions of the full band: `lo_frac`/`hi_frac`
         // are `view_lo`/`view_hi ÷ WS_MAX_HZ`. The texture is cropped vertically to
@@ -1283,35 +1344,22 @@ impl Spectrogram {
         lo_frac: f32,
         hi_frac: f32,
     ) {
-        if let Some(row) = latest {
+        // Size the texture from the most recent column's bin count (RX or, failing
+        // that, TX). With neither there's nothing to draw this frame.
+        if let Some(row) = rx_rows.last().or_else(|| tx_rows.last()) {
             self.ensure_size(row.mags.len().clamp(1, SPECTRO_MAX_H));
         }
         if self.w == 0 || self.h == 0 {
             return;
         }
 
-        // Scroll right by whole columns; carry the fraction across frames.
-        self.dx_frac += dt * (self.w as f64 / history_secs as f64);
-        let mut dx = self.dx_frac.floor() as usize;
-        if dx > 0 {
-            self.dx_frac -= dx as f64;
-            dx = dx.min(self.w);
-            for r in 0..self.h {
-                let base = r * self.w;
-                self.intensity
-                    .copy_within(base..base + (self.w - dx), base + dx);
-            }
-            for c in 0..dx {
-                match latest {
-                    Some(row) => self.write_col(c, &row.mags),
-                    None => {
-                        for r in 0..self.h {
-                            self.intensity[r * self.w + c] = 0;
-                        }
-                    }
-                }
-            }
-        }
+        // Repaint every column from scratch, by timestamp. RX fills the whole
+        // window up to the NOW line; the TX over (if any) overpaints only its own
+        // time span on top.
+        self.intensity.iter_mut().for_each(|v| *v = 0);
+        let cols_per_sec = self.w as f64 / history_secs.max(0.001) as f64;
+        self.fill_from_rows(rx_rows, now_ms, cols_per_sec, true);
+        self.fill_from_rows(tx_rows, now_ms, cols_per_sec, false);
 
         for (px, &v) in self.image.pixels.iter_mut().zip(self.intensity.iter()) {
             *px = cmap[v as usize];
