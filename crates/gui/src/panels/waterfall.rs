@@ -25,11 +25,11 @@ use crate::waterslide_panel::Target;
 /// The real-mode click selection tracked by the panel. The live waterslide is
 /// draw-only (the mock sim's `ui()` owns selection in mock mode), so in real mode
 /// the panel records the clicked target itself.
-#[derive(Clone)]
+///
+/// The TX **offset is no longer here** — the QSO engine is its sole owner (read via
+/// `QsoState.tx_offset`); the panel only records *who* is selected.
+#[derive(Clone, Default)]
 struct RealSel {
-    /// Outgoing TX audio offset (Hz, absolute 0..3000) — where the next CQ/answer
-    /// transmits. Kept distinct from the dial/centre frequency.
-    offset: f32,
     /// The station to work (its base call + the slot its decode landed in, for the
     /// real `DecodeRef`) when a decoded line was clicked rather than bare spectrum.
     target: Option<(String, SlotId)>,
@@ -37,6 +37,14 @@ struct RealSel {
     /// the parsed message + its SNR, so SEND picks the contact up mid-stream
     /// ([`BusView::resume_qso`]) instead of arming and waiting for a CQ.
     resume: Option<(ParsedMessage, i8)>,
+}
+
+/// A resolved waterslide click: the audio offset under the cursor (sent to the
+/// engine via `set_tx_offset`, which ignores it while locked) plus the selection it
+/// lands on (a decoded station, or a bare offset with no target).
+struct WsClick {
+    offset: f32,
+    sel: RealSel,
 }
 
 pub struct Waterfall {
@@ -74,11 +82,6 @@ pub struct Waterfall {
     /// `true` widens the decode side to 2/3 (`WS_DECODE_WIDE_FRAC`). Loaded from
     /// the config file at startup, toggled live from the unlocked EDIT surface.
     wide_decode: bool,
-    /// When true, the TX audio offset is locked: clicks on the waterslide, auto-QSY
-    /// hops, and the `q`/`/clear` shortcut cannot move it. Toggled with Tab or the
-    /// padlock button on the TX band. (egui 0.34 drops NamedKey::CapsLock; Tab is
-    /// used instead.)
-    offset_locked: bool,
     /// Frequency-axis view window (Hz): the lowest visible audio offset and the
     /// span shown top-to-bottom. The decode side and the spectrogram share it.
     /// Default is the full `[0, WS_MAX_HZ]`; scroll-wheel zooms (to the cursor),
@@ -100,18 +103,13 @@ impl Waterfall {
             spectro: Spectrogram::new(),
             form: ConfigForm::default(),
             send: SendState::default(),
-            real_sel: RealSel {
-                offset: 1500.0,
-                target: None,
-                resume: None,
-            },
+            real_sel: RealSel::default(),
             tx_hold: None,
             cq_assignments: HashMap::new(),
             last_assigned_slot_ms: 0,
             cq_shortcuts: vec![None; 10],
             last_next_tx: None,
             wide_decode: crate::settings::read_waterslide_wide(),
-            offset_locked: false,
             view_lo_hz: 0.0,
             view_span_hz: WS_MAX_HZ,
             auto_hop: false,
@@ -156,6 +154,10 @@ impl Waterfall {
         // `now_ms` is hoisted here (rather than after the QSO block below) so the
         // Tab and Q key handlers can pass it to `best_cq_offset` synchronously.
         let now_ms = chrono::Utc::now().timestamp_millis();
+        // The QSO engine owns the TX offset + its lock; the panel reads them, never a
+        // local copy. The Tab/Q/digit handlers and the selection below act on these.
+        let locked = ctx.bus.offset_locked();
+        let tx_off = ctx.bus.tx_offset().unwrap_or(1500.0);
 
         let mut activate = false;
         if ctx.active {
@@ -165,28 +167,29 @@ impl Waterfall {
             let mut digit_consumed = false;
             let mut tab_consumed = false;
             for ev in &events {
-                // Tab — toggle the TX offset lock.
+                // Tab — toggle the TX offset lock (the engine owns the lock).
                 // Guard: no modifiers, NOT mid-command, not armed (shortcuts_active).
                 if let egui::Event::Key { key: egui::Key::Tab, pressed: true, modifiers, .. } = ev
                     && !modifiers.any()
                     && !self.send.entering
                     && shortcuts_active
                 {
-                    self.offset_locked = !self.offset_locked;
+                    ctx.bus.set_offset_lock(!locked);
                     tab_consumed = true;
                     digit_consumed = true;
                     continue;
                 }
-                // Q — Clear QSY: jump offset to the clearest available lane.
-                // Guard: no modifiers, NOT mid-command, not armed, offset not locked.
+                // Q — Clear QSY: jump offset to the clearest available lane. No lock
+                // guard — the engine ignores the move while locked. Guard: no
+                // modifiers, NOT mid-command, not armed.
                 if let egui::Event::Key { key: egui::Key::Q, pressed: true, modifiers, .. } = ev
                     && !modifiers.any()
                     && !self.send.entering
                     && shortcuts_active
-                    && !self.offset_locked
                 {
                     if let Some(off) = Self::best_cq_offset(ctx, now_ms) {
-                        self.real_sel = RealSel { offset: off, target: None, resume: None };
+                        ctx.bus.set_tx_offset(off);
+                        self.real_sel = RealSel::default();
                     }
                     digit_consumed = true;
                     continue;
@@ -202,12 +205,11 @@ impl Waterfall {
                     if let Some(d) = self.cq_shortcuts[idx].clone()
                         && let Some((call, slot)) = decode_station(&d)
                     {
-                        // When the offset is locked, keep our TX frequency and arm
-                        // there; the station's offset only matters for who we target.
-                        let arm_off =
-                            if self.offset_locked { self.real_sel.offset } else { d.offset.0 };
+                        // When the offset is locked, keep our (engine-owned) TX
+                        // frequency and arm there; unlocked, snap to the station's own
+                        // offset. The station's offset only matters for who we target.
+                        let arm_off = if locked { tx_off } else { d.offset.0 };
                         self.real_sel = RealSel {
-                            offset: arm_off,
                             target: Some((call.clone(), slot)),
                             resume: None,
                         };
@@ -251,12 +253,12 @@ impl Waterfall {
         // the real `DecodeRef`).
         let (sel_off, sel_call, sel_slot, sel_resume) = match &self.real_sel.target {
             Some((call, slot)) => (
-                self.real_sel.offset,
+                tx_off,
                 Some(call.clone()),
                 *slot,
                 self.real_sel.resume.clone(),
             ),
-            None => (self.real_sel.offset, None, SlotId(0), None),
+            None => (tx_off, None, SlotId(0), None),
         };
 
         // Keep the buffer mirroring the would-be next message as a preview (unless
@@ -435,10 +437,10 @@ impl Waterfall {
             }
         }
 
-        // While auto-QSY is on and the offset is unlocked, keep the engine's hop
-        // target fresh: feed it the current best CQ lane once per clock slot (after
-        // that slot's decodes settle), not every frame.
-        if self.auto_hop && !self.offset_locked {
+        // While auto-QSY is on, keep the engine's hop target fresh: feed it the
+        // current best CQ lane once per clock slot (after that slot's decodes settle),
+        // not every frame. No lock guard — the engine won't hop while locked.
+        if self.auto_hop {
             let slot = ctx.bus.clock().map(|c| c.slot);
             if slot != self.last_hop_feed_slot {
                 self.last_hop_feed_slot = slot;
@@ -456,11 +458,11 @@ impl Waterfall {
     fn apply_command(&mut self, ctx: &PanelCtx, cmd: Command) {
         match cmd {
             Command::ClearQsy => {
-                if !self.offset_locked {
-                    let now_ms = chrono::Utc::now().timestamp_millis();
-                    if let Some(off) = Self::best_cq_offset(ctx, now_ms) {
-                        self.real_sel = RealSel { offset: off, target: None, resume: None };
-                    }
+                // No lock guard — the engine ignores the offset move while locked.
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                if let Some(off) = Self::best_cq_offset(ctx, now_ms) {
+                    ctx.bus.set_tx_offset(off);
+                    self.real_sel = RealSel::default();
                 }
             }
             cmd => {
@@ -496,8 +498,8 @@ impl Panel for Waterfall {
         // we only adopt the display selection here (no re-arm — Enter still arms).
         if let Some(pick) = ctx.map_pick.take() {
             self.real_sel.target = Some((pick.call, pick.slot));
-            if let Some(off) = pick.offset && !self.offset_locked {
-                self.real_sel.offset = off;
+            if let Some(off) = pick.offset {
+                ctx.bus.set_tx_offset(off); // engine ignores the move while locked
             }
         }
 
@@ -514,6 +516,10 @@ impl Panel for Waterfall {
         let op_armed = !matches!(op_phase, QsoPhase::Idle);
         let now_ms = chrono::Utc::now().timestamp_millis();
         let op_transmitting = ctx.bus.tx_spectrum().is_some_and(|r| now_ms - r.t.0 < 500);
+        // Engine-owned TX offset + lock — the single source of truth for the TX lane,
+        // the CLEAR QSY enable, and the LOCKED button.
+        let locked = ctx.bus.offset_locked();
+        let tx_off = ctx.bus.tx_offset().unwrap_or(1500.0);
 
         let header = Rect::from_min_max(
             block.min,
@@ -569,13 +575,17 @@ impl Panel for Waterfall {
             pal,
             clear_cell,
             "CLEAR QSY",
-            !self.offset_locked,
+            !locked,
             pal.accent,
             ctx.ui.id().with("header_clear_qsy"),
         );
-        if clear_resp.clicked() && !self.offset_locked && !op_armed
+        // No lock click-guard — the engine ignores the move while locked; the button
+        // is just dimmed (above) so the operator sees it's frozen. `!op_armed` stays
+        // (don't QSY mid-contact).
+        if clear_resp.clicked() && !op_armed
             && let Some(off) = Self::best_cq_offset(ctx, now_ms) {
-                self.real_sel = RealSel { offset: off, target: None, resume: None };
+                ctx.bus.set_tx_offset(off);
+                self.real_sel = RealSel::default();
             }
         // When the mode actually changes, also retune to the calling frequency for
         // the new mode on the current band (FT8 and FT4 use different dial freqs).
@@ -781,17 +791,6 @@ impl Panel for Waterfall {
                         self.real_sel.resume = None;
                     }
 
-                    // Keep real_sel.offset in sync with the engine's actual TX offset
-                    // when unlocked, so auto-QSY hops are reflected in the cursor.
-                    // When locked, real_sel.offset is authoritative — the engine is
-                    // never allowed to move it.
-                    if !self.offset_locked
-                        && let Some(engine_off) =
-                            ctx.bus.qso_state().and_then(|q| q.tx_offset)
-                        {
-                            self.real_sel.offset = engine_off.0;
-                        }
-
                     // Click-to-select on the live waterslide (mock mode selects via
                     // the sim's own `ui()`; the real waterslide is draw-only). We
                     // hit-test via the body interaction above and let `draw_waterslide`
@@ -836,10 +835,9 @@ impl Panel for Waterfall {
                         .and_then(|hz| Band::from_hz(AbsHz(hz)))
                         .map(|b| ctx.bus.worked_calls_on_band(b))
                         .unwrap_or_default();
-                    // real_sel.offset is the single source of truth for the TX lane.
-                    // The engine's tx_offset is synced back into it above (when
-                    // unlocked), so auto-QSY hops are reflected without switching sources.
-                    let tx_off = self.real_sel.offset;
+                    // The engine-owned `tx_off` (read at the top of `ui`) is the single
+                    // source of truth for the TX lane — auto-QSY hops are reflected for
+                    // free, since the lane reads the engine directly.
 
                     // Slot-locked CQ shortcuts. Assignments are updated once per
                     // slot boundary (drop aged/worked, fill freed slots with new
@@ -886,7 +884,7 @@ impl Panel for Waterfall {
                         slots
                     };
 
-                    if let Some(mut sel) = draw_waterslide(
+                    if let Some(click) = draw_waterslide(
                         painter,
                         body,
                         pal,
@@ -905,22 +903,22 @@ impl Panel for Waterfall {
                         op_accent,
                         op_armed,
                         op_transmitting,
-                        self.offset_locked,
+                        locked,
                         now_frac,
                         self.view_lo_hz,
                         self.view_span_hz,
                     ) {
-                        // When the offset is locked, allow station selection/QSO
-                        // initiation to proceed normally — only protect the TX Hz.
-                        if self.offset_locked {
-                            sel.offset = self.real_sel.offset;
-                        }
-                        self.real_sel = sel;
+                        // Send the clicked offset to the engine (the sole owner — it
+                        // ignores the move while locked, so a locked click still selects
+                        // a station without moving the TX frequency). The panel only
+                        // records who's selected.
+                        ctx.bus.set_tx_offset(click.offset);
+                        self.real_sel = click.sel;
                     }
 
                     // When locked, show a "LOCKED" key button at the right edge of
                     // the TX band. Clicking it unlocks. Nothing is shown when unlocked.
-                    if self.offset_locked
+                    if locked
                         && tx_off < self.view_lo_hz + self.view_span_hz
                         && tx_off + bandwidth_hz > self.view_lo_hz
                     {
@@ -958,7 +956,7 @@ impl Panel for Waterfall {
                             ctx.ui.id().with("offset_lock_btn"),
                         );
                         if locked_btn.clicked() {
-                            self.offset_locked = false;
+                            ctx.bus.set_offset_lock(false);
                         }
                     }
 
@@ -1515,7 +1513,7 @@ fn draw_waterslide(
     // the window are culled; the click→offset inverse reads against it too.
     view_lo: f32,
     view_span: f32,
-) -> Option<RealSel> {
+) -> Option<WsClick> {
     let painter = painter.with_clip_rect(rect);
     let now_x = rect.left() + rect.width() * now_frac; // the NOW line
     let left_w = (now_x - rect.left()).max(1.0);
@@ -1525,7 +1523,7 @@ fn draw_waterslide(
     // mirror so the rules still land on the spectrogram's slot columns.
     let right_w = (rect.right() - now_x).max(1.0);
     let pps_right = right_w / history_secs;
-    let mut hit: Option<RealSel> = None;
+    let mut hit: Option<WsClick> = None;
 
     // Audio offset → vertical position (low Hz at bottom, high Hz at top), mapped
     // through the current frequency-view window. Unclamped: callers that need edge
@@ -1729,10 +1727,12 @@ fn draw_waterslide(
             && msg_rect.expand(4.0).contains(cp)
             && let Some((call, slot)) = &station
         {
-            hit = Some(RealSel {
+            hit = Some(WsClick {
                 offset: d.offset.0,
-                target: Some((call.clone(), *slot)),
-                resume: resume_intent(d, my_call),
+                sel: RealSel {
+                    target: Some((call.clone(), *slot)),
+                    resume: resume_intent(d, my_call),
+                },
             });
         }
         // Signal report: right-aligned, half a space to the left of the slot rule.
@@ -1940,10 +1940,9 @@ fn draw_waterslide(
             let off = (view_lo + (rect.bottom() - cp.y) / rect.height() * view_span
                 - bandwidth_hz / 2.0)
                 .clamp(0.0, WS_MAX_HZ);
-            RealSel {
+            WsClick {
                 offset: off,
-                target: None,
-                resume: None,
+                sel: RealSel::default(),
             }
         }));
     }

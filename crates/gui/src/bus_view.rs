@@ -547,7 +547,6 @@ impl BusView {
     /// The engine-owned TX audio offset (Hz). The engine owns the offset, so this is
     /// the single source of truth for the TX lane / send preview. `None` only before
     /// the engine's first publish (the engine always reports `Some` once running).
-    #[allow(dead_code)] // wired into the panel in step 4
     pub fn tx_offset(&self) -> Option<f32> {
         self.qso
             .lock()
@@ -559,7 +558,6 @@ impl BusView {
 
     /// Whether the engine has the TX offset locked (the LOCKED state). Defaults to
     /// unlocked before the engine's first publish.
-    #[allow(dead_code)] // wired into the panel in step 4
     pub fn offset_locked(&self) -> bool {
         self.qso
             .lock()
@@ -627,14 +625,12 @@ impl BusView {
     /// `/clear` / map-pick gesture). Sent unconditionally — the engine ignores it
     /// while the offset is locked, so the lock is enforced in one place (the engine),
     /// not duplicated here.
-    #[allow(dead_code)] // wired into the panel's offset writers in step 4
     pub fn set_tx_offset(&self, hz: f32) {
         self.send_qso_command(QsoCommand::SetTxOffset(OffsetHz(hz)));
     }
 
     /// Freeze / unfreeze the TX offset (Tab key / LOCKED button). While locked the
     /// engine moves the offset for nobody — operator writes or its own auto-QSY.
-    #[allow(dead_code)] // wired into the panel's lock control in step 4
     pub fn set_offset_lock(&self, locked: bool) {
         self.send_qso_command(QsoCommand::SetOffsetLock(locked));
     }
