@@ -333,7 +333,7 @@ fn apply(
         }
         // Key-up requires a live interlock grant for this token (the granter is the
         // authority `allow_transmit` unlocks). Key-down is always allowed — never
-        // block releasing TX. The actor's gate + 10 s watchdog still apply beneath.
+        // block releasing TX. The actor's gate + 15 s watchdog still apply beneath.
         t::RigCommand::PttRequest { on, token } => {
             if *on && !granter.validate(*token) {
                 tracing::warn!(?token, "rig: PTT key-up denied (no live interlock grant)");

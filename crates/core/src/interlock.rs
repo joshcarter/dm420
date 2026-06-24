@@ -14,7 +14,7 @@ use bus::types as t;
 use bus::{BusHandle, Topic};
 
 /// How long a grant stays valid. Covers a full FT8 slot (~15 s) plus margin; the
-/// rig's own 10 s PTT watchdog is the finer-grained stuck-key guard.
+/// rig's own 15 s PTT watchdog is the finer-grained stuck-key guard.
 const GRANT_TTL: Duration = Duration::from_secs(20);
 
 struct State {
