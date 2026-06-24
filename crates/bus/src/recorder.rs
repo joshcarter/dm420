@@ -109,7 +109,6 @@ fn publish_envelope(bus: &BusHandle, env: &Envelope) -> Result<(), BusError> {
         | TopicKind::AudioTx
         | TopicKind::Interlock
         | TopicKind::QsoCommand
-        | TopicKind::LogbookQuery
         | TopicKind::ScannerCommand
         | TopicKind::StationSnapshot => Ok(()),
     }
