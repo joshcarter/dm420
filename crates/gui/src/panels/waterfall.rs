@@ -1221,14 +1221,13 @@ fn signal_bandwidth_hz(protocol: Protocol) -> f32 {
 const SPECTRO_COLS: usize = 512;
 const SPECTRO_MAX_H: usize = 512;
 
-/// How long (seconds) a single spectrum column may be sample-and-held *forward* of
-/// its own timestamp in `fill_from_rows`. A column is a ~50 ms FFT; ~1 s comfortably
-/// bridges the normal inter-row cadence plus dropped-frame jitter, yet stays far below
-/// the multi-second no-TX gap *between* own-TX overs (≥ ~7.5 s FT4 / ~15 s FT8, since a
-/// QSO always has the other station's whole slot between my overs). Bounding the hold to
-/// this horizon stops a stale over's last column being smeared across the other station's
-/// response slot (which used to blank his RX on the spectrogram).
-const SPECTRO_MAX_HOLD_SECS: f64 = 1.0;
+/// The spectrum-column cadence: the decoder emits one FFT column about every 50 ms
+/// (matches `core::decode`'s `SPECTRUM_HOP_S`). A column's legitimate on-screen
+/// footprint is one row period — holding it forward longer just smears one frame
+/// across many columns. `fill_from_rows` caps every forward hold at this footprint
+/// (plus a rounding column), so a row bridges the ~50 ms gap to its neighbour but an
+/// own-TX over's tail can't bleed past its own width into the following RX.
+const SPECTRO_ROW_PERIOD_SECS: f64 = 0.05;
 
 /// A scrolling spectrogram texture for the right side. Newest column sits at the
 /// NOW line; older columns flow right, brightness = signal intensity. It always
@@ -1289,12 +1288,17 @@ impl Spectrogram {
     /// TX side passes `false`: an over's columns must stop at the over's leading edge,
     /// leaving the post-over RX visible in front rather than smearing TX up to NOW.
     ///
-    /// The forward hold is capped at `SPECTRO_MAX_HOLD_SECS`: a row never paints more
-    /// than `max_hold_cols` columns ahead of its own timestamp. Without that cap, a
-    /// bursty source (own-TX, which leaves a multi-second gap between overs) would hold
-    /// one over's last column forward across the entire inter-over interval — overpainting
-    /// the other station's response. The cap is well above the within-over row cadence and
-    /// well below the inter-over gap, so it expires stale columns without leaving holes.
+    /// Every forward hold is bounded to one column's footprint (`max_hold_cols` ≈ one
+    /// row period, `SPECTRO_ROW_PERIOD_SECS`): a row paints at most ~50 ms ahead of its
+    /// own timestamp. Within an over (or an RX run) columns arrive ~one row period apart,
+    /// so this footprint tiles them with no holes. But own-TX is bursty — a multi-second
+    /// no-TX gap sits between overs — so an over's tail column must stop ~one row period
+    /// past its own edge instead of smearing forward across the following RX (the other
+    /// station's response slot, which used to be blanked on the spectrogram). The footprint
+    /// is hugely smaller than the inter-over gap, so the gap is never bridged. Because the
+    /// cap applies whether a TX row is the newest or has been superseded by a newer over,
+    /// an over's tail paints the same columns either way — so it doesn't visibly re-render
+    /// when the next over keys up.
     fn fill_from_rows(
         &mut self,
         rows: &[SpectrumRow],
@@ -1302,8 +1306,9 @@ impl Spectrogram {
         cols_per_sec: f64,
         fill_to_now: bool,
     ) {
-        // Most columns a single row may sample-and-hold forward of its own timestamp.
-        let max_hold_cols = ((SPECTRO_MAX_HOLD_SECS * cols_per_sec).ceil() as usize).max(1);
+        // One column's footprint: the most columns a single row may sample-and-hold
+        // forward of its own timestamp (~one row period + a rounding column).
+        let max_hold_cols = ((SPECTRO_ROW_PERIOD_SECS * cols_per_sec).ceil() as usize + 1).max(1);
         // Column index of the previous (newer) row already painted, so this row fills
         // only the gap behind it.
         let mut newer_col: Option<usize> = None;
@@ -1317,13 +1322,16 @@ impl Spectrogram {
                 break; // older than the buffer spans; every remaining row is older still
             }
             let lo = match newer_col {
-                Some(p) => p + 1,
-                None if fill_to_now => 0, // RX: newest column reaches the NOW line
-                None => col,              // TX: newest column stops at the over's edge
+                // Older rows (and the TX newest below) hold forward only their own footprint, so
+                // an inter-over gap — or a burst's tail — isn't smeared into the following RX.
+                Some(p) => (p + 1).max(col.saturating_sub(max_hold_cols)),
+                // RX newest reaches the NOW line: live capture always extends to now.
+                None if fill_to_now => 0,
+                // TX newest: its own footprint, not the NOW line (post-over RX shows in front).
+                // Same span it gets once a newer over makes it an "older" row, so it doesn't
+                // visibly re-render when the next over keys up.
+                None => col.saturating_sub(max_hold_cols),
             };
-            // Cap the forward hold: never paint further ahead than the horizon, so a
-            // stale column expires instead of bridging an inter-over gap.
-            let lo = lo.max(col.saturating_sub(max_hold_cols));
             if lo > col {
                 continue; // a newer row already owns this column
             }
@@ -2524,12 +2532,15 @@ mod tests {
         assert_eq!(display_call(&Callsign("<...>".into()), "W4LL <...> -10"), "<...>");
     }
 
-    /// `fill_from_rows` must not bridge the multi-second no-TX gap between two own-TX
-    /// overs: the older over's columns must stay parked on their own span (plus the
-    /// bounded forward hold) and not smear across the other station's response slot.
-    /// Within a single over a one-row gap is still sample-and-held.
+    /// `fill_from_rows` bounds every forward hold to one column's footprint (~one row
+    /// period). This guards two coupled properties:
+    ///   * within an over, contiguous rows tile with no internal holes;
+    ///   * an own-TX over's tail stops ~one row period past its own leading edge, so it
+    ///     never smears across the multi-second inter-over gap into the following RX —
+    ///     and it paints the *same* columns whether or not a newer over is also present,
+    ///     so the tail does not visibly re-render when the next over keys up.
     #[test]
-    fn fill_from_rows_does_not_bridge_inter_over_gap() {
+    fn fill_from_rows_tx_tail_does_not_smear_or_rerender() {
         use types::{OffsetHz, RadioId, SignalSource, Timestamp};
 
         const NOW_MS: i64 = 1_000_000;
@@ -2548,53 +2559,87 @@ mod tests {
             source: SignalSource::OwnTx,
         };
 
-        // 20 cols/s → 50 ms per column, so max_hold = ceil(1.0 * 20) = 20 columns.
+        // 20 cols/s → 50 ms per column. The footprint is ceil(0.05·20)+1 = 2 columns, so
+        // an over's leading edge holds forward at most 2 columns — dwarfed by the ~7.5 s
+        // (≈150-col) inter-over gap below.
         let cols_per_sec = 20.0;
 
-        // Over A at ages 8.0–8.5 s (cols 160–170); over B at ages 0.0–0.5 s (cols 0–10),
-        // with the age-0.3 row (col 6) deliberately dropped to exercise the within-over
-        // hold. The ~7.5 s no-TX gap between them dwarfs the 1 s / 20-col hold horizon.
-        let rows = vec![
-            // over A, oldest→newest
-            tx_row(8.5, A_VAL),
-            tx_row(8.4, A_VAL),
-            tx_row(8.3, A_VAL),
-            tx_row(8.2, A_VAL),
-            tx_row(8.1, A_VAL),
-            tx_row(8.0, A_VAL),
-            // over B, oldest→newest, age-0.3 (col 6) omitted
-            tx_row(0.5, B_VAL),
-            tx_row(0.4, B_VAL),
-            tx_row(0.2, B_VAL),
-            tx_row(0.1, B_VAL),
-            tx_row(0.0, B_VAL),
-        ];
+        // Over A: contiguous 50 ms rows at ages 8.00..=8.20 s → cols 160..=164 (oldest→newest).
+        let push_over_a = |rows: &mut Vec<SpectrumRow>| {
+            for &age in &[8.20, 8.15, 8.10, 8.05, 8.00] {
+                rows.push(tx_row(age, A_VAL));
+            }
+        };
+        // Over B: contiguous 50 ms rows at ages 0.00..=0.20 s → cols 0..=4, newer, near NOW.
+        let push_over_b = |rows: &mut Vec<SpectrumRow>| {
+            for &age in &[0.20, 0.15, 0.10, 0.05, 0.00] {
+                rows.push(tx_row(age, B_VAL));
+            }
+        };
 
+        // Columns of `spec` painted with `val`. intensity[col] is row 0 of `col`; for a
+        // constant column it equals the painted magnitude (0 when never painted).
+        let painted = |spec: &Spectrogram, val: u8| -> Vec<usize> {
+            (0..spec.w).filter(|&c| spec.intensity[c] == val).collect()
+        };
+
+        // --- Render 1: over A alone. Record the columns its tail paints. ---
+        let mut rows_a = Vec::new();
+        push_over_a(&mut rows_a);
         let mut spec = Spectrogram::new();
         spec.ensure_size(H);
-        // TX semantics: fill_to_now = false (the newest over must not bleed to NOW).
-        spec.fill_from_rows(&rows, NOW_MS, cols_per_sec, false);
+        // TX semantics: fill_to_now = false (an over must not bleed forward to NOW).
+        spec.fill_from_rows(&rows_a, NOW_MS, cols_per_sec, false);
+        let a_alone = painted(&spec, A_VAL);
 
-        // intensity[col] is row 0 of `col`; for a constant column it equals the painted
-        // magnitude (0 when the column was never painted).
-        let at = |col: usize| spec.intensity[col];
+        // Over A tiles contiguously — a solid run, no internal holes. Its leading edge
+        // holds forward exactly the 2-col footprint (158..=160); trailing rows fill 161..=164.
+        assert_eq!(
+            a_alone,
+            (158..=164).collect::<Vec<_>>(),
+            "over A must tile as one solid run with no holes"
+        );
 
-        // Over B is painted across cols 0..=10 — including col 6, the one-missing-row
-        // within-over gap that sample-and-hold still bridges.
-        for c in 0..=10 {
-            assert_eq!(at(c), B_VAL, "over B col {c} should be painted");
+        // --- Render 2: over A *and* a newer over B near NOW. Zero the buffer first,
+        // exactly as the production frame loop does before each fill_from_rows. ---
+        let mut rows_ab = Vec::new();
+        push_over_a(&mut rows_ab);
+        push_over_b(&mut rows_ab);
+        spec.intensity.iter_mut().for_each(|v| *v = 0);
+        spec.fill_from_rows(&rows_ab, NOW_MS, cols_per_sec, false);
+
+        // Over B tiles solidly across its own cols 0..=4.
+        assert_eq!(
+            painted(&spec, B_VAL),
+            (0..=4).collect::<Vec<_>>(),
+            "over B must tile as one solid run with no holes"
+        );
+        // The key property: over A's tail paints the *exact same* columns it did alone.
+        // Adding a newer over does NOT make A's tail re-render or extend forward.
+        assert_eq!(
+            painted(&spec, A_VAL),
+            a_alone,
+            "over A's tail must paint identical columns with or without a newer over"
+        );
+
+        // The multi-second inter-over gap (cols 5..=157) stays cleared — no smear bridges it.
+        for c in [10usize, 30, 60, 90, 120, 150] {
+            assert_eq!(spec.intensity[c], 0, "inter-over gap col {c} must stay unpainted");
         }
-        assert_eq!(at(6), B_VAL, "within-over one-row gap (col 6) must still be filled");
 
-        // Over A is painted across its own cols 160..=170.
-        for c in 160..=170 {
-            assert_eq!(at(c), A_VAL, "over A col {c} should be painted");
-        }
-
-        // The inter-over gap, well beyond over A's 20-col forward hold (reaches col 140)
-        // and well ahead of over B (ends col 10), stays cleared — the smear is gone.
-        for c in [30usize, 60, 90, 120] {
-            assert_eq!(at(c), 0, "inter-over gap col {c} must stay unpainted");
-        }
+        // Within-over tiling stays hole-free at a much higher column rate too: at 200 cols/s
+        // the footprint grows to ceil(0.05·200)+1 = 11 cols, and contiguous 50 ms rows (10
+        // cols apart) still tile into one solid run with no internal gaps.
+        let dense: Vec<_> = (0..=20).map(|i| tx_row(2.0 - i as f64 * 0.05, A_VAL)).collect();
+        let mut spec2 = Spectrogram::new();
+        spec2.ensure_size(H);
+        spec2.fill_from_rows(&dense, NOW_MS, 200.0, false);
+        let run = painted(&spec2, A_VAL);
+        let (lo, hi) = (*run.first().unwrap(), *run.last().unwrap());
+        assert_eq!(
+            run,
+            (lo..=hi).collect::<Vec<_>>(),
+            "dense within-over run must be contiguous with no holes"
+        );
     }
 }
