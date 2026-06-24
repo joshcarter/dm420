@@ -453,6 +453,14 @@ pub enum QsoCommand {
     },
     CallCq,
     Abort,
+    /// Set the engine's outgoing TX audio offset (the waterslide click / `/clear` /
+    /// map-pick gesture). The engine is the **sole owner** of the offset and ignores
+    /// this while the offset is locked, so the operator's writes and the engine's own
+    /// auto-QSY obey one rule enforced in one place (`engine::on_command`).
+    SetTxOffset(OffsetHz),
+    /// Freeze / unfreeze the TX offset. While locked, **no** offset move happens —
+    /// not [`QsoCommand::SetTxOffset`], not auto-QSY. (The Tab key / LOCKED button.)
+    SetOffsetLock(bool),
 }
 
 /// `qso/{id}/state` (State + short history) — written by the QSO engine.
@@ -463,11 +471,13 @@ pub struct QsoState {
     pub partner: Option<Callsign>,
     /// What the engine will send next slot.
     pub next_tx: Option<OutgoingMessage>,
-    /// The engine's current TX audio offset while calling/in a contact (`None`
-    /// when idle). Lets the UI place the TX-lane indicator where the engine is
-    /// actually transmitting — notably after an auto-QSY hop the operator didn't
-    /// set by hand.
+    /// The engine's current TX audio offset — **always `Some`** (the engine owns the
+    /// offset even when idle, so the UI can render the TX lane before a QSO and track
+    /// an auto-QSY hop the operator didn't set by hand).
     pub tx_offset: Option<OffsetHz>,
+    /// Whether the TX offset is locked (the operator froze it). Mirrors the engine's
+    /// owned lock so the UI renders the LOCKED state and the engine alone enforces it.
+    pub offset_locked: bool,
 }
 
 /// Phase of an in-progress contact.
@@ -1216,12 +1226,16 @@ mod tests {
         });
         round_trip(QsoCommand::CallCq);
         round_trip(QsoCommand::Abort);
+        round_trip(QsoCommand::SetTxOffset(OffsetHz(1234.0)));
+        round_trip(QsoCommand::SetOffsetLock(true));
+        round_trip(QsoCommand::SetOffsetLock(false));
         round_trip(QsoState {
             radio: RadioId("k1".into()),
             phase: QsoPhase::InExchange { step: 2 },
             partner: Some(Callsign("W4LL".into())),
             next_tx: Some(sample_outgoing()),
             tx_offset: Some(OffsetHz(1500.0)),
+            offset_locked: true,
         });
     }
 

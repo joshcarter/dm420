@@ -269,6 +269,9 @@ impl Engine {
                 self.state = State::Idle;
                 None
             }
+            // Step 1 vocabulary placeholders — wired in step 2 (the engine becomes the
+            // sole owner + enforcer of the TX offset and its lock). Inert for now.
+            QsoCommand::SetTxOffset(_) | QsoCommand::SetOffsetLock(_) => None,
         }
     }
 
@@ -957,6 +960,7 @@ impl Engine {
                     State::Active(a) => Some(a.offset),
                     _ => None,
                 },
+                offset_locked: false,
             };
         }
         let (phase, partner, next_tx) = match &self.state {
@@ -986,6 +990,7 @@ impl Engine {
             partner,
             next_tx,
             tx_offset,
+            offset_locked: false,
         }
     }
 }
