@@ -215,7 +215,7 @@ async fn run(bus: BusHandle, radio: t::RadioId, audio: Option<Arc<AudioControl>>
             }
             r = logs.recv() => {
                 let Ok(e) = r else { continue };
-                engine.on_logged(e.call, e.band, e.mode);
+                engine.on_logged(e.call, e.band);
             }
             r = rig.recv() => {
                 let Ok(s) = r else { continue };

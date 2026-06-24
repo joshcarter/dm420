@@ -76,8 +76,10 @@ pub struct Scanner {
     heard: HashMap<(Band, OverAirMode), HashSet<Callsign>>,
     /// Distinct CQ callers per `(band, mode)` (a subset of `heard`).
     cq: HashMap<(Band, OverAirMode), HashSet<Callsign>>,
-    /// `(call, band, mode)` already in the logbook — fed from `logbook/entries`.
-    worked: HashSet<(Callsign, Band, OverAirMode)>,
+    /// `(call, band)` already in the logbook — fed from `logbook/entries`. Keyed per
+    /// band, not per mode: under the ARRL Field Day rule all digital modes count as
+    /// one, so a station worked on a band is a dupe there regardless of FT8/FT4.
+    worked: HashSet<(Callsign, Band)>,
 }
 
 impl Scanner {
@@ -231,11 +233,11 @@ impl Scanner {
         }
     }
 
-    /// Record a logged contact so it counts as worked on its band + mode (drives the
-    /// unworked tally). Fed from the logbook's startup replay + live
-    /// `logbook/entries`.
-    pub fn on_logged(&mut self, call: Callsign, band: Band, mode: OverAirMode) {
-        self.worked.insert((call, band, mode));
+    /// Record a logged contact so it counts as worked on its band (drives the unworked
+    /// tally). Mode is intentionally ignored — Field Day counts all digital modes as
+    /// one. Fed from the logbook's startup replay + live `logbook/entries`.
+    pub fn on_logged(&mut self, call: Callsign, band: Band) {
+        self.worked.insert((call, band));
     }
 
     /// Per-(band, mode) tallies, one per planned stop in sweep order.
@@ -248,7 +250,7 @@ impl Scanner {
                 let cq = self.cq.get(&(band, mode)).map_or(0, |c| c.len()) as u32;
                 let unworked = heard_set.map_or(0, |h| {
                     h.iter()
-                        .filter(|&c| !self.worked.contains(&(c.clone(), band, mode)))
+                        .filter(|&c| !self.worked.contains(&(c.clone(), band)))
                         .count()
                 }) as u32;
                 BandTally {
@@ -374,21 +376,26 @@ mod tests {
     }
 
     #[test]
-    fn counts_split_by_mode_and_unworked_is_per_band_mode() {
+    fn heard_cq_split_by_mode_but_worked_is_per_band() {
         let mut s = Scanner::new();
         s.start(
             &[(Band::B20m, OverAirMode::Ft8), (Band::B20m, OverAirMode::Ft4)],
             2,
         );
+        // W1ABC is heard on both modes; K2DEF only on FT4.
         s.on_decode(Band::B20m, OverAirMode::Ft8, &cq("W1ABC"));
+        s.on_decode(Band::B20m, OverAirMode::Ft4, &cq("W1ABC"));
         s.on_decode(Band::B20m, OverAirMode::Ft4, &cq("K2DEF"));
-        // Worked W1ABC on 20m FT8 only — so it's worked there, but K2DEF on 20m FT4
-        // stays unworked, and W1ABC would still be unworked on FT4.
-        s.on_logged(call("W1ABC"), Band::B20m, OverAirMode::Ft8);
+        // Work W1ABC on 20m. Field Day counts all digital modes as one, so it's worked
+        // on 20m regardless of mode — and therefore not unworked on FT4 either. K2DEF
+        // stays unworked. heard/CQ remain split per (band, mode).
+        s.on_logged(call("W1ABC"), Band::B20m);
         let ft8 = tally(&s, Band::B20m, OverAirMode::Ft8);
         let ft4 = tally(&s, Band::B20m, OverAirMode::Ft4);
         assert_eq!((ft8.heard, ft8.cq, ft8.unworked), (1, 1, 0));
-        assert_eq!((ft4.heard, ft4.cq, ft4.unworked), (1, 1, 1));
+        // Under the old per-(band,mode) rule this would be (2, 2, 2): W1ABC worked only
+        // on FT8 would still read unworked on FT4. Per-band, only K2DEF is unworked.
+        assert_eq!((ft4.heard, ft4.cq, ft4.unworked), (2, 2, 1));
     }
 
     #[test]
