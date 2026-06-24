@@ -26,7 +26,7 @@ use std::hash::Hash;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use types::Timestamp;
@@ -122,14 +122,6 @@ struct RecorderSink {
     version: u16,
 }
 
-/// Milliseconds since the Unix epoch, for stamping recorded envelopes.
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
 /// A cloneable handle to the in-process bus. Cheap to clone (`Arc` inside) and
 /// usable from any number of tasks.
 #[derive(Clone)]
@@ -199,7 +191,7 @@ impl BusHandle {
                 topic: topic_key.to_string(),
                 correlation: None,
                 payload,
-                recorded_at: Timestamp(now_ms()),
+                recorded_at: Timestamp(types::now_ms()),
             };
             let _ = sink.tx.send(env);
         }

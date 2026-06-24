@@ -135,7 +135,7 @@ async fn run(bus: BusHandle, radio: t::RadioId, audio: Option<Arc<AudioControl>>
                                 active_mode = None;
                                 slot_band.clear();
                                 prev_slot = None;
-                                publish_state(&bus, &engine, Some(now_ms()));
+                                publish_state(&bus, &engine, Some(types::now_ms()));
                             } else {
                                 if changed {
                                     // The dwelled stop was removed — retune to the new one.
@@ -160,7 +160,7 @@ async fn run(bus: BusHandle, radio: t::RadioId, audio: Option<Arc<AudioControl>>
                         active_mode = None;
                         slot_band.clear();
                         prev_slot = None;
-                        publish_state(&bus, &engine, Some(now_ms()));
+                        publish_state(&bus, &engine, Some(types::now_ms()));
                         tracing::info!("scanner: survey cancelled");
                     }
                 }
@@ -314,7 +314,7 @@ fn publish_state(bus: &BusHandle, engine: &Scanner, last_scan_ms: Option<i64>) {
 /// boundary (and zeroed on Start), so the panel always sees a complete, current set —
 /// no accumulation, no coalescing, and counts reset cleanly when a scan begins.
 fn publish_snapshot(bus: &BusHandle, engine: &Scanner) {
-    let now = now_ms();
+    let now = types::now_ms();
     let snapshot: Vec<t::BandActivity> = engine
         .tallies()
         .into_iter()
@@ -337,12 +337,4 @@ fn proto_of(mode: t::OverAirMode) -> Protocol {
         t::OverAirMode::Ft4 => Protocol::Ft4,
         _ => Protocol::Ft8,
     }
-}
-
-fn now_ms() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }

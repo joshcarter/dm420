@@ -165,7 +165,7 @@ async fn run(
     // colliding with already-logged ids — the logbook dedups by `QsoId`, so those
     // post-restart contacts were silently dropped (never persisted). now_ms at
     // startup is strictly greater than any prior session's seqs, so no collision.
-    let mut seq: u64 = now_ms();
+    let mut seq: u64 = types::now_ms() as u64;
     // The rig's last-seen VFO frequency, used to stamp the real band/freq on a
     // completed contact (replacing the old hardcoded 20 m placeholder).
     let mut last_vfo: Option<AbsHz> = None;
@@ -394,7 +394,7 @@ fn build_log(
         mode,
         band,
         freq,
-        time: Timestamp(now_ms() as i64),
+        time: Timestamp(types::now_ms()),
         exchange_sent: done.exchange_sent,
         exchange_rcvd: done.exchange_rcvd,
         grid: done.grid,
@@ -404,14 +404,6 @@ fn build_log(
 
 fn station_call(shared: &Arc<Mutex<StationConfig>>) -> StationId {
     StationId(shared.lock().unwrap().call.0.clone())
-}
-
-fn now_ms() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

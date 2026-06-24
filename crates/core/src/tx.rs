@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use bus::types as t;
 use bus::{BusError, BusHandle, Topic, TopicSelector};
@@ -85,7 +85,7 @@ pub fn spawn(bus: &BusHandle, radio: t::RadioId, tx: Arc<crate::control::TxContr
                 ..
             } = &req
             {
-                Some((*mode, *offset, *slot, message.clone(), t::Timestamp(now_ms())))
+                Some((*mode, *offset, *slot, message.clone(), t::Timestamp(types::now_ms())))
             } else {
                 None
             };
@@ -214,7 +214,7 @@ async fn transmit(
     // budget is visible on real hw.
     let slot_ms = slot_period_ms(mode);
     tracing::info!(
-        ?slot, ?mode, offset = offset.0, into_slot_ms = now_ms().rem_euclid(slot_ms),
+        ?slot, ?mode, offset = offset.0, into_slot_ms = types::now_ms().rem_euclid(slot_ms),
         message = %message.text, "audio-tx: begin over",
     );
 
@@ -286,7 +286,7 @@ async fn transmit(
     // `synth/key/load_ms` break down the gap from "begin over" so we can see which
     // step dominates. Plus the ~0.2 s lead trimmed above, this is our effective DT.
     tracing::info!(
-        into_slot_ms = now_ms().rem_euclid(slot_ms),
+        into_slot_ms = types::now_ms().rem_euclid(slot_ms),
         synth_ms,
         key_ms,
         load_ms,
@@ -412,7 +412,7 @@ fn spawn_tx_spectrum(
                     t::SpectrumRow {
                         radio: radio.clone(),
                         mode,
-                        t: t::Timestamp(now_ms()),
+                        t: t::Timestamp(types::now_ms()),
                         bin0_offset: t::OffsetHz(0.0),
                         bin_hz,
                         mags,
@@ -424,14 +424,6 @@ fn spawn_tx_spectrum(
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     });
-}
-
-/// Milliseconds since the Unix epoch (wall clock), for stamping spectrum columns.
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 /// Slot length in ms for the `into_slot_ms` audit metric (mode-aware: FT4 = 7.5 s).

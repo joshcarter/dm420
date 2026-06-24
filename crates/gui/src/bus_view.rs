@@ -471,7 +471,7 @@ impl BusView {
     /// per `docs/map_panel.md` (transient points last at most an hour). Callers
     /// that also show worked spots should exclude calls already in the log.
     pub fn heard_spots(&self) -> Vec<MapSpot> {
-        let cutoff = now_ms() - 3_600_000; // one hour
+        let cutoff = types::now_ms() - 3_600_000; // one hour
         self.heard
             .lock()
             .unwrap()
@@ -493,7 +493,7 @@ impl BusView {
     /// Current wall-clock time, ms since the Unix epoch — the reference the map
     /// uses for recent/all filtering and age-dimming.
     pub fn now_ms(&self) -> i64 {
-        now_ms()
+        types::now_ms()
     }
 
     /// The currently-applied hardware config (the settings form's starting point).
@@ -769,14 +769,6 @@ fn band_order(b: Band) -> u8 {
         Band::B10m => 8,
         Band::B6m => 9,
     }
-}
-
-/// Wall-clock time, ms since the Unix epoch.
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 /// Extract a placeable `(call, locator, calling_cq)` from a decode, if it

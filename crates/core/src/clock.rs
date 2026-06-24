@@ -48,7 +48,7 @@ pub fn spawn(bus: &BusHandle, audio: Option<Arc<AudioControl>>, fallback: Protoc
             if slot_ms <= 0 {
                 continue;
             }
-            let ms = now_ms();
+            let ms = types::now_ms();
             // Identical formula to `decode::publish_one`, so clock slots and decode
             // slots share one numbering — the property the QSO parity check needs.
             let slot = SlotId(ms.div_euclid(slot_ms) as u64);
@@ -65,12 +65,4 @@ pub fn spawn(bus: &BusHandle, audio: Option<Arc<AudioControl>>, fallback: Protoc
             );
         }
     });
-}
-
-fn now_ms() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }

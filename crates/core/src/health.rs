@@ -4,17 +4,8 @@
 //! State, so we deduplicate against the last value the caller published — only
 //! emitting on a real transition keeps the UI from repainting on every heartbeat.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use bus::types as t;
 use bus::{BusHandle, Topic};
-
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
 
 /// Publish `state` for subsystem `id`, skipping it if equal to `*last`. Updates
 /// `*last` to the new state when it does publish.
@@ -32,7 +23,7 @@ pub(crate) fn set(
         t::SubsystemHealth {
             id,
             state: state.clone(),
-            since: t::Timestamp(now_ms()),
+            since: t::Timestamp(types::now_ms()),
         },
     );
     *last = Some(state);

@@ -39,6 +39,23 @@
 use serde::{Deserialize, Serialize};
 
 // =====================================================================
+// §0  Shared time helper
+// =====================================================================
+
+/// Wall-clock time, milliseconds since the Unix epoch.
+///
+/// Pure: reads `SystemTime` only — no async, no bus I/O. Shared so every crate
+/// stamps timestamps with byte-identical values. Returns `0` if the clock is
+/// somehow before the epoch.
+pub fn now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+// =====================================================================
 // §1  Scalar newtypes & enums
 // =====================================================================
 //

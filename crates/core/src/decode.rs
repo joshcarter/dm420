@@ -58,13 +58,6 @@ const AUDIO_SILENCE_TIMEOUT: Duration = Duration::from_secs(3);
 const AUDIO_BACKOFF_START: Duration = Duration::from_secs(1);
 const AUDIO_BACKOFF_MAX: Duration = Duration::from_secs(15);
 
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
 fn now_unix() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -130,7 +123,7 @@ fn publish_column(
     let row = t::SpectrumRow {
         radio: radio.clone(),
         mode: over_air(proto),
-        t: t::Timestamp(now_ms()),
+        t: t::Timestamp(types::now_ms()),
         bin0_offset: t::OffsetHz(0.0),
         bin_hz,
         mags: dsp::spectrum_column(win, FFT_SIZE, max_bins),
@@ -277,7 +270,7 @@ pub fn spawn_wav(
                     tokio::task::spawn_blocking(move || decode(&samples, DECODE_RATE, proto))
                         .await
                         .unwrap_or_default();
-                publish_slot(&bus, &radio, proto, now_ms(), decs);
+                publish_slot(&bus, &radio, proto, types::now_ms(), decs);
             }
             if !looping {
                 break;
