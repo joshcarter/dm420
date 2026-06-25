@@ -334,3 +334,249 @@ The characterization suite staying green across the routing commits is the
 behavior-preservation proof. The final gate is **on-air**: run real QSOs through
 the full sequence (CQ → report → RR73 → 73), including a Field Day class+section
 exchange, on both roles, and confirm the progression is identical to before.
+
+---
+
+## Appendix — the code: `Progress` and the transition tables
+
+> **Proposed shape, ahead of implementation.** This is the design written out
+> concretely so it can be read before any engine code changes — it is **not yet in
+> `crates/qso`**. The `Progress` *labels* are descriptive and **Joel owns the final
+> taxonomy**; what is behavior-bearing (and must stay byte-identical to today) is
+> each transition's `reply`, `step`, `capture`, `log`, and `settle`. Every value
+> below was reconstructed from the four current decision sites in `engine.rs`.
+
+### The state label, and the table key/value types
+
+```rust
+/// Where we are in the exchange — WSJT-X's `m_QSOProgress`, mirrored. The
+/// authoritative, legible phase of a contact; the published `step` stays
+/// display-only. `Calling` is the pre-contact `State::Calling`; a committed
+/// `Active` carries one of `Replying`/`Report`/`RogerReport`/`Rogers`/`Signoff`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Progress { Calling, Replying, Report, RogerReport, Rogers, Signoff }
+
+/// The received content the sequencer reacts to — a flattened projection of
+/// `ParsedMessage` + `ExchangePayload`, with the Field Day exchange split by its
+/// `rogered` bit (the two cases the engine treats differently). Addressing
+/// (`to`/`from`/`caller`) is intentionally dropped: the routing sites check it
+/// *before* consulting the tables.
+enum MsgKind {
+    Cq { grid: Option<GridSquare> },
+    Grid(GridSquare),
+    Report(i8),
+    RogerReport(i8),
+    FdBare { class: String, section: Section },   // FieldDay { rogered: false }
+    FdRoger { class: String, section: Section },  // FieldDay { rogered: true }
+    Signoff(Signoff),
+    /// Free / Raw / anything the decoder couldn't classify — never sequenced.
+    Other,
+}
+
+impl MsgKind {
+    fn classify(m: &ParsedMessage) -> MsgKind {
+        match m {
+            ParsedMessage::Cq { grid, .. } => MsgKind::Cq { grid: grid.clone() },
+            ParsedMessage::Exchange { payload, .. } => match payload {
+                ExchangePayload::Grid(g) => MsgKind::Grid(g.clone()),
+                ExchangePayload::Report(r) => MsgKind::Report(*r),
+                ExchangePayload::RogerReport(r) => MsgKind::RogerReport(*r),
+                ExchangePayload::FieldDay { class, section, rogered: false } =>
+                    MsgKind::FdBare { class: class.clone(), section: section.clone() },
+                ExchangePayload::FieldDay { class, section, rogered: true } =>
+                    MsgKind::FdRoger { class: class.clone(), section: section.clone() },
+            },
+            ParsedMessage::Signoff { kind, .. } => MsgKind::Signoff(*kind),
+            ParsedMessage::Free(_) | ParsedMessage::Raw(_) => MsgKind::Other,
+        }
+    }
+}
+
+/// Abstract reply tag the engine materializes against `&self.me` + partner (+ snr);
+/// keeps the tables pure data — they can't build `OutgoingMessage`s themselves.
+enum Reply { None, Opener, Report, RogerReport, FdRogerExchange, Rr73, Seven3 }
+
+/// Which captured fact to record from the received message (for the log).
+enum Capture { None, Grid(Option<GridSquare>), Report(i8), Fd(String, Section) }
+
+/// When the contact is logged. `OnSend` is today's `log_on_tx` (log when the queued
+/// message transmits); `OnReceive` fires immediately on a sign-off.
+enum LogWhen { Never, OnSend, OnReceive }
+
+/// What to do once the reply is queued. `FinishOnSend` is today's `finish_after_tx`
+/// (apply after the message goes out); `ResumeCqNow` resumes CQ immediately (a
+/// silent partner, nothing left to send).
+enum Settle { StayActive, FinishOnSend(Finish), ResumeCqNow }
+
+/// One transition's full consequence — pure data, no `&mut self`, no state borrow.
+struct Outcome {
+    reply: Reply,
+    progress: Progress,
+    step: u8,            // carried, NOT derived from progress — preserves today's exact numbers
+    capture: Capture,
+    log: LogWhen,
+    settle: Settle,
+}
+
+/// `advance()`'s result. `Ignore` is the old silent `_ => None`, now explicit:
+/// leave the contact untouched (it keeps repeating; the give-up counter climbs).
+enum Step { Ignore, Act(Outcome) }
+```
+
+### Table 1 — openers (entering a contact)
+
+```rust
+/// Armed → answering: our target finally called CQ. The opener is fixed (our grid
+/// in Standard, our FD exchange in Field Day — `self.opener`); we capture the
+/// target's grid from its CQ. Used only by `commit_from_armed`, which has already
+/// checked `caller == target`. (`Replying` is the descriptive label for both
+/// contests; only `step == 1` is behavior-bearing.)
+fn answer_opener(target_grid: Option<GridSquare>) -> Outcome {
+    Outcome {
+        reply: Reply::Opener,
+        progress: Progress::Replying,
+        step: 1,
+        capture: Capture::Grid(target_grid),
+        log: LogWhen::Never,
+        settle: Settle::StayActive,
+    }
+}
+
+/// A station answered our CQ (we become `CallingCq`). Shared by `commit_from_cq`
+/// and `resume_from`'s opener path; both have already checked the line is `to == me`.
+/// `None` = not an opener → stay `Calling` (no contact). Exhaustive over `MsgKind`.
+fn open(fd: bool, kind: MsgKind) -> Option<(Role, Outcome)> {
+    use MsgKind::*;
+    match kind {
+        // Standard: they answered with their grid (Tx1) → we send the report (Tx2).
+        Grid(g) if !fd => Some((Role::CallingCq, Outcome {
+            reply: Reply::Report, progress: Progress::Report, step: 1,
+            capture: Capture::Grid(Some(g)), log: LogWhen::Never, settle: Settle::StayActive,
+        })),
+        // Standard (P3 skip-Tx1): they skipped the grid and opened with a bare report
+        // → roger it and send ours (Tx3). Completes when they roger us (their RR73).
+        Report(r) if !fd => Some((Role::CallingCq, Outcome {
+            reply: Reply::RogerReport, progress: Progress::RogerReport, step: 2,
+            capture: Capture::Report(r), log: LogWhen::Never, settle: Settle::StayActive,
+        })),
+        // Field Day: they answered with the bare exchange (Tx2) → reply with the
+        // combined roger+exchange (Tx3 = `R 3A WI`).
+        FdBare { class, section } if fd => Some((Role::CallingCq, Outcome {
+            reply: Reply::FdRogerExchange, progress: Progress::RogerReport, step: 1,
+            capture: Capture::Fd(class, section), log: LogWhen::Never, settle: Settle::StayActive,
+        })),
+        // Explicit holes — every variant named, no `_`. A wrong-contest opener, a
+        // roger-report/sign-off/CQ, or unclassified text does NOT open a contact.
+        // Adding an ExchangePayload/Signoff variant breaks this match until classified.
+        Grid(_) | Report(_) | FdBare { .. } | FdRoger { .. }
+        | RogerReport(_) | Signoff(_) | Cq { .. } | Other => None,
+    }
+}
+```
+
+### Table 2 — advancing a committed contact
+
+```rust
+/// Advance an existing `Active`. Role comes from the contact; the addressing /
+/// lost-race (abandon) pre-check has already run, so anything here is a directed
+/// message from our partner. Exhaustive over `MsgKind` — `Ignore` is the old silent
+/// `_ => None`, now explicit (the contact keeps repeating, give-up counter climbs).
+fn advance(role: Role, fd: bool, kind: MsgKind) -> Step {
+    use MsgKind::*;
+    use Role::*;
+    match kind {
+        // Standard, answering side: their report → roger+report (Tx3).
+        Report(r) if role == Answering && !fd => Step::Act(Outcome {
+            reply: Reply::RogerReport, progress: Progress::RogerReport, step: 2,
+            capture: Capture::Report(r), log: LogWhen::Never, settle: Settle::StayActive,
+        }),
+        // Field Day, answering side: their R+exchange → RR73; log on send, then idle.
+        FdRoger { class, section } if role == Answering && fd => Step::Act(Outcome {
+            reply: Reply::Rr73, progress: Progress::Rogers, step: 2,
+            capture: Capture::Fd(class, section), log: LogWhen::OnSend,
+            settle: Settle::FinishOnSend(Finish::Idle),
+        }),
+        // Standard, CQ side: their R-report → RR73; log on send (then hold for a 73).
+        RogerReport(r) if role == CallingCq && !fd => Step::Act(Outcome {
+            reply: Reply::Rr73, progress: Progress::Rogers, step: 2,
+            capture: Capture::Report(r), log: LogWhen::OnSend, settle: Settle::StayActive,
+        }),
+        // Any directed sign-off (RRR / RR73 / 73) completes the contact (P2).
+        Signoff(k) => Step::Act(signoff_outcome(role, fd, k)),
+        // Explicit holes — every variant named, no `_`. A repeated/wrong-phase
+        // message, a contest mismatch, another CQ, or unclassified text is ignored.
+        Report(_) | RogerReport(_) | FdBare { .. } | FdRoger { .. }
+        | Grid(_) | Cq { .. } | Other => Step::Ignore,
+    }
+}
+
+/// The sign-off branch. A partner who sends us any sign-off is done. We send a
+/// courtesy `73` when we hold the courtesy slot — the answering side always, and
+/// the Field Day CQ side on their RR73/RRR; otherwise we've already logged on
+/// RR73-sent (Standard CQ side) and just resume CQ. Logging on *receive* is gated
+/// on `!logged` by the applier reading the live `Active`, so it isn't needed here.
+fn signoff_outcome(role: Role, fd: bool, k: Signoff) -> Outcome {
+    let courtesy = role == Role::Answering || (fd && is_roger(k));
+    if courtesy {
+        let finish = if role == Role::CallingCq { Finish::ResumeCq } else { Finish::Idle };
+        Outcome {
+            reply: Reply::Seven3, progress: Progress::Signoff, step: 3,
+            capture: Capture::None, log: LogWhen::OnReceive,
+            settle: Settle::FinishOnSend(finish),
+        }
+    } else {
+        Outcome {
+            reply: Reply::None, progress: Progress::Signoff, step: 3,
+            capture: Capture::None, log: LogWhen::OnReceive, settle: Settle::ResumeCqNow,
+        }
+    }
+}
+```
+
+### Resume — inferring the role (the one site-specific helper)
+
+`resume_from` picks a contact up mid-stream, so it must first infer which side it's
+on from the clicked line before consulting `open`/`advance`. Standard and Field Day
+reverse the side that holds `RR73`. This keeps its own `_ => None` — that means
+"this line carries no contact to resume" (e.g. a bare `73`), which is a property of
+the *gesture*, not a sequencing drop:
+
+```rust
+fn resume_role(fd: bool, kind: &MsgKind) -> Option<Role> {
+    use MsgKind::*;
+    match (kind, fd) {
+        (Grid(_) | RogerReport(_), false) | (FdBare { .. }, true) => Some(Role::CallingCq),
+        (Report(_), false) | (FdRoger { .. }, true)               => Some(Role::Answering),
+        (Signoff(k), false) if is_roger(*k) => Some(Role::Answering),
+        (Signoff(k), true)  if is_roger(*k) => Some(Role::CallingCq),
+        _ => None,
+    }
+}
+```
+
+### Materializing a reply, and the glue
+
+The tables are pure; the engine turns a `Reply` tag into a real message (these need
+`&self.me`, so they can't live in the table):
+
+```rust
+fn materialize(&self, reply: Reply, his: &Callsign, snr: i8) -> Option<OutgoingMessage> {
+    use Reply::*;
+    Some(match reply {
+        None            => return Option::None,
+        Opener          => self.opener(his),                       // grid (Std) / fd_exchange (FD)
+        Report          => message::report(&self.me, his, snr),
+        RogerReport     => message::roger_report(&self.me, his, snr),
+        FdRogerExchange => message::fd_roger_exchange(&self.me, his),
+        Rr73            => message::rr73(&self.me, his),
+        Seven3          => message::seven3(&self.me, his),
+    })
+}
+```
+
+Two appliers (not shown in full — routing glue) finish the job: **`open_at(seed,
+outcome)`** builds a fresh `Active` from the triggering context (`partner`,
+`target`, `offset`, `tx_parity`, `snr`) plus the `Outcome`, and **`apply_advance(
+step)`** either leaves the contact untouched (`Ignore`) or writes the `Outcome` into
+the live `Active` — exactly the `next` / `finish_after_tx` / `log_on_tx` / `step` /
+captured-fact writes the four functions do by hand today, now in one place.
