@@ -19,9 +19,10 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bus::BusHandle;
-use bus::types::{RadioId, StationId};
+use bus::types::{Band, OverAirMode, RadioId, StationId};
 
 mod clock;
 mod control;
@@ -182,6 +183,13 @@ pub struct CoreConfig {
     /// reaches the rig. Clamped to `[0.0, 1.0]`; see [`DEFAULT_TX_GAIN`].
     /// Live-editable afterward via [`CoreControl::tx`].
     pub tx_gain: f32,
+    /// The `(band, mode)` stops the band-status producer aggregates and the band
+    /// scanner sweeps — `[bands] list × modes` from `config.toml`, defaulting to
+    /// [`bus::types::field_day_stops`] (the six Field Day HF bands × FT8/FT4).
+    pub band_status_stops: Vec<(Band, OverAirMode)>,
+    /// How long a heard station stays counted in the band-status window
+    /// (`[bands] retention_secs`, default 5 minutes).
+    pub band_status_window: Duration,
 }
 
 impl Default for CoreConfig {
@@ -199,6 +207,8 @@ impl Default for CoreConfig {
             decode_archive: None,
             tx_output: None,
             tx_gain: DEFAULT_TX_GAIN,
+            band_status_stops: bus::types::field_day_stops(),
+            band_status_window: Duration::from_secs(300),
         }
     }
 }
@@ -222,6 +232,9 @@ pub fn spawn(bus: &BusHandle, cfg: CoreConfig) -> CoreControl {
         decode_archive,
         tx_output,
         tx_gain,
+        // Consumed by the band-status / enrich producers (wired in a later step).
+        band_status_stops: _,
+        band_status_window: _,
     } = cfg;
 
     tracing::info!(

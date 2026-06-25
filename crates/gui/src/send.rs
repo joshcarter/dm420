@@ -62,7 +62,7 @@ pub fn parse_command(input: &str) -> Option<Command> {
 
 /// Parse a band argument — `20`, `20m`, or `20M` — into a [`Band`]. The meter
 /// count must name a real amateur HF/6 m band.
-fn parse_band(arg: &str) -> Option<Band> {
+pub(crate) fn parse_band(arg: &str) -> Option<Band> {
     let meters: u16 = arg.trim_end_matches(['m', 'M']).parse().ok()?;
     Some(match meters {
         160 => Band::B160m,
