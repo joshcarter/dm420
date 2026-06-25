@@ -13,9 +13,12 @@
 //!
 //! A `Wildcard(kind)` subscription is served by a parallel per-kind entry. Every
 //! `publish` delivers to the exact-topic channel *and*, if any wildcard
-//! subscribers exist for that kind, to the kind-level channel. State wildcard
-//! delivery is a live stream of updates (`broadcast`) with no snapshot, since a
-//! single latest-value cell can't represent many scope ids at once.
+//! subscribers exist for that kind, to the kind-level `broadcast`. A wildcard
+//! `State` subscriber is additionally **primed** on subscribe with the current
+//! value of every already-registered exact topic of that kind (one `watch` can't
+//! hold many scope ids at once, so the snapshot is gathered across the per-scope
+//! watches), then continues live off the broadcast — giving wildcard `State` the
+//! same late-join semantics as exact `State`. See [`BusHandle::subscribe`].
 //!
 //! The recorder tap (record every published envelope) is layered on in
 //! `recorder.rs`; this module is the live-delivery core.
@@ -380,20 +383,45 @@ impl BusHandle {
                 lossless_subscription(&arc)
             }
             // ---- wildcard ----
-            (None, DeliveryClass::State) | (None, DeliveryClass::StreamLossy) => {
-                // Both served by a per-kind broadcast (State wildcard = live updates).
+            // Wildcard `State`: prime with the current value of every existing
+            // exact topic of this kind, then continue live off the per-kind
+            // broadcast. This is the late-join fix — without the prime, a
+            // subscriber that joins after a peer's snapshot already landed would
+            // never see it (`ARCHITECTURE_REVIEW.md` "D1", the multi-op blocker).
+            (None, DeliveryClass::State) => {
                 let mut guard = self.inner.reg.lock().unwrap();
-                let entry = guard.wild.entry(kind).or_insert_with(|| {
-                    let (tx, _rx) = broadcast::channel::<M>(LOSSY_CAP);
-                    Entry::Lossy(Box::new(tx))
-                });
-                let Entry::Lossy(b) = entry else {
-                    return Err(BusError::ClassMismatch);
-                };
-                let rx = b
-                    .downcast_ref::<broadcast::Sender<M>>()
-                    .ok_or(BusError::ClassMismatch)?
-                    .subscribe();
+                let reg = &mut *guard;
+                // Subscribe to the live broadcast FIRST, *then* snapshot the
+                // existing exact watches. The registry lock already serializes us
+                // against `publish`, but this order is what keeps the prime
+                // gap-free even under any future finer-grained locking: any value
+                // that lands after we grab `rx` is captured live, never dropped.
+                // The trade-off is **at-least-once** delivery — a value present in
+                // both the primed backlog and the live stream is delivered twice,
+                // which is harmless for latest-wins `State`. Never reverse this
+                // order (snapshot-then-subscribe risks a *missed* update).
+                let rx = wild_broadcast_rx::<M>(&mut reg.wild, kind)?;
+                let mut backlog = VecDeque::new();
+                for (key, e) in reg.exact.iter() {
+                    let Entry::State(b) = e else { continue };
+                    // Restrict to this kind. The downcast below already type-filters
+                    // (each State kind has its own payload type), but parsing the
+                    // canonical key keeps this correct if two kinds ever share one.
+                    if Topic::parse(key).ok().map(|t| t.kind()) != Some(kind) {
+                        continue;
+                    }
+                    if let Some(tx) = b.downcast_ref::<watch::Sender<Option<M>>>()
+                        && let Some(v) = tx.borrow().clone()
+                    {
+                        backlog.push_back(v);
+                    }
+                }
+                SubInner::WildcardState { backlog, rx }
+            }
+            // Wildcard `StreamLossy`: future messages only, off the per-kind broadcast.
+            (None, DeliveryClass::StreamLossy) => {
+                let mut guard = self.inner.reg.lock().unwrap();
+                let rx = wild_broadcast_rx::<M>(&mut guard.wild, kind)?;
                 SubInner::Stream { rx }
             }
             (None, DeliveryClass::StreamLossless) => {
@@ -497,6 +525,25 @@ fn goc_lossless<M: BusMessage, K: Eq + Hash>(
         .ok_or(BusError::ClassMismatch)
 }
 
+/// Get-or-create the per-kind wildcard `broadcast` sender and return a fresh
+/// receiver on it. Shared by the wildcard `State` and `StreamLossy` arms (the
+/// live-update transport is identical; only `State` additionally primes a backlog).
+fn wild_broadcast_rx<M: BusMessage>(
+    wild: &mut HashMap<TopicKind, Entry>,
+    kind: TopicKind,
+) -> Result<broadcast::Receiver<M>, BusError> {
+    let entry = wild.entry(kind).or_insert_with(|| {
+        let (tx, _rx) = broadcast::channel::<M>(LOSSY_CAP);
+        Entry::Lossy(Box::new(tx))
+    });
+    let Entry::Lossy(b) = entry else {
+        return Err(BusError::ClassMismatch);
+    };
+    Ok(b.downcast_ref::<broadcast::Sender<M>>()
+        .ok_or(BusError::ClassMismatch)?
+        .subscribe())
+}
+
 /// Register a new subscriber on a lossless channel: snapshot the current ring,
 /// then attach a fresh per-subscriber queue for live delivery.
 fn lossless_subscription<M: BusMessage>(arc: &Arc<Mutex<LosslessInner<M>>>) -> SubInner<M> {
@@ -519,6 +566,15 @@ enum SubInner<M> {
         primed: bool,
     },
     Stream {
+        rx: broadcast::Receiver<M>,
+    },
+    /// Wildcard `State`: a primed backlog of the current values of all exact
+    /// topics of the kind that already existed at subscribe time, drained before
+    /// the live broadcast. Semantics are **at-least-once** — a value can appear in
+    /// both `backlog` and the live stream, which latest-wins `State` makes a
+    /// harmless duplicate.
+    WildcardState {
+        backlog: VecDeque<M>,
         rx: broadcast::Receiver<M>,
     },
     Lossless {
@@ -553,6 +609,21 @@ impl<M: BusMessage> Subscription<M> {
                 Err(broadcast::error::RecvError::Lagged(n)) => Err(BusError::Lagged { skipped: n }),
                 Err(broadcast::error::RecvError::Closed) => Err(BusError::Closed),
             },
+            // Drain the primed backlog (existing exact values at subscribe time)
+            // before reading live broadcast updates. See `SubInner::WildcardState`
+            // for the at-least-once / possible-duplicate semantics.
+            SubInner::WildcardState { backlog, rx } => {
+                if let Some(v) = backlog.pop_front() {
+                    return Ok(v);
+                }
+                match rx.recv().await {
+                    Ok(v) => Ok(v),
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        Err(BusError::Lagged { skipped: n })
+                    }
+                    Err(broadcast::error::RecvError::Closed) => Err(BusError::Closed),
+                }
+            }
             SubInner::Lossless { snapshot, rx } => {
                 if let Some(v) = snapshot.pop_front() {
                     return Ok(v);

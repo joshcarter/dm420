@@ -8,7 +8,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use bus::types::*;
-use bus::{BusError, BusHandle, BusMessage, DeliveryClass, Envelope, Topic, TopicSelector};
+use bus::{BusError, BusHandle, BusMessage, DeliveryClass, Envelope, Topic, TopicKind, TopicSelector};
 
 // --------------------------------------------------------------------- helpers
 
@@ -108,6 +108,66 @@ async fn state_late_join() {
         .subscribe::<ClockStatus>(TopicSelector::Exact(Topic::ClockStatus))
         .unwrap();
     assert_eq!(sub.recv().await.unwrap().offset_ms, 1.0);
+}
+
+// ---------------------------------------- #3b wildcard State late-join prime (D1)
+
+fn snapshot(id: &str, seq: u64) -> StationSnapshot {
+    StationSnapshot {
+        station: StationId(id.into()),
+        seq,
+        working: None,
+        band_activity: vec![],
+        heard: vec![],
+    }
+}
+
+/// D1: a wildcard `State` subscription is LIVE-ONLY no more — it must be primed
+/// with the current value of every exact topic of that kind that already exists,
+/// then continue to receive live updates.
+#[tokio::test]
+async fn wildcard_state_late_join_primes_then_live() {
+    let bus = BusHandle::new();
+    let a = StationId("a".into());
+    let b = StationId("b".into());
+
+    // Two exact State topics of the same kind exist (published) BEFORE any
+    // wildcard subscriber.
+    bus.publish(&Topic::StationSnapshot(a.clone()), snapshot("a", 1))
+        .unwrap();
+    bus.publish(&Topic::StationSnapshot(b.clone()), snapshot("b", 2))
+        .unwrap();
+
+    // Late-joining wildcard-State subscriber: its first recvs must yield BOTH
+    // current values (order-independent — collect into a set).
+    let mut sub = bus
+        .subscribe::<StationSnapshot>(TopicSelector::Wildcard(TopicKind::StationSnapshot))
+        .unwrap();
+    let mut primed = std::collections::HashSet::new();
+    for _ in 0..2 {
+        let snap = tokio::time::timeout(Duration::from_secs(1), sub.recv())
+            .await
+            .expect("primed recv timed out")
+            .unwrap();
+        primed.insert((snap.station.0, snap.seq));
+    }
+    assert_eq!(
+        primed,
+        [("a".to_string(), 1), ("b".to_string(), 2)]
+            .into_iter()
+            .collect()
+    );
+
+    // A subsequent live publish — to a fresh exact topic of the kind — still
+    // arrives over the broadcast.
+    let c = StationId("c".into());
+    bus.publish(&Topic::StationSnapshot(c.clone()), snapshot("c", 3))
+        .unwrap();
+    let live = tokio::time::timeout(Duration::from_secs(1), sub.recv())
+        .await
+        .expect("live recv timed out")
+        .unwrap();
+    assert_eq!((live.station.0, live.seq), ("c".to_string(), 3));
 }
 
 // ----------------------------------------------------- #4 Lossless order + late-join
