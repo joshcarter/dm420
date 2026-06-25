@@ -723,7 +723,11 @@ impl Engine {
             // courtesy `73`; the Standard CQ side has already logged on RR73-sent and
             // just resumes CQ.
             (_, _, ParsedMessage::Signoff { kind, .. }) => {
-                let done = (!logged).then(|| self.completed());
+                // Log on receive (if not already logged) — we're still `Active` here.
+                let done = match &self.state {
+                    State::Active(a) if !logged => Some(self.completed(a)),
+                    _ => None,
+                };
                 let courtesy = matches!(role, Role::Answering) || (me_fd && is_roger(*kind));
                 if courtesy {
                     let s73 = message::seven3(&self.me, &partner);
@@ -901,15 +905,19 @@ impl Engine {
                 (None, None)
             }
             Act::Send => {
-                // Snapshot what we need; the borrow ends before the `&mut self` calls.
-                let (offset, message, do_log, finish) = match &self.state {
+                // Snapshot what we need (incl. the log-on-send record, built while we
+                // still hold `&Active`); the borrow ends before the `&mut self` calls.
+                let (offset, message, finish, log) = match &self.state {
                     State::Active(a) => match &a.next {
-                        Some(m) => (
-                            a.offset,
-                            m.clone(),
-                            a.log_on_tx && !a.logged,
-                            a.finish_after_tx,
-                        ),
+                        Some(m) => {
+                            let do_log = a.log_on_tx && !a.logged;
+                            (
+                                a.offset,
+                                m.clone(),
+                                a.finish_after_tx,
+                                do_log.then(|| self.completed(a)),
+                            )
+                        }
                         None => return (None, None),
                     },
                     _ => return (None, None),
@@ -923,14 +931,13 @@ impl Engine {
                     slot,
                     message,
                 };
-                // "Log on send" trigger (RR73 sent).
-                let mut log = None;
-                if do_log {
-                    log = Some(self.completed());
-                    if let State::Active(a) = &mut self.state {
-                        a.logged = true;
-                        a.log_on_tx = false;
-                    }
+                // "Log on send" trigger (RR73 sent): the record was built above; mark
+                // the contact logged so it fires only once.
+                if log.is_some()
+                    && let State::Active(a) = &mut self.state
+                {
+                    a.logged = true;
+                    a.log_on_tx = false;
                 }
                 // Apply any queued transition now that the message is on the air.
                 if let Some(finish) = finish {
@@ -956,18 +963,11 @@ impl Engine {
         }
     }
 
-    /// Build the completed-QSO record from the active contact.
-    fn completed(&self) -> CompletedQso {
-        let State::Active(a) = &self.state else {
-            // Only ever called while active.
-            return CompletedQso {
-                call: Callsign(String::new()),
-                grid: None,
-                section: None,
-                exchange_sent: String::new(),
-                exchange_rcvd: String::new(),
-            };
-        };
+    /// Build the completed-QSO record from the given active contact. Taking the
+    /// `&Active` the caller already holds (rather than re-reading `self.state`) makes
+    /// "we're active" an invariant the caller proves — so the old empty-callsign
+    /// escape hatch is gone.
+    fn completed(&self, a: &Active) -> CompletedQso {
         let (sent, rcvd) = if self.me.is_field_day() {
             let sent = format!("{} {}", self.me.fd_class, self.me.fd_section.0);
             let rcvd = a
