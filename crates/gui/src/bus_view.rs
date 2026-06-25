@@ -227,13 +227,18 @@ impl BusView {
         let _guard = rt.enter();
         // Real rig + decode + clock + logbook + band-scanner producers — `core::spawn`
         // covers them all (the scanner is real too). The decode stream is the real decoder's.
-        let control = app_core::spawn(&bus, settings.core_config());
+        // The configured multi-op identity lives in the core config; pull it out before
+        // `spawn` consumes the config so the QSO engine stamps the same `station_id`.
+        let core_config = settings.core_config();
+        let station_id = core_config.station_id.clone();
+        let control = app_core::spawn(&bus, core_config);
 
-        // The QSO engine is logic, not hardware — it runs in both modes, driven
-        // by whichever decode/clock producers are live, serving `qso/{id}/command`
-        // and publishing `QsoState`. It auto-sends in real mode (a rig + the PTT
-        // interlock are present); in mock mode it sequences but never keys.
-        let qso_control = qso::spawn(&bus, app_core::radio_id(), station, true);
+        // The QSO engine is logic, not hardware — driven by whichever decode/clock
+        // producers are live, serving `qso/{id}/command` and publishing `QsoState`.
+        // It auto-sends when a rig + the PTT interlock are present (the operator
+        // still keys explicitly per over). `station_id` is the single configured
+        // identity stamped as the `origin` on every logged contact.
+        let qso_control = qso::spawn(&bus, app_core::radio_id(), station, station_id, true);
 
         pump_state(
             &bus,

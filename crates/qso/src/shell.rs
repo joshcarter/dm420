@@ -82,11 +82,17 @@ impl QsoControl {
 }
 
 /// Launch the QSO engine for `radio` onto `bus`. Must be called from within a
-/// tokio runtime (like `core::spawn` / `mocks::spawn`).
+/// tokio runtime (like `core::spawn`).
+///
+/// `station_id` is the configured multi-op identity (`CoreConfig.station_id`),
+/// stamped as the `origin` on every logged contact. It is **separate from the
+/// callsign** in `station`: a shared club call can't tell operators apart, so the
+/// stable configured id is what tags "who logged this," not the (editable) call.
 pub fn spawn(
     bus: &BusHandle,
     radio: RadioId,
     station: StationConfig,
+    station_id: StationId,
     allow_transmit: bool,
 ) -> QsoControl {
     let shared = Arc::new(Mutex::new(station.clone()));
@@ -95,8 +101,16 @@ pub fn spawn(
         station: shared.clone(),
         hop: hop.clone(),
     };
-    tracing::info!(radio = ?radio, allow_transmit, "qso: engine spawned");
-    tokio::spawn(run(bus.clone(), radio, station, shared, hop, allow_transmit));
+    tracing::info!(radio = ?radio, station_id = ?station_id, allow_transmit, "qso: engine spawned");
+    tokio::spawn(run(
+        bus.clone(),
+        radio,
+        station,
+        station_id,
+        shared,
+        hop,
+        allow_transmit,
+    ));
     control
 }
 
@@ -104,6 +118,7 @@ async fn run(
     bus: BusHandle,
     radio: RadioId,
     station: StationConfig,
+    station_id: StationId,
     shared: Arc<Mutex<StationConfig>>,
     hop: Arc<Mutex<HopConfig>>,
     allow_transmit: bool,
@@ -225,7 +240,7 @@ async fn run(
         apply(
             &bus,
             &radio,
-            &station_call(&shared),
+            &station_id,
             &mut seq,
             step,
             allow_transmit,
@@ -402,10 +417,6 @@ fn build_log(
     }
 }
 
-fn station_call(shared: &Arc<Mutex<StationConfig>>) -> StationId {
-    StationId(shared.lock().unwrap().call.0.clone())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,6 +446,26 @@ mod tests {
         );
         assert_eq!(e.band, Band::B40m);
         assert_eq!(e.freq, AbsHz(7_074_000));
+    }
+
+    /// The configured `station_id` (threaded from `CoreConfig.station_id` through
+    /// `spawn`/`run` into `apply`'s `my_station`) is the `origin` stamped on the
+    /// logged contact — both the `LogEntry.origin` and the `QsoId` merge key — not
+    /// a callsign-derived value. This is the identity that flows config → log.
+    #[test]
+    fn build_log_stamps_origin_from_configured_station_id() {
+        let id = StationId("op-left".into());
+        let e = build_log(
+            done(),
+            RadioId("rig0".into()),
+            id.clone(),
+            7,
+            OverAirMode::Ft8,
+            Some(AbsHz(14_074_000)),
+        );
+        assert_eq!(e.origin, id, "LogEntry.origin carries the configured station_id");
+        assert_eq!(e.id.origin, id, "QsoId merge key carries it too");
+        assert_eq!(e.id.seq, 7);
     }
 
     /// With no `RigState` seen, fall back to the 20 m placeholder.
