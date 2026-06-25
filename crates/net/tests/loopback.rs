@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use bus::{BusHandle, Topic, TopicKind, TopicSelector};
 use net::{NetConfig, Service};
-use types::{StationId, StationSnapshot};
+use types::{RadioId, StationId, StationSnapshot};
 
 /// A loopback-only config: bind `127.0.0.1:0` (ephemeral), no discovery, no peers
 /// (cross-wired by the test once both ports are known).
@@ -24,6 +24,7 @@ fn loopback_cfg(station: &str) -> NetConfig {
         port: 0,
         manual_peers: vec![],
         enable_mdns: false,
+        radio: RadioId("rig0".into()),
     }
 }
 

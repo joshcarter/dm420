@@ -9,11 +9,13 @@
 //!
 //! Transport + discovery + the periodic [`StationSnapshot`] beacon: two instances
 //! find each other (mDNS or `DM420_PEERS`), exchange snapshots over UDP, and each
-//! re-publishes peers' snapshots onto `station/{id}/snapshot`. The snapshots carry
-//! an empty payload for now — wiring `working`/`heard`/`band_activity` from the bus
-//! is step 3, and the log-G-set anti-entropy loop (`LogDigest`/`LogRequest`/
-//! `LogReply`) is step 2. Those `Wire` variants are already declared so the wire
-//! format is stable; they're logged-and-ignored until then.
+//! re-publishes peers' snapshots onto `station/{id}/snapshot`. The beacon's
+//! `working` field is now populated from local bus state (the deconfliction
+//! [`WorkingTarget`] — band + TX offset + the call being worked; see
+//! [`beacon_loop`]); `heard`/`band_activity` are still empty, and the log-G-set
+//! anti-entropy loop (`LogDigest`/`LogRequest`/`LogReply`) is step 2. Those `Wire`
+//! variants are already declared so the wire format is stable; they're
+//! logged-and-ignored until then.
 
 #![forbid(unsafe_code)]
 
@@ -25,12 +27,17 @@ use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bus::{BusHandle, Topic};
+use bus::{BusError, BusHandle, BusMessage, Subscription, Topic, TopicSelector};
 use tokio::net::UdpSocket;
-use types::{StationId, StationSnapshot};
+use types::{Band, QsoState, RadioId, RigState, StationId, StationSnapshot, WorkingTarget};
 
 use crate::peers::Peers;
 use crate::wire::{Frame, Wire, PROTO_VERSION};
+
+/// Default radio id, matching `core::radio_id()` — there is exactly one radio today.
+/// Kept as a local literal so `net` stays free of a `core` dependency; production
+/// overrides it via `NetConfig.radio = core::radio_id()` when `core` wires the service.
+const DEFAULT_RADIO_ID: &str = "rig0";
 
 /// How often we beacon our [`StationSnapshot`] to known peers.
 const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(5);
@@ -54,6 +61,10 @@ pub struct NetConfig {
     pub manual_peers: Vec<SocketAddr>,
     /// Whether to run mDNS discovery (advertise + browse).
     pub enable_mdns: bool,
+    /// Which radio's live state (`qso/{radio}/state`, `radio/{radio}/rig_state`) the
+    /// beacon summarizes into its [`WorkingTarget`]. Supplied by the caller because
+    /// `net` doesn't depend on `core`; production sets it to `core::radio_id()`.
+    pub radio: RadioId,
 }
 
 impl NetConfig {
@@ -84,6 +95,7 @@ impl NetConfig {
             port,
             manual_peers,
             enable_mdns: true,
+            radio: RadioId(DEFAULT_RADIO_ID.into()),
         })
     }
 }
@@ -135,6 +147,7 @@ pub struct Service {
     peers: Peers,
     station: StationId,
     enable_mdns: bool,
+    radio: RadioId,
 }
 
 impl Service {
@@ -153,6 +166,7 @@ impl Service {
             peers,
             station: cfg.station,
             enable_mdns: cfg.enable_mdns,
+            radio: cfg.radio,
         })
     }
 
@@ -188,45 +202,125 @@ impl Service {
             self.station.clone(),
         ));
 
-        beacon_loop(self.socket, self.peers, self.station).await
+        beacon_loop(self.socket, self.peers, self.station, self.bus, self.radio).await
     }
 }
 
 /// Beacon our [`StationSnapshot`] to every known peer on a fixed interval, and
-/// age out peers we've stopped hearing. Step-1 snapshots carry an empty payload —
-/// we're proving transport + discovery; the bus-fed content lands in steps 2–3.
-async fn beacon_loop(socket: Arc<UdpSocket>, peers: Peers, station: StationId) -> std::io::Result<()> {
+/// age out peers we've stopped hearing. Step 3: the snapshot's `working` field
+/// carries our live [`WorkingTarget`] (band + TX offset + the call being worked),
+/// summarized from two **local-authority** State topics we only ever READ —
+/// `qso/{radio}/state` and `radio/{radio}/rig_state`. We never republish peer data
+/// onto those topics; the beacon is a one-way curated view of our own tuning.
+///
+/// The interval tick and the two State subscriptions are multiplexed with
+/// `tokio::select!`: a QsoState/RigState message refreshes the cache; the tick
+/// builds + sends the beacon from whatever is cached. A lagged sub is tolerated
+/// (State watches don't lag, but it's harmless to keep reading); a closed sub is
+/// retired (`None`) so a gone producer neither busy-spins nor stops the beacon.
+async fn beacon_loop(
+    socket: Arc<UdpSocket>,
+    peers: Peers,
+    station: StationId,
+    bus: BusHandle,
+    radio: RadioId,
+) -> std::io::Result<()> {
     let mut seq = 0u64;
     let mut tick = tokio::time::interval(SNAPSHOT_INTERVAL);
+
+    // Subscribe (State, Exact) to the two inputs. `.ok()` so a subscribe failure
+    // degrades to "no working target" rather than killing the beacon.
+    let mut qso_sub: Option<Subscription<QsoState>> = bus
+        .subscribe::<QsoState>(TopicSelector::Exact(Topic::QsoState(radio.clone())))
+        .ok();
+    let mut rig_sub: Option<Subscription<RigState>> = bus
+        .subscribe::<RigState>(TopicSelector::Exact(Topic::RigState(radio.clone())))
+        .ok();
+
+    let mut last_qso: Option<QsoState> = None;
+    let mut last_rig: Option<RigState> = None;
+
     loop {
-        tick.tick().await;
-        seq += 1;
-        let snap = StationSnapshot {
-            station: station.clone(),
-            seq,
-            working: None,
-            band_activity: vec![],
-            heard: vec![],
-        };
-        let frame = Frame {
-            version: PROTO_VERSION,
-            from: station.clone(),
-            msg: Wire::Snapshot(snap),
-        };
-        match wire::encode(&frame) {
-            Ok(bytes) => {
-                for addr in peers.targets() {
-                    if let Err(e) = socket.send_to(&bytes, addr).await {
-                        tracing::debug!(%addr, error = %e, "net: beacon send failed");
+        tokio::select! {
+            _ = tick.tick() => {
+                seq += 1;
+                let snap = StationSnapshot {
+                    station: station.clone(),
+                    seq,
+                    working: assemble_working(&last_qso, &last_rig, &radio),
+                    band_activity: vec![],
+                    heard: vec![],
+                };
+                let frame = Frame {
+                    version: PROTO_VERSION,
+                    from: station.clone(),
+                    msg: Wire::Snapshot(snap),
+                };
+                match wire::encode(&frame) {
+                    Ok(bytes) => {
+                        for addr in peers.targets() {
+                            if let Err(e) = socket.send_to(&bytes, addr).await {
+                                tracing::debug!(%addr, error = %e, "net: beacon send failed");
+                            }
+                        }
                     }
+                    Err(e) => tracing::warn!(error = %e, "net: snapshot encode failed"),
+                }
+                for dropped in peers.expire(PEER_TTL, Instant::now()) {
+                    tracing::info!(station = %dropped.0, "net: peer timed out");
                 }
             }
-            Err(e) => tracing::warn!(error = %e, "net: snapshot encode failed"),
-        }
-        for dropped in peers.expire(PEER_TTL, Instant::now()) {
-            tracing::info!(station = %dropped.0, "net: peer timed out");
+            r = recv_cached(&mut qso_sub) => match r {
+                Ok(v) => last_qso = Some(v),
+                Err(BusError::Lagged { .. }) => {} // keep reading
+                Err(_) => qso_sub = None,          // producer gone — stop polling, keep beaconing
+            },
+            r = recv_cached(&mut rig_sub) => match r {
+                Ok(v) => last_rig = Some(v),
+                Err(BusError::Lagged { .. }) => {}
+                Err(_) => rig_sub = None,
+            },
         }
     }
+}
+
+/// Await the next value from an optional State subscription. When the sub is
+/// `None` (never created, or retired after a close) this never resolves, so the
+/// `select!` arm stays inert instead of busy-spinning on a dead source.
+async fn recv_cached<M: BusMessage>(sub: &mut Option<Subscription<M>>) -> Result<M, BusError> {
+    match sub {
+        Some(s) => s.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Fold the latest cached `QsoState` (TX offset + partner) and `RigState` (dial
+/// freq → band) into the beacon's [`WorkingTarget`]. Pure; no I/O. Returns `None`
+/// until we have *both* a TX offset and a derivable band — we can't advertise a
+/// tuned position without them.
+///
+/// INTERIM: the band is derived here from `RigState.vfo` via the canonical
+/// [`Band::from_hz`]. Once the single-owner `OperatingState` producer (rework
+/// slice 2c) lands, this should read `OperatingState.band` directly instead of
+/// re-deriving the band from the rig's dial frequency.
+fn assemble_working(
+    last_qso: &Option<QsoState>,
+    last_rig: &Option<RigState>,
+    radio: &RadioId,
+) -> Option<WorkingTarget> {
+    // `tx_offset` is effectively always `Some` once the QSO engine is up, but treat
+    // a missing offset as "nothing to advertise yet".
+    let offset = last_qso.as_ref()?.tx_offset?;
+    let band = Band::from_hz(last_rig.as_ref()?.vfo)?;
+    // `partner` may be `None` (idle / armed-to-a-frequency): we still advertise the
+    // tuned position so idle operators are visible, not just active QSOs.
+    let call = last_qso.as_ref().and_then(|q| q.partner.clone());
+    Some(WorkingTarget {
+        radio: radio.clone(),
+        band,
+        offset,
+        call,
+    })
 }
 
 async fn recv_loop(socket: Arc<UdpSocket>, bus: BusHandle, peers: Peers, me: StationId) {
@@ -270,5 +364,76 @@ async fn recv_loop(socket: Arc<UdpSocket>, bus: BusHandle, peers: Peers, me: Sta
             // Log-sync (LogPush/LogDigest/LogRequest/LogReply) is step 2.
             other => tracing::trace!(?other, "net: log-sync frame (step 2)"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use types::{AbsHz, Callsign, Meters, OffsetHz, QsoPhase, RigMode};
+
+    fn qso(partner: Option<&str>, offset: Option<f32>) -> QsoState {
+        QsoState {
+            radio: RadioId(DEFAULT_RADIO_ID.into()),
+            phase: QsoPhase::Calling,
+            partner: partner.map(|c| Callsign(c.into())),
+            next_tx: None,
+            tx_offset: offset.map(OffsetHz),
+            offset_locked: false,
+        }
+    }
+
+    fn rig(vfo_hz: u64) -> RigState {
+        RigState {
+            radio: RadioId(DEFAULT_RADIO_ID.into()),
+            vfo: AbsHz(vfo_hz),
+            rig_mode: RigMode::UsbData,
+            ptt: false,
+            meters: Meters::default(),
+        }
+    }
+
+    // (a) offset + a derivable band present → Some with the right offset/band/call.
+    #[test]
+    fn assemble_some_when_offset_and_band() {
+        let radio = RadioId(DEFAULT_RADIO_ID.into());
+        let w = assemble_working(
+            &Some(qso(Some("N0JDC"), Some(1500.0))),
+            &Some(rig(14_074_000)), // 20 m
+            &radio,
+        )
+        .expect("offset + derivable band → Some");
+        assert_eq!(w.radio, radio);
+        assert_eq!(w.band, Band::B20m);
+        assert_eq!(w.offset, OffsetHz(1500.0));
+        assert_eq!(w.call, Some(Callsign("N0JDC".into())));
+    }
+
+    // (b) missing rig (no derivable band) → None.
+    #[test]
+    fn assemble_none_without_rig() {
+        let radio = RadioId(DEFAULT_RADIO_ID.into());
+        assert!(assemble_working(&Some(qso(Some("N0JDC"), Some(1500.0))), &None, &radio).is_none());
+    }
+
+    // (c) missing offset → None.
+    #[test]
+    fn assemble_none_without_offset() {
+        let radio = RadioId(DEFAULT_RADIO_ID.into());
+        assert!(
+            assemble_working(&Some(qso(Some("N0JDC"), None)), &Some(rig(14_074_000)), &radio)
+                .is_none()
+        );
+    }
+
+    // (d) partner None (idle / armed to a frequency) → Some with call: None.
+    #[test]
+    fn assemble_some_with_no_partner() {
+        let radio = RadioId(DEFAULT_RADIO_ID.into());
+        let w = assemble_working(&Some(qso(None, Some(1500.0))), &Some(rig(14_074_000)), &radio)
+            .expect("offset + band present even when idle → Some");
+        assert_eq!(w.call, None);
+        assert_eq!(w.band, Band::B20m);
+        assert_eq!(w.offset, OffsetHz(1500.0));
     }
 }
