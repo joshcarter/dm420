@@ -337,6 +337,90 @@ exchange, on both roles, and confirm the progression is identical to before.
 
 ---
 
+## The transition tables (tabular)
+
+The readable twin of the code in the appendix below — the same decisions, every
+value reconstructed from the four current sites in `engine.rs`. **Keep these and the
+code in sync.** Legend: *Reply* names the message we queue (with its WSJT-X `Tx`
+slot); *Progress* is the descriptive label set on the contact; *step* is the
+display-only number published in `QsoState`; *Log* is when the contact is written
+(`on send` = when the queued message transmits; `on receive` = immediately);
+*Settle* is what happens after (`stay`, `finish → Idle/ResumeCq` after the message
+goes out, or `resume CQ now`). Addressing (`to`/`from`/`caller`) is checked by the
+routing sites *before* these tables, so it doesn't appear as a column.
+
+### Table A — openers: a station answered our CQ → we become `CallingCq`
+
+Shared by `commit_from_cq` and `resume_from`'s opener path. All openers `Log: —`
+and `Settle: stay`.
+
+| Contest | Received | Reply (we send) | Progress | step | Capture |
+|---|---|---|---|---|---|
+| Standard | `Grid(g)` | report — `Tx2` | `Report` | 1 | their grid |
+| Standard | `Report(r)` *(P3 skip-Tx1)* | roger+report — `Tx3` | `RogerReport` | 2 | their report |
+| Field Day | `FdBare{class,sec}` | roger+exchange — `Tx3` (`R 3A WI`) | `RogerReport` | 1 | their class+section |
+| *either* | any other kind — wrong-contest opener, `RogerReport`, `FdRoger`, `Signoff`, `Cq`, free/raw | **— ignore → stay `Calling`** | | | |
+
+### Table B — armed answer: our target called CQ → we become `Answering`
+
+`commit_from_armed`, after checking `caller == target`. All `Log: —`, `Settle: stay`.
+
+| Contest | Trigger | Reply (we send) | Progress | step | Capture |
+|---|---|---|---|---|---|
+| Standard | target's `Cq` | grid — `Tx1` (`answer_grid`) | `Replying` | 1 | target's grid |
+| Field Day | target's `Cq FD` | exchange — `Tx2` (`fd_exchange`, no grid) | `Replying` | 1 | target's grid |
+| *either* | target answers **someone else** | **— stay `Armed`** (receive-only) | | | |
+
+### Table C — advance a committed contact
+
+`advance_active`, after the addressing / lost-race (`abandon`) pre-check — so every
+row here is a directed message from our partner.
+
+| Role | Contest | Received | Reply (we send) | Progress | step | Capture | Log | Settle |
+|---|---|---|---|---|---|---|---|---|
+| Answering | Standard | `Report(r)` | roger+report — `Tx3` | `RogerReport` | 2 | their report | — | stay |
+| Answering | Field Day | `FdRoger{…}` | `RR73` — `Tx4` | `Rogers` | 2 | their class+section | **on send** | finish → Idle |
+| CallingCq | Standard | `RogerReport(r)` | `RR73` — `Tx4` | `Rogers` | 2 | their report | **on send** | stay |
+| *any* | *any* | `Signoff(k)` | *see Table D* | `Signoff` | 3 | — | **on receive** | *see Table D* |
+| *any* | *any* | any other kind | **— ignore**: repeat current message; the give-up counter climbs → eventually time out | | | | | |
+
+### Table D — sign-off: any directed `RRR`/`RR73`/`73` from our partner (P2)
+
+`signoff_outcome`. Logs **on receive** if not already logged. `courtesy = role is
+Answering, OR (Field Day AND the sign-off is a roger RR73/RRR)`.
+
+| Side we're on | Sign-off | Courtesy reply | Settle |
+|---|---|---|---|
+| Answering (Standard or Field Day) | any (`RRR`/`RR73`/`73`) | `73` — `Tx5` | finish → Idle |
+| CallingCq, Field Day | `RR73` / `RRR` (a roger) | `73` — `Tx5` | finish → ResumeCq |
+| CallingCq, Field Day | bare `73` (non-roger) | — | resume CQ now |
+| CallingCq, Standard | any (already logged on RR73-sent) | — | resume CQ now |
+
+### Table E — resume role-inference
+
+`resume_from` first infers which side we're on from the clicked line (Standard and
+Field Day reverse the side that holds `RR73`), then routes into Table A or C.
+
+| Contest | Clicked line | Inferred role | Routed to |
+|---|---|---|---|
+| Standard | `Grid` | CallingCq | Table A (opener) |
+| Standard | `RogerReport` | CallingCq | Table C |
+| Standard | `Report` | Answering | Table C |
+| Standard | `RR73` / `RRR` | Answering | Table C/D (completes) |
+| Field Day | `FdBare` | CallingCq | Table A (opener) |
+| Field Day | `FdRoger` | Answering | Table C |
+| Field Day | `RR73` / `RRR` | CallingCq | Table C/D (completes) |
+| *either* | bare `73`, contest-mismatched opener, `Cq`, free/raw | — | **not resumable — ignored** |
+
+> **Note the known asymmetry** (Tables A vs E): a bare `Report` addressed to us is
+> read as **CallingCq** when it arrives while we're calling CQ (Table A, the P3
+> opener) but as **Answering** when the operator *resumes* from it (Table E). The
+> endings differ — CQ side resumes CQ with no final `73`; answering side sends `73`
+> and goes idle. This is **preserved as-is** by the refactor (pinned by the
+> `report_to_us_diverges_entry_vs_resume` test); unifying it is a separate question.
+
+---
+
 ## Appendix — the code: `Progress` and the transition tables
 
 > **Proposed shape, ahead of implementation.** This is the design written out
