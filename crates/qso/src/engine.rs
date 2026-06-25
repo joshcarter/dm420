@@ -306,6 +306,18 @@ enum Transition {
     Act(Outcome),
 }
 
+/// The triggering context for building a fresh contact — the facts only the commit
+/// site has (who answered, where, which slot, our report of them). Paired with an
+/// opener [`Outcome`] by [`Engine::open_at`].
+struct Seed {
+    role: Role,
+    partner: Callsign,
+    target: Option<DecodeRef>,
+    offset: OffsetHz,
+    tx_parity: u8,
+    snr: i8,
+}
+
 /// Armed → answering: our target finally called CQ. The opener is fixed (our grid in
 /// Standard, our FD exchange in Field Day — see [`Engine::opener`]); we capture the
 /// target's grid from its CQ. Used by the armed trigger after it checks
@@ -689,98 +701,28 @@ impl Engine {
         offset: OffsetHz,
         tx_parity: Option<u8>,
     ) -> Option<CompletedQso> {
-        let parity = tx_parity.unwrap_or(0);
-        match msg {
-            // Standard: a caller answered with their grid (Tx1).
-            ParsedMessage::Exchange {
-                to,
-                from,
-                payload: ExchangePayload::Grid(grid),
-            } if to == &self.me.call && !self.me.is_field_day() => {
-                let reply = message::report(&self.me, from, snr);
-                self.state = State::Active(Box::new(Active {
-                    role: Role::CallingCq,
-                    partner: from.clone(),
-                    target: None,
-                    offset,
-                    tx_parity: parity,
-                    next: Some(reply),
-                    finish_after_tx: None,
-                    log_on_tx: false,
-                    logged: false,
-                    step: 1,
-                    partner_grid: Some(grid.clone()),
-                    partner_snr: snr,
-                    rcvd_report: None,
-                    rcvd_fd: None,
-                    overs_since_progress: 0,
-                }));
-                None
-            }
-            // Standard (P3): a caller skipped the grid and answered with a bare
-            // signal report (the Tx2-style "skip-Tx1" opening, common in pile-ups
-            // and POTA). Roger it and send our report (Tx3) — WSJT-X's jump-ahead.
-            // We complete when they roger us (their `RR73`, via `advance_active`).
-            // Field Day stays exclusive (no report openers — see A3 of the doc).
-            ParsedMessage::Exchange {
-                to,
-                from,
-                payload: ExchangePayload::Report(r),
-            } if to == &self.me.call && !self.me.is_field_day() => {
-                let reply = message::roger_report(&self.me, from, snr);
-                self.state = State::Active(Box::new(Active {
-                    role: Role::CallingCq,
-                    partner: from.clone(),
-                    target: None,
-                    offset,
-                    tx_parity: parity,
-                    next: Some(reply),
-                    finish_after_tx: None,
-                    log_on_tx: false,
-                    logged: false,
-                    step: 2,
-                    partner_grid: None,
-                    partner_snr: snr,
-                    rcvd_report: Some(*r),
-                    rcvd_fd: None,
-                    overs_since_progress: 0,
-                }));
-                None
-            }
-            // Field Day: a caller answered with their bare exchange (Tx2). We
-            // reply with the combined roger+exchange (Tx3).
-            ParsedMessage::Exchange {
-                to,
-                from,
-                payload:
-                    ExchangePayload::FieldDay {
-                        class,
-                        section,
-                        rogered: false,
-                    },
-            } if to == &self.me.call && self.me.is_field_day() => {
-                let reply = message::fd_roger_exchange(&self.me, from);
-                self.state = State::Active(Box::new(Active {
-                    role: Role::CallingCq,
-                    partner: from.clone(),
-                    target: None,
-                    offset,
-                    tx_parity: parity,
-                    next: Some(reply),
-                    finish_after_tx: None,
-                    log_on_tx: false,
-                    logged: false,
-                    step: 1,
-                    partner_grid: None,
-                    partner_snr: snr,
-                    rcvd_report: None,
-                    rcvd_fd: Some((class.clone(), section.clone())),
-                    overs_since_progress: 0,
-                }));
-                None
-            }
-            _ => None,
+        // Only a line addressed to us answers our CQ (lifted from the old per-arm
+        // `to == me` guards); a CQ / free text / a line to someone else opens nothing.
+        let (to, from) = addressed(msg)?;
+        if to != &self.me.call {
+            return None;
         }
+        // The `open` table decides which opener this is (grid / P3 report / FD bare),
+        // or `None` to stay calling CQ — replacing the three arms and their `_ => None`.
+        if let Some((role, o)) = open(self.me.is_field_day(), MsgKind::classify(msg)) {
+            self.open_at(
+                Seed {
+                    role,
+                    partner: from.clone(),
+                    target: None,
+                    offset,
+                    tx_parity: tx_parity.unwrap_or(0),
+                    snr,
+                },
+                o,
+            );
+        }
+        None
     }
 
     /// Pick up a contact mid-stream from a decode the operator clicked, when the
@@ -1005,6 +947,42 @@ impl Engine {
             a.overs_since_progress = 0;
         }
         done
+    }
+
+    /// Build a fresh committed contact from an opener [`Outcome`] + its [`Seed`]
+    /// context — the single place an *entering* contact is constructed, shared by the
+    /// CQ-side commit, the armed trigger, and the resume opener path. Openers queue a
+    /// first reply and then wait; we honor whatever `log`/`settle` the table carries
+    /// (today every opener is `Never` / `StayActive`, so these start cleared).
+    fn open_at(&mut self, seed: Seed, o: Outcome) {
+        let next = self.materialize(o.reply, &seed.partner, seed.snr);
+        let mut a = Active {
+            role: seed.role,
+            partner: seed.partner,
+            target: seed.target,
+            offset: seed.offset,
+            tx_parity: seed.tx_parity,
+            next,
+            finish_after_tx: match o.settle {
+                Settle::FinishOnSend(f) => Some(f),
+                _ => None,
+            },
+            log_on_tx: matches!(o.log, LogWhen::OnSend),
+            logged: false,
+            step: o.step,
+            partner_grid: None,
+            partner_snr: seed.snr,
+            rcvd_report: None,
+            rcvd_fd: None,
+            overs_since_progress: 0,
+        };
+        match &o.capture {
+            Capture::None => {}
+            Capture::Grid(g) => a.partner_grid = g.clone(),
+            Capture::Report(r) => a.rcvd_report = Some(*r),
+            Capture::Fd(class, section) => a.rcvd_fd = Some((class.clone(), section.clone())),
+        }
+        self.state = State::Active(Box::new(a));
     }
 
     /// Lost the race mid-QSO: stop, and re-arm (answering) or resume CQ.
