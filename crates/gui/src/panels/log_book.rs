@@ -106,7 +106,7 @@ impl Panel for LogBook {
             let grid = e.grid.as_ref().map(|g| g.0.as_str()).unwrap_or("----");
             // Mine vs. peer: a peer's row renders identically to mine — same colors,
             // no tint — except for a single ↔-led station-id badge past the callsign,
-            // the same "accent2 = someone else, not me" language the waterslide's
+            // the same "accent = someone else, not me" language the waterslide's
             // deconfliction overlay uses (heard ≠ mine), dialed back to one quiet marker.
             let mine = e.id.origin.0.as_str() == my_id;
             painter.text(
@@ -130,16 +130,16 @@ impl Panel for LogBook {
             if !mine {
                 let badge_x = call_rect.right() + 6.0;
                 let full = format!("\u{2194} {}", e.id.origin.0);
-                let galley = painter.layout_no_wrap(full, mono(8.0), pal.accent2);
+                let galley = painter.layout_no_wrap(full, mono(10.0), pal.accent);
                 let badge = if badge_x + galley.size().x <= x_grid - 6.0 {
                     galley
                 } else {
-                    painter.layout_no_wrap("\u{2194}".to_owned(), mono(8.0), pal.accent2)
+                    painter.layout_no_wrap("\u{2194}".to_owned(), mono(10.0), pal.accent)
                 };
                 painter.galley(
                     Pos2::new(badge_x, ry - badge.size().y * 0.5),
                     badge,
-                    pal.accent2,
+                    pal.accent,
                 );
             }
             painter.text(
