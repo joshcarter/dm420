@@ -153,6 +153,13 @@ pub struct BusView {
     /// Latest QSO-engine state (phase, partner, queued next message). Drives the
     /// FT8 send row.
     qso: Cell<QsoState>,
+    /// Latest published selection (`selection/{id}/active`) — the single owner of
+    /// "which station/decode the operator picked". Written by both the Digital and
+    /// Contacts panels via [`Self::select`] and read back by both (and the Call Sign
+    /// panel) for their highlight; the Digital panel reads it to drive arm + offset.
+    /// Pumped now; its panel readers land in the map/Digital wiring commits.
+    #[allow(dead_code)]
+    selection: Cell<Selection>,
     /// Latest health per hardware subsystem (real mode only). Drives the panels'
     /// fault display when a device is missing or disconnected.
     health: Arc<Mutex<HashMap<SubsystemId, SubsystemHealth>>>,
@@ -194,6 +201,7 @@ impl BusView {
         let clock = cell();
         let worked = cell();
         let qso = cell();
+        let selection = cell();
         let bands: Arc<Mutex<Vec<BandActivity>>> = Arc::new(Mutex::new(Vec::new()));
         let logs = Ring::new(512);
         // Sized to hold every decode that can be on the waterslide at once: the panel
@@ -239,6 +247,15 @@ impl BusView {
             &bus,
             Topic::RigState(app_core::radio_id()),
             rig.clone(),
+            egui_ctx.clone(),
+        );
+        // The selection is published by this GUI (both panels write it via `select`);
+        // subscribing to our own topic round-trips it back so every panel reads one
+        // owned value, and the engine's echo never matters (it doesn't publish here).
+        pump_state(
+            &bus,
+            Topic::Selection(app_core::radio_id()),
+            selection.clone(),
             egui_ctx.clone(),
         );
         pump_spectrum(
@@ -288,6 +305,7 @@ impl BusView {
             decodes,
             heard,
             qso,
+            selection,
             health,
             control,
             qso_control,
@@ -544,6 +562,15 @@ impl BusView {
         self.qso.lock().unwrap().clone()
     }
 
+    /// The current published selection (who + where), if any — the single owner the
+    /// Digital + Contacts panels read for their highlight, and the Digital panel reads
+    /// to drive the arm target + the TX-offset / retune response. (Readers land in the
+    /// map/Digital wiring commits.)
+    #[allow(dead_code)]
+    pub fn selection(&self) -> Option<Selection> {
+        self.selection.lock().unwrap().clone()
+    }
+
     /// The engine-owned TX audio offset (Hz). The engine owns the offset, so this is
     /// the single source of truth for the TX lane / send preview. `None` only before
     /// the engine's first publish (the engine always reports `Some` once running).
@@ -716,17 +743,29 @@ impl BusView {
         }
     }
 
-    /// Publish the current selection (outgoing offset + optional target) onto the
-    /// `selection/{id}/active` State topic.
-    fn publish_selection(&self, offset_hz: f32, target: Option<DecodeRef>) {
+    /// Publish a selection (who + where) onto `selection/{id}/active` — the single
+    /// owner, written by both the Digital and Contacts panels and read back by both
+    /// (and the QSO engine). It records the operator's pick; it does **not** move the
+    /// TX offset (the Digital panel does that via [`Self::set_tx_offset`], engine-gated
+    /// by the lock) or retune the dial.
+    pub fn select(&self, target: Option<DecodeRef>, context: Option<SelectionContext>) {
         let _ = self.bus.publish(
             &Topic::Selection(app_core::radio_id()),
             Selection {
                 radio: app_core::radio_id(),
-                outgoing: OffsetHz(offset_hz),
                 target,
+                context,
             },
         );
+    }
+
+    /// Bridge used by the arming helpers below: record the selection (who + a
+    /// passband context for the panels' highlight) and place the engine-owned TX
+    /// offset. The offset reaches the engine via `SetTxOffset` (lock-gated), not the
+    /// selection — `Selection` no longer carries it.
+    fn publish_selection(&self, offset_hz: f32, target: Option<DecodeRef>) {
+        self.select(target, Some(SelectionContext::Passband(OffsetHz(offset_hz))));
+        self.set_tx_offset(offset_hz);
     }
 
     /// Fire a QSO command at the engine's command server. The engine reflects the

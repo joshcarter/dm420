@@ -410,15 +410,51 @@ impl Band {
 // §5  Selection + QSO
 // =====================================================================
 
-/// `selection/{id}/active` (State) — a gesture, not an action; the mode service
-/// interprets it. `target == None` is a bare retune (click in the FFT); `Some` is
-/// intent to work that decode (click on the text).
+/// `selection/{id}/active` (State) — which station/decode the operator has selected.
+/// A *gesture*, not an operating action: it records **who** is selected (`target`) and
+/// **where** they are (`context`). It is the single owner of the selection, written by
+/// both the Digital (waterslide) and Contacts (map) panels via one select command and
+/// read back by both for their highlight, by the Call Sign panel, and by the QSO
+/// engine for the arm target.
+///
+/// The Digital panel is the **single operating authority**: it turns a *new* selection
+/// into operating actions — set the TX offset (via [`QsoCommand::SetTxOffset`], which
+/// the engine gates on the lock) and retune the dial, but only when the station is
+/// outside the current passband *and* the offset is unlocked. The map is a pure
+/// select-input: it emits a selection and does nothing else (no offset, no retune, no
+/// lock awareness).
+///
+/// `target == None` is a bare-offset / deselect gesture (a click in empty spectrum, or
+/// CLEAR QSY); `Some` is intent to work that decode. The TX offset itself is **not**
+/// carried here — the QSO engine owns it; this only carries the freq/offset *context*
+/// the Digital panel needs to place it.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Selection {
     pub radio: RadioId,
-    /// Where the next TX audio is tuned.
-    pub outgoing: OffsetHz,
+    /// The selected decode (the station to work), or `None` for a bare-offset gesture
+    /// / deselect.
     pub target: Option<DecodeRef>,
+    /// Where the selection is, so the Digital panel can place the TX offset and decide
+    /// a retune. `None` = select-by-call with no known frequency (a worked-only map
+    /// spot): select the station, move nothing.
+    pub context: Option<SelectionContext>,
+}
+
+/// The freq/offset *context* of a [`Selection`] — where the selected lane/station is,
+/// for the Digital panel to set the TX offset and decide whether to retune the dial.
+/// Deliberately **not** the TX offset: the QSO engine owns the offset (set via
+/// [`QsoCommand::SetTxOffset`], lock-enforced); this only says where the operator
+/// pointed so the single operating handler can react.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub enum SelectionContext {
+    /// A lane already inside the current passband — a waterslide click, a bare-offset
+    /// gesture, or CLEAR QSY. The Digital panel sets the TX offset here; no retune.
+    Passband(OffsetHz),
+    /// A station at a known absolute frequency — a Contacts-map pick (the map knows
+    /// where it was heard/logged, but has no passband awareness). The Digital panel
+    /// computes the in-passband offset, or — when unlocked — retunes the dial so the
+    /// station lands mid-passband.
+    AbsFreq(AbsHz),
 }
 
 /// Stable handle so a selection survives the decode batch it came from.
@@ -1196,12 +1232,28 @@ mod tests {
     fn selection_and_qso_round_trip() {
         round_trip(Selection {
             radio: RadioId("k1".into()),
-            outgoing: OffsetHz(1500.0),
             target: Some(DecodeRef {
                 radio: RadioId("k1".into()),
                 slot: SlotId(42),
                 call: Some(Callsign("N0JDC".into())),
             }),
+            context: Some(SelectionContext::Passband(OffsetHz(1500.0))),
+        });
+        // A map pick carries an absolute frequency; a bare-offset / select-by-call
+        // gesture carries no context.
+        round_trip(Selection {
+            radio: RadioId("k1".into()),
+            target: Some(DecodeRef {
+                radio: RadioId("k1".into()),
+                slot: SlotId(3),
+                call: Some(Callsign("W4LL".into())),
+            }),
+            context: Some(SelectionContext::AbsFreq(AbsHz(14_075_500))),
+        });
+        round_trip(Selection {
+            radio: RadioId("k1".into()),
+            target: None,
+            context: None,
         });
         round_trip(QsoCommand::Start {
             target: DecodeRef {

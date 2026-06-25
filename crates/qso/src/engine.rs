@@ -28,8 +28,10 @@ use crate::message::{self, StationConfig};
 pub enum Event {
     /// Operator command from `qso/{id}/command`.
     Command(QsoCommand),
-    /// The current selection from `selection/{id}/active` (carries our outgoing
-    /// offset; the target is conveyed separately by [`QsoCommand::Start`]).
+    /// The current selection from `selection/{id}/active` — who the operator picked.
+    /// It only records the [`Selection::target`]; the TX offset is **not** carried
+    /// here (the engine owns the offset, moved via [`QsoCommand::SetTxOffset`]), and
+    /// the arm itself still arrives as [`QsoCommand::Start`].
     Select(Selection),
     /// An inbound decode from `radio/{id}/decodes`. The engine filters relevance.
     Decode(Decode),
@@ -178,9 +180,15 @@ pub struct Engine {
     timed_out: Option<Callsign>,
     /// TX offset frozen by the operator. The engine is the **sole owner** of the
     /// offset; this is the **one place** the lock is enforced — while set, the engine
-    /// ignores every offset write (operator [`Event::Select`] / [`QsoCommand::SetTxOffset`])
-    /// *and* its own auto-QSY hop, so a locked offset never moves. "Freeze everything."
+    /// ignores every offset write ([`QsoCommand::SetTxOffset`]) *and* its own auto-QSY
+    /// hop, so a locked offset never moves. "Freeze everything."
     offset_locked: bool,
+    /// The operator's current selection target, from [`Event::Select`] — who they
+    /// last picked on the waterslide or the map. The single owner's view of the
+    /// selection; recorded for observability (and future arm-from-selection work).
+    /// Arming today still flows through [`QsoCommand::Start`], so this doesn't drive
+    /// behavior on its own — it never moves the offset (the engine owns that).
+    selected: Option<DecodeRef>,
 }
 
 impl Engine {
@@ -196,6 +204,7 @@ impl Engine {
             next_cq_offset: None,
             timed_out: None,
             offset_locked: false,
+            selected: None,
         }
     }
 
@@ -214,6 +223,12 @@ impl Engine {
         self.next_cq_offset = offset;
     }
 
+    /// The operator's current selection target (from the last [`Event::Select`]), or
+    /// `None` if nothing is selected. The engine's view of the single-owner selection.
+    pub fn selected(&self) -> Option<&DecodeRef> {
+        self.selected.as_ref()
+    }
+
     /// The current published state, without stepping (for an initial snapshot).
     pub fn state(&self) -> QsoState {
         self.snapshot()
@@ -225,13 +240,12 @@ impl Engine {
         let mut log = None;
         match event {
             Event::Command(cmd) => log = self.on_command(cmd),
-            // The Selection topic is also an offset write, so it obeys the same lock:
-            // the engine is the sole enforcer, so no offset path (selection gesture or
-            // command) can move a frozen offset.
+            // A selection records *who* the operator picked — nothing else. It no
+            // longer carries the TX offset (the engine owns the offset, moved only via
+            // `SetTxOffset`), so it never touches `outgoing`, locked or not. Placing
+            // the offset is the Digital panel's job (it sends `SetTxOffset`).
             Event::Select(sel) => {
-                if !self.offset_locked {
-                    self.outgoing = sel.outgoing;
-                }
+                self.selected = sel.target;
             }
             Event::Decode(d) => log = self.on_decode(d),
             Event::Tick { slot } => {
@@ -346,9 +360,10 @@ impl Engine {
         let target = target.clone();
         match msg {
             // The target called CQ — answer in the opposite slot at our chosen TX
-            // offset (self.outgoing), which the UI set via the Selection topic when
-            // the operator armed. Using the target's decoded offset here would
-            // ignore a locked audio offset and transmit on the wrong frequency.
+            // offset (self.outgoing), the engine-owned offset the Digital panel set
+            // via `SetTxOffset` when the operator selected this target. Using the
+            // target's decoded offset here would ignore a locked audio offset and
+            // transmit on the wrong frequency.
             ParsedMessage::Cq { caller, grid, .. } if Some(caller) == target.call.as_ref() => {
                 tracing::info!(target = ?caller, tx_offset = ?self.outgoing, "qso engine: target called CQ → answering");
                 let opener = self.opener(caller);
@@ -1055,7 +1070,7 @@ fn is_roger(kind: Signoff) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use types::{ContestProfile, OverAirMode, SignalSource, Timestamp};
+    use types::{ContestProfile, OverAirMode, SelectionContext, SignalSource, Timestamp};
 
     const ME: &str = "W9XYZ";
     const HIM: &str = "K1ABC";
@@ -1478,6 +1493,41 @@ mod tests {
         e.step(Event::Command(QsoCommand::SetTxOffset(OffsetHz(1800.0))));
         assert_eq!(cq_offset(&mut e, 2), OffsetHz(1800.0), "live Calling.offset moved");
         assert_eq!(e.state().tx_offset, Some(OffsetHz(1800.0)));
+    }
+
+    /// A selection records the operator's target and **never** moves the engine-owned
+    /// TX offset — not even unlocked (the path that used to adopt `Selection.outgoing`).
+    /// The offset now flows solely through `SetTxOffset`; `Select` only says *who*.
+    #[test]
+    fn select_sets_target_and_never_moves_offset() {
+        let mut e = engine(ContestProfile::Standard);
+        assert_eq!(e.selected(), None);
+        let target = DecodeRef {
+            radio: RadioId("rig0".into()),
+            slot: SlotId(3),
+            call: Some(call(HIM)),
+        };
+        // Unlocked, with a freq context present: the target is recorded, the offset
+        // stays put (the context is the panel's to act on, not the engine's).
+        e.step(Event::Select(Selection {
+            radio: RadioId("rig0".into()),
+            target: Some(target.clone()),
+            context: Some(SelectionContext::Passband(OffsetHz(2300.0))),
+        }));
+        assert_eq!(e.selected(), Some(&target), "selection records the target");
+        assert_eq!(
+            e.state().tx_offset,
+            Some(OffsetHz(1500.0)),
+            "selection must not move the engine-owned offset",
+        );
+        // A bare-offset selection (no target) clears it; still no offset move.
+        e.step(Event::Select(Selection {
+            radio: RadioId("rig0".into()),
+            target: None,
+            context: Some(SelectionContext::Passband(OffsetHz(900.0))),
+        }));
+        assert_eq!(e.selected(), None, "a bare-offset selection clears the target");
+        assert_eq!(e.state().tx_offset, Some(OffsetHz(1500.0)));
     }
 
     /// Unlocking re-enables movement: a write rejected while locked applies once the
