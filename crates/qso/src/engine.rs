@@ -252,6 +252,206 @@ enum Reply {
     Seven3,
 }
 
+/// Which captured fact a transition records from the received message (for the log).
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq)]
+enum Capture {
+    None,
+    Grid(Option<GridSquare>),
+    Report(i8),
+    Fd(String, Section),
+}
+
+/// When a transition logs the contact. `OnSend` is today's `log_on_tx` (log when the
+/// queued message transmits); `OnReceive` fires immediately on a received sign-off.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LogWhen {
+    Never,
+    OnSend,
+    OnReceive,
+}
+
+/// What to do once the reply is queued. `FinishOnSend` is today's `finish_after_tx`
+/// (applied after the message goes out); `ResumeCqNow` resumes CQ immediately.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Settle {
+    StayActive,
+    FinishOnSend(Finish),
+    ResumeCqNow,
+}
+
+/// One transition's full consequence — pure data the engine then materializes (the
+/// reply) and applies (the fields). `step` is carried, not derived from `progress`, to
+/// keep the published display number byte-identical.
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq)]
+struct Outcome {
+    reply: Reply,
+    progress: Progress,
+    step: u8,
+    capture: Capture,
+    log: LogWhen,
+    settle: Settle,
+}
+
+/// The result of advancing a committed contact: `Ignore` is the old silent `_ => None`
+/// made explicit (leave the contact untouched; it repeats and the give-up counter
+/// climbs toward the timeout).
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq)]
+enum Transition {
+    Ignore,
+    Act(Outcome),
+}
+
+/// Armed → answering: our target finally called CQ. The opener is fixed (our grid in
+/// Standard, our FD exchange in Field Day — see [`Engine::opener`]); we capture the
+/// target's grid from its CQ. Used by the armed trigger after it checks
+/// `caller == target`.
+#[allow(dead_code)]
+fn answer_opener(target_grid: Option<GridSquare>) -> Outcome {
+    Outcome {
+        reply: Reply::Opener,
+        progress: Progress::Replying,
+        step: 1,
+        capture: Capture::Grid(target_grid),
+        log: LogWhen::Never,
+        settle: Settle::StayActive,
+    }
+}
+
+/// A station answered our CQ (we become `CallingCq`). Shared by the CQ-side commit and
+/// the resume opener path; both have already checked the line is `to == me`. `None`
+/// means "not an opener" → stay calling CQ. **Exhaustive over `MsgKind` — no `_`**, so
+/// a new content variant fails to compile until it's classified here.
+#[allow(dead_code)]
+fn open(fd: bool, kind: MsgKind) -> Option<(Role, Outcome)> {
+    use MsgKind::*;
+    match kind {
+        // Standard: they answered with their grid (Tx1) → we send the report (Tx2).
+        Grid(g) if !fd => Some((
+            Role::CallingCq,
+            Outcome {
+                reply: Reply::Report,
+                progress: Progress::Report,
+                step: 1,
+                capture: Capture::Grid(Some(g)),
+                log: LogWhen::Never,
+                settle: Settle::StayActive,
+            },
+        )),
+        // Standard (P3 skip-Tx1): they opened with a bare report → roger it (Tx3).
+        Report(r) if !fd => Some((
+            Role::CallingCq,
+            Outcome {
+                reply: Reply::RogerReport,
+                progress: Progress::RogerReport,
+                step: 2,
+                capture: Capture::Report(r),
+                log: LogWhen::Never,
+                settle: Settle::StayActive,
+            },
+        )),
+        // Field Day: they answered with the bare exchange (Tx2) → roger+exchange (Tx3).
+        FdBare { class, section } if fd => Some((
+            Role::CallingCq,
+            Outcome {
+                reply: Reply::FdRogerExchange,
+                progress: Progress::RogerReport,
+                step: 1,
+                capture: Capture::Fd(class, section),
+                log: LogWhen::Never,
+                settle: Settle::StayActive,
+            },
+        )),
+        // Explicit holes — every variant named, no `_`. A wrong-contest opener, a
+        // roger-report / sign-off / CQ, or unclassified text opens no contact.
+        Grid(_) | Report(_) | FdBare { .. } | FdRoger { .. } | RogerReport(_)
+        | Signoff(_) | Cq { .. } | Other => None,
+    }
+}
+
+/// Advance a committed contact. Role comes from the contact; the addressing /
+/// lost-race (`abandon`) pre-check has already run, so this is a directed message from
+/// our partner. **Exhaustive over `MsgKind` — `Ignore` is the explicit no-op** that
+/// used to be a silent `_ => None`.
+#[allow(dead_code)]
+fn advance(role: Role, fd: bool, kind: MsgKind) -> Transition {
+    use MsgKind::*;
+    use Role::*;
+    match kind {
+        // Standard, answering side: their report → roger+report (Tx3).
+        Report(r) if role == Answering && !fd => Transition::Act(Outcome {
+            reply: Reply::RogerReport,
+            progress: Progress::RogerReport,
+            step: 2,
+            capture: Capture::Report(r),
+            log: LogWhen::Never,
+            settle: Settle::StayActive,
+        }),
+        // Field Day, answering side: their R+exchange → RR73; log on send, then idle.
+        FdRoger { class, section } if role == Answering && fd => Transition::Act(Outcome {
+            reply: Reply::Rr73,
+            progress: Progress::Rogers,
+            step: 2,
+            capture: Capture::Fd(class, section),
+            log: LogWhen::OnSend,
+            settle: Settle::FinishOnSend(Finish::Idle),
+        }),
+        // Standard, CQ side: their R-report → RR73; log on send (then hold for a 73).
+        RogerReport(r) if role == CallingCq && !fd => Transition::Act(Outcome {
+            reply: Reply::Rr73,
+            progress: Progress::Rogers,
+            step: 2,
+            capture: Capture::Report(r),
+            log: LogWhen::OnSend,
+            settle: Settle::StayActive,
+        }),
+        // Any directed sign-off completes the contact (P2).
+        Signoff(k) => Transition::Act(signoff_outcome(role, fd, k)),
+        // Explicit holes — every variant named, no `_`. A repeated / wrong-phase /
+        // contest-mismatched / non-advancing message is ignored.
+        Report(_) | RogerReport(_) | FdBare { .. } | FdRoger { .. } | Grid(_)
+        | Cq { .. } | Other => Transition::Ignore,
+    }
+}
+
+/// The sign-off branch (P2): any directed `RRR`/`RR73`/`73` completes the contact. We
+/// send a courtesy `73` when we hold the courtesy slot (the answering side always, and
+/// the Field Day CQ side on their roger); otherwise we've already logged on RR73-sent
+/// (Standard CQ side) and just resume CQ. Logging-on-receive is gated on `!logged` by
+/// the applier reading the live contact, so it isn't decided here.
+#[allow(dead_code)]
+fn signoff_outcome(role: Role, fd: bool, k: Signoff) -> Outcome {
+    let courtesy = role == Role::Answering || (fd && is_roger(k));
+    if courtesy {
+        let finish = if role == Role::CallingCq {
+            Finish::ResumeCq
+        } else {
+            Finish::Idle
+        };
+        Outcome {
+            reply: Reply::Seven3,
+            progress: Progress::Signoff,
+            step: 3,
+            capture: Capture::None,
+            log: LogWhen::OnReceive,
+            settle: Settle::FinishOnSend(finish),
+        }
+    } else {
+        Outcome {
+            reply: Reply::None,
+            progress: Progress::Signoff,
+            step: 3,
+            capture: Capture::None,
+            log: LogWhen::OnReceive,
+            settle: Settle::ResumeCqNow,
+        }
+    }
+}
+
 /// The QSO engine for one radio.
 pub struct Engine {
     radio: RadioId,
@@ -2488,5 +2688,184 @@ mod tests {
             fd.materialize(Reply::FdRogerExchange, &him, -8).unwrap().text,
             "K1ABC W9XYZ R 3A WI"
         );
+    }
+
+    // ---- step 4: the pure transition tables (open / advance / signoff / answer)
+
+    fn fd_bare() -> MsgKind {
+        MsgKind::FdBare {
+            class: "2B".into(),
+            section: Section("IL".into()),
+        }
+    }
+    fn fd_roger() -> MsgKind {
+        MsgKind::FdRoger {
+            class: "2B".into(),
+            section: Section("IL".into()),
+        }
+    }
+
+    #[test]
+    fn open_table_every_cell() {
+        let g = GridSquare("FN42".into());
+        // The three openers, full Outcome.
+        assert_eq!(
+            open(false, MsgKind::Grid(g.clone())),
+            Some((
+                Role::CallingCq,
+                Outcome {
+                    reply: Reply::Report,
+                    progress: Progress::Report,
+                    step: 1,
+                    capture: Capture::Grid(Some(g.clone())),
+                    log: LogWhen::Never,
+                    settle: Settle::StayActive,
+                }
+            ))
+        );
+        assert_eq!(
+            open(false, MsgKind::Report(-7)),
+            Some((
+                Role::CallingCq,
+                Outcome {
+                    reply: Reply::RogerReport,
+                    progress: Progress::RogerReport,
+                    step: 2,
+                    capture: Capture::Report(-7),
+                    log: LogWhen::Never,
+                    settle: Settle::StayActive,
+                }
+            ))
+        );
+        assert_eq!(
+            open(true, fd_bare()),
+            Some((
+                Role::CallingCq,
+                Outcome {
+                    reply: Reply::FdRogerExchange,
+                    progress: Progress::RogerReport,
+                    step: 1,
+                    capture: Capture::Fd("2B".into(), Section("IL".into())),
+                    log: LogWhen::Never,
+                    settle: Settle::StayActive,
+                }
+            ))
+        );
+        // Wrong contest → no opener.
+        assert_eq!(open(true, MsgKind::Grid(g.clone())), None);
+        assert_eq!(open(true, MsgKind::Report(-7)), None);
+        assert_eq!(open(false, fd_bare()), None);
+        // Non-opener kinds → no opener, in both contests.
+        for fd in [false, true] {
+            assert_eq!(open(fd, MsgKind::RogerReport(-3)), None);
+            assert_eq!(open(fd, fd_roger()), None);
+            assert_eq!(open(fd, MsgKind::Signoff(Signoff::Rr73)), None);
+            assert_eq!(open(fd, MsgKind::Cq { grid: None }), None);
+            assert_eq!(open(fd, MsgKind::Other), None);
+        }
+    }
+
+    #[test]
+    fn advance_table_every_cell() {
+        use Role::*;
+        // The three advancing transitions, full Outcome.
+        assert_eq!(
+            advance(Answering, false, MsgKind::Report(-9)),
+            Transition::Act(Outcome {
+                reply: Reply::RogerReport,
+                progress: Progress::RogerReport,
+                step: 2,
+                capture: Capture::Report(-9),
+                log: LogWhen::Never,
+                settle: Settle::StayActive,
+            })
+        );
+        assert_eq!(
+            advance(Answering, true, fd_roger()),
+            Transition::Act(Outcome {
+                reply: Reply::Rr73,
+                progress: Progress::Rogers,
+                step: 2,
+                capture: Capture::Fd("2B".into(), Section("IL".into())),
+                log: LogWhen::OnSend,
+                settle: Settle::FinishOnSend(Finish::Idle),
+            })
+        );
+        assert_eq!(
+            advance(CallingCq, false, MsgKind::RogerReport(-4)),
+            Transition::Act(Outcome {
+                reply: Reply::Rr73,
+                progress: Progress::Rogers,
+                step: 2,
+                capture: Capture::Report(-4),
+                log: LogWhen::OnSend,
+                settle: Settle::StayActive,
+            })
+        );
+        // Any sign-off acts (details in signoff_outcome's test).
+        assert!(matches!(
+            advance(Answering, false, MsgKind::Signoff(Signoff::Seven3)),
+            Transition::Act(_)
+        ));
+        assert!(matches!(
+            advance(CallingCq, true, MsgKind::Signoff(Signoff::Rr73)),
+            Transition::Act(_)
+        ));
+        // The cells that used to fall through `_ => None` are now explicit Ignores:
+        // wrong role, wrong contest, repeated/early kinds, CQ, free text.
+        assert_eq!(advance(CallingCq, false, MsgKind::Report(-9)), Transition::Ignore);
+        assert_eq!(advance(Answering, false, MsgKind::RogerReport(-4)), Transition::Ignore);
+        assert_eq!(
+            advance(Answering, false, MsgKind::Grid(GridSquare("FN42".into()))),
+            Transition::Ignore
+        );
+        assert_eq!(advance(Answering, true, fd_bare()), Transition::Ignore);
+        assert_eq!(advance(CallingCq, true, fd_roger()), Transition::Ignore);
+        assert_eq!(advance(Answering, true, MsgKind::Report(-9)), Transition::Ignore);
+        assert_eq!(advance(CallingCq, false, MsgKind::Cq { grid: None }), Transition::Ignore);
+        assert_eq!(advance(CallingCq, false, MsgKind::Other), Transition::Ignore);
+    }
+
+    #[test]
+    fn signoff_outcome_courtesy_and_fallback() {
+        use Role::*;
+        // Answering side (either contest, any token): courtesy 73, finish idle, log rx.
+        for fd in [false, true] {
+            for k in [Signoff::Rrr, Signoff::Rr73, Signoff::Seven3] {
+                let o = signoff_outcome(Answering, fd, k);
+                assert_eq!(o.reply, Reply::Seven3);
+                assert_eq!(o.settle, Settle::FinishOnSend(Finish::Idle));
+                assert_eq!(o.log, LogWhen::OnReceive);
+                assert_eq!(o.step, 3);
+                assert_eq!(o.progress, Progress::Signoff);
+            }
+        }
+        // FD CQ side on a roger: courtesy 73, then resume CQ.
+        for k in [Signoff::Rrr, Signoff::Rr73] {
+            let o = signoff_outcome(CallingCq, true, k);
+            assert_eq!(o.reply, Reply::Seven3);
+            assert_eq!(o.settle, Settle::FinishOnSend(Finish::ResumeCq));
+        }
+        // FD CQ side on a bare 73: no courtesy, resume CQ now.
+        let o = signoff_outcome(CallingCq, true, Signoff::Seven3);
+        assert_eq!(o.reply, Reply::None);
+        assert_eq!(o.settle, Settle::ResumeCqNow);
+        // Standard CQ side (already logged on send): no courtesy, resume CQ now.
+        for k in [Signoff::Rrr, Signoff::Rr73, Signoff::Seven3] {
+            let o = signoff_outcome(CallingCq, false, k);
+            assert_eq!(o.reply, Reply::None);
+            assert_eq!(o.settle, Settle::ResumeCqNow);
+        }
+    }
+
+    #[test]
+    fn answer_opener_is_the_fixed_armed_reply() {
+        let o = answer_opener(Some(GridSquare("FN42".into())));
+        assert_eq!(o.reply, Reply::Opener);
+        assert_eq!(o.progress, Progress::Replying);
+        assert_eq!(o.step, 1);
+        assert_eq!(o.capture, Capture::Grid(Some(GridSquare("FN42".into()))));
+        assert_eq!(o.log, LogWhen::Never);
+        assert_eq!(o.settle, Settle::StayActive);
     }
 }
