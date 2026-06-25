@@ -4,7 +4,7 @@
 //! state.
 
 use eframe::egui;
-use egui::{Align2, Pos2, Stroke};
+use egui::{Align2, Pos2, Rect, Stroke};
 
 use super::{Panel, PanelCtx};
 use crate::chrome::{panel_header, split_block};
@@ -98,9 +98,27 @@ impl Panel for LogBook {
             Stroke::new(1.0, pal.dim.gamma_multiply(0.4)),
         );
 
+        // Our own multi-op identity: a row whose `id.origin` differs is another
+        // operator's contact, gossiped onto the shared logbook over the LAN.
+        let my_id = ctx.bus.my_station_id();
         for (i, e) in logs.iter().enumerate() {
             let ry = first_row_y + i as f32 * ROW_H;
             let grid = e.grid.as_ref().map(|g| g.0.as_str()).unwrap_or("----");
+            // Mine vs. peer: peer rows lean into the secondary accent — the same
+            // "accent2 = someone else, not me" language the waterslide's
+            // deconfliction overlay uses (heard ≠ mine). A faint row tint + an
+            // accent2 callsign + a ◁-led station-id badge mark them; mine is unchanged.
+            let mine = e.id.origin.0.as_str() == my_id;
+            if !mine {
+                // Whisper-faint full-row wash in accent2. Color32 is premultiplied,
+                // so gamma_multiply just dials the opacity down — enough to band a
+                // peer's row without competing with the data on it.
+                let tint = Rect::from_min_max(
+                    Pos2::new(l, ry - ROW_H * 0.5),
+                    Pos2::new(r, ry + ROW_H * 0.5),
+                );
+                painter.rect_filled(tint, 0.0, pal.accent2.gamma_multiply(0.10));
+            }
             painter.text(
                 Pos2::new(l, ry),
                 Align2::LEFT_CENTER,
@@ -108,13 +126,32 @@ impl Panel for LogBook {
                 mono(10.0),
                 pal.dim,
             );
-            painter.text(
+            let call_rect = painter.text(
                 Pos2::new(x_call, ry),
                 Align2::LEFT_CENTER,
                 tracked(&e.call.0),
                 heading(10.0),
-                pal.body,
+                if mine { pal.body } else { pal.accent2 },
             );
+            // Peer rows get a ◁-prefixed badge of the author's station id just past
+            // the callsign — the overlay's "◁ = a peer, not us" marker. Drawn only
+            // when it clears the GRID column; in a too-narrow panel the bare caret
+            // still flags the row.
+            if !mine {
+                let badge_x = call_rect.right() + 6.0;
+                let full = format!("\u{25C1} {}", e.id.origin.0);
+                let galley = painter.layout_no_wrap(full, mono(8.0), pal.accent2);
+                let badge = if badge_x + galley.size().x <= x_grid - 6.0 {
+                    galley
+                } else {
+                    painter.layout_no_wrap("\u{25C1}".to_owned(), mono(8.0), pal.accent2)
+                };
+                painter.galley(
+                    Pos2::new(badge_x, ry - badge.size().y * 0.5),
+                    badge,
+                    pal.accent2,
+                );
+            }
             painter.text(
                 Pos2::new(x_grid, ry),
                 Align2::LEFT_CENTER,

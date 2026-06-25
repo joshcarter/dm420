@@ -193,6 +193,12 @@ pub struct BusView {
     /// each frame (via [`Self::peers`]) to draw other operators' working offsets so
     /// the operator can avoid stomping them — display-only deconfliction.
     peers: Arc<Mutex<HashMap<StationId, PeerSnapshot>>>,
+    /// This operator's own configured multi-op identity — the `origin` the QSO
+    /// engine stamps on every contact we log and the gossip key `net` advertises
+    /// (pulled from `core_config.station_id`, the single configured identity).
+    /// Read via [`Self::my_station_id`] so consumers compare a [`LogEntry`]'s
+    /// `id.origin` against one owned value instead of re-deriving "mine vs peer".
+    my_station_id: StationId,
 
     /// Handle for live reconfiguration of the running producers (real mode only;
     /// empty otherwise).
@@ -351,6 +357,7 @@ impl BusView {
             selection,
             health,
             peers,
+            my_station_id: station_id,
             control,
             qso_control,
             applied,
@@ -432,6 +439,14 @@ impl BusView {
     /// How many log entries are currently held (capped at the ring size).
     pub fn log_count(&self) -> usize {
         self.logs.buf.lock().unwrap().len()
+    }
+
+    /// This operator's own multi-op [`StationId`] (as a `&str`) — the single
+    /// configured identity stamped as `origin` on every contact we log. The Log
+    /// Book compares a [`LogEntry`]'s `id.origin` against it to tell our own
+    /// contacts from peers' on the shared (LAN-gossiped) logbook — *mine ≠ peer*.
+    pub fn my_station_id(&self) -> &str {
+        &self.my_station_id.0
     }
 
     /// The latest authoritative worked set from the `core::worked` producer, or an
