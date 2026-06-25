@@ -4,12 +4,15 @@
 
 ## 🔴 Field Day blockers (June 27–28)
 - [ ] **Per-band/per-mode "unworked" tracking + Field-Day log reset** — J — the core FD dupe rule; reset path + per-`(call,band)` worked display
-- [ ] **First on-air FT4 QSO** — W/J — encode verified offline (r=1.0 vs ft8_lib) but never keyed; confirm TX path + FT4 watchdog on a real radio
 - [ ] **QSO correctness investigation** — W/J — on-air symptoms observed, not yet pinned; reproduce + diagnose
 - [ ] **CQ answered with a report (not grid) is ignored** — J — drops real FD contacts; fix drafted+reverted on `lane-finder` branch, needs landing + regression test
 - [ ] **Logbook shows class/section, not signal report** — — — the FD exchange is class+section, not SNR
 - [ ] **Send box doesn't update live during a QSO** — J — only refreshes after TX (`tx_hold` latch); operational blindness mid-over
 - [ ] **Shared logbook MVP (multi-op headline)** — J — Network Step 2; full anti-entropy is risky in 2 days, but an outbound-push + inbound-merge MVP may land (see `docs/networking.md`)
+
+## Field Day Desired
+
+- [ ] Band scan function needs to move to the Digital panel. Band Scan panel needs to be read-only.
 
 ## After Field Day
 
@@ -18,7 +21,7 @@
 - [ ] 1c — clock unification (wire the dead `BusView.clock`; remaining direct `Utc::now()` reads) — spectrogram drift only partly fixed
 - [ ] 2c — publish `OperatingState` (the mode+band owner) + a `SessionCommand` bus path — retires the interim band-from-`RigState` workaround in the beacon
 - [ ] 3b — per-radio control lease (Operate | Scanning | Configuring) + operate⊥configure invariant; config off the lock edge
-- [ ] 0a — derive watchdog / `max_tx` / `grant_ttl` from one `slot_period` + `debug_assert`; explicit `ForceUnkey` (the stale comments are already fixed)
+- [ ] 0a — derive watchdog / `max_tx` / `grant_ttl` from one `slot_period` + `debug_assert`; explicit `ForceUnkey` (the stale comments are already fixed); tighten the FT4 TX watchdog (currently runs too long, ~2 slots — non-blocking)
 - [ ] 0b — wire `Granter::revoke` into the QSO-Stop / scan-cancel abort path (the method exists but is unused)
 - [ ] A2 — carve the dead prototype tables (`panel_data.rs`) + the mock-only `waterslide_panel.rs`
 - [ ] Phase 4 — reconcile `docs/message-catalog.md` with reality (mark each topic built / delete the dead ones)
@@ -31,7 +34,6 @@
 - [ ] Shared band-scan: beacon `band_activity`; show peers' scan results
 
 **Decoder** — see `docs/decoder_*.md` (W's lane):
-- [ ] FT4 coherent decode (still magnitude-only; baseline gap ~30%) — `docs/decoder_ft4_coherent_handoff.md`
 - [ ] Sensitivity Phase 3.1 fit + profiling
 
 **Reliability / live pipeline** — see `docs/live_pipeline_notes.md`:
