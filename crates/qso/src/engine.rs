@@ -130,6 +130,11 @@ struct Active {
     logged: bool,
     /// Display-only over counter for `QsoPhase::InExchange { step }`.
     step: u8,
+    /// The authoritative exchange phase (WSJT-X `m_QSOProgress`), set in one place by
+    /// the appliers as the contact advances. Carried for legibility — the *published*
+    /// phase stays `step`; a follow-up slice can surface `progress` on the bus.
+    #[allow(dead_code)]
+    progress: Progress,
     // --- captured facts for the log ---
     partner_grid: Option<GridSquare>,
     /// Our report of the partner's signal (Standard), used for the report we send.
@@ -788,64 +793,47 @@ impl Engine {
 
         tracing::info!(partner = ?from, ?role, "qso engine: resume — picking up mid-contact");
 
-        // A provisional contact; `next`, the logging trigger, and the captured
-        // exchange facts are filled by the same content-driven transitions the live
-        // paths use (the openers inline below, everything else via `advance_active`).
-        // We never saw the earlier overs, so the log can only carry what's on this
+        // An opener (a station answering our CQ — a grid in Standard, the bare
+        // exchange in Field Day) builds the contact directly via the shared `open`
+        // table. Everything else — a report / roger-report / sign-off — seeds a
+        // *provisional* contact and lets the in-QSO `advance` fill it in from this
+        // line, the same content-driven path the live engine uses (and the reason
+        // resume can pick up partway through). We use the inferred `role` either way;
+        // since we never saw the earlier overs, the log can only carry what's on this
         // line plus our own report — partial, but truthful for a late pick-up.
-        self.state = State::Active(Box::new(Active {
-            role,
-            partner: from.clone(),
-            target: Some(target.clone()),
-            offset,
-            tx_parity: parity_after(target.slot),
-            next: None,
-            finish_after_tx: None,
-            log_on_tx: false,
-            logged: false,
-            step: 0,
-            partner_grid: None,
-            partner_snr: snr,
-            rcvd_report: None,
-            rcvd_fd: None,
-            overs_since_progress: 0,
-        }));
-
-        match &msg {
-            // Openers — a station answering our CQ. `advance_active` only handles
-            // mid/late exchanges, so seed the reply (and captured fact) here.
-            ParsedMessage::Exchange {
-                payload: ExchangePayload::Grid(grid),
-                ..
-            } => {
-                let reply = message::report(&self.me, &from, snr);
-                if let State::Active(a) = &mut self.state {
-                    a.partner_grid = Some(grid.clone());
-                    a.next = Some(reply);
-                    a.step = 1;
-                }
-                None
-            }
-            ParsedMessage::Exchange {
-                payload:
-                    ExchangePayload::FieldDay {
-                        class,
-                        section,
-                        rogered: false,
-                    },
-                ..
-            } => {
-                let reply = message::fd_roger_exchange(&self.me, &from);
-                if let State::Active(a) = &mut self.state {
-                    a.rcvd_fd = Some((class.clone(), section.clone()));
-                    a.next = Some(reply);
-                    a.step = 1;
-                }
-                None
-            }
-            // Report / R-report / sign-off: reuse the in-QSO transition, which sets
-            // `next`, the logging trigger, and returns any log (their `RR73`).
-            _ => self.advance_active(&msg, snr),
+        if let Some((_, o)) = open(me_fd, MsgKind::classify(&msg)) {
+            self.open_at(
+                Seed {
+                    role,
+                    partner: from,
+                    target: Some(target.clone()),
+                    offset,
+                    tx_parity: parity_after(target.slot),
+                    snr,
+                },
+                o,
+            );
+            None
+        } else {
+            self.state = State::Active(Box::new(Active {
+                role,
+                partner: from,
+                target: Some(target.clone()),
+                offset,
+                tx_parity: parity_after(target.slot),
+                next: None,
+                finish_after_tx: None,
+                log_on_tx: false,
+                logged: false,
+                step: 0,
+                progress: Progress::Replying,
+                partner_grid: None,
+                partner_snr: snr,
+                rcvd_report: None,
+                rcvd_fd: None,
+                overs_since_progress: 0,
+            }));
+            self.advance_active(&msg, snr)
         }
     }
 
@@ -919,6 +907,7 @@ impl Engine {
                 a.next = Some(m);
             }
             a.step = o.step;
+            a.progress = o.progress;
             match &o.capture {
                 Capture::None => {}
                 Capture::Grid(g) => a.partner_grid = g.clone(),
@@ -961,6 +950,7 @@ impl Engine {
             log_on_tx: matches!(o.log, LogWhen::OnSend),
             logged: false,
             step: o.step,
+            progress: o.progress,
             partner_grid: None,
             partner_snr: seed.snr,
             rcvd_report: None,
