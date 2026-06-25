@@ -5,21 +5,36 @@
 //! the bus**. See `docs/networking.md` for the full protocol (transport, merge
 //! semantics, anti-entropy loop) and `docs/message-catalog.md §9` for the payloads.
 //!
-//! ## What's built (step 1)
+//! ## What's built (steps 1 & 2-MVP)
 //!
 //! Transport + discovery + the periodic [`StationSnapshot`] beacon: two instances
 //! find each other (mDNS or `DM420_PEERS`), exchange snapshots over UDP, and each
 //! re-publishes peers' snapshots onto `station/{id}/snapshot`. The beacon's
-//! `working` field is now populated from local bus state (the deconfliction
+//! `working` field is populated from local bus state (the deconfliction
 //! [`WorkingTarget`] — band + TX offset + the call being worked; see
-//! [`beacon_loop`]); `heard`/`band_activity` are still empty, and the log-G-set
-//! anti-entropy loop (`LogDigest`/`LogRequest`/`LogReply`) is step 2. Those `Wire`
-//! variants are already declared so the wire format is stable; they're
-//! logged-and-ignored until then.
+//! [`beacon_loop`]); `heard`/`band_activity` are still empty.
+//!
+//! **Shared logbook (step 2 MVP).** The log G-set ([`gset::Gset`]) now syncs:
+//! - **OUT:** we subscribe `logbook/entries`, hold every entry in the G-set, and
+//!   proactively [`Wire::LogPush`] entries we *authored* (`origin == me`) to peers
+//!   — peer entries we injected are held but never re-pushed (echo guard).
+//! - **IN:** `LogPush`/`LogReply` entries not already held are re-published onto
+//!   `logbook/entries`, where the logbook service persists them (curated boundary:
+//!   peer data only ever lands on `logbook/entries`, never a local-authority topic).
+//! - **Catch-up:** the first snapshot from a new peer triggers a one-shot
+//!   MTU-chunked bulk `LogPush` of our own backlog, and a periodic ~15 s
+//!   [`repush_loop`] re-pushes our authored entries to every peer as a
+//!   convergence backstop — it closes the new-peer catch-up race (an empty
+//!   catch-up when nothing is logged yet) and is independent of join order.
+//!
+//! The full anti-entropy loop (`LogDigest`/`LogRequest` range diffing) is step 2b;
+//! the periodic re-push is a brute-force stand-in until it lands. Those `Wire`
+//! variants stay declared-but-inert.
 
 #![forbid(unsafe_code)]
 
 mod discovery;
+mod gset;
 mod peers;
 pub mod wire;
 
@@ -29,10 +44,20 @@ use std::time::{Duration, Instant};
 
 use bus::{BusError, BusHandle, BusMessage, Subscription, Topic, TopicSelector};
 use tokio::net::UdpSocket;
-use types::{Band, QsoState, RadioId, RigState, StationId, StationSnapshot, WorkingTarget};
+use types::{
+    Band, LogEntry, QsoState, RadioId, RigState, StationId, StationSnapshot, WorkingTarget,
+};
 
+use crate::gset::Gset;
 use crate::peers::Peers;
-use crate::wire::{Frame, Wire, PROTO_VERSION};
+use crate::wire::{Frame, PROTO_VERSION, Wire};
+
+/// MTU-safe byte budget for a single gossip datagram. Held well under the ~1500 B
+/// Ethernet MTU so a `LogPush`/`LogReply` never IP-fragments — a fragmented
+/// datagram is lost *whole* if any one fragment drops, which would defeat the
+/// G-set's reliability. Bulk catch-up is split across as many datagrams as needed
+/// to stay under this.
+const PUSH_MTU_BUDGET: usize = 1200;
 
 /// Default radio id, matching `core::radio_id()` — there is exactly one radio today.
 /// Kept as a local literal so `net` stays free of a `core` dependency; production
@@ -44,6 +69,12 @@ const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(5);
 /// A peer not heard within this window drops from the live set (several missed
 /// beacons). Its beacon target is kept — a quiet peer is still worth pinging.
 const PEER_TTL: Duration = Duration::from_secs(30);
+/// How often we re-push our own log G-set to every peer ([`repush_loop`]). A
+/// brute-force convergence backstop standing in for the deferred anti-entropy
+/// pull (step 2b): bounded traffic at Field-Day log sizes, idempotent on the
+/// receiver (dedup by `QsoId`), and immune to join order / the new-peer
+/// catch-up race.
+const REPUSH_INTERVAL: Duration = Duration::from_secs(15);
 /// Receive buffer — one UDP datagram's hard maximum.
 const RECV_BUF: usize = 64 * 1024;
 
@@ -207,11 +238,32 @@ impl Service {
             }
         }
 
+        // The log G-set is shared by the inbound (`recv_loop`) and outbound
+        // (`outbound_log_loop`) halves of the shared-logbook sync: both fold
+        // entries in, and the merge/echo guards key off "already held".
+        let gset = Gset::default();
+
         tokio::spawn(recv_loop(
             self.socket.clone(),
             self.bus.clone(),
             self.peers.clone(),
             self.station.clone(),
+            gset.clone(),
+        ));
+        tokio::spawn(outbound_log_loop(
+            self.socket.clone(),
+            self.bus.clone(),
+            self.peers.clone(),
+            self.station.clone(),
+            gset.clone(),
+        ));
+        // Convergence backstop: periodically re-push our own backlog to every
+        // peer, independent of join order and the one-shot new-peer catch-up.
+        tokio::spawn(repush_loop(
+            self.socket.clone(),
+            self.peers.clone(),
+            self.station.clone(),
+            gset,
         ));
 
         beacon_loop(self.socket, self.peers, self.station, self.bus, self.radio).await
@@ -237,7 +289,16 @@ async fn beacon_loop(
     bus: BusHandle,
     radio: RadioId,
 ) -> std::io::Result<()> {
-    let mut seq = 0u64;
+    // Seed the beacon `seq` from the wall clock, mirroring the log seq idiom in
+    // `qso::shell`. A per-process `0`-counter looked *stale* to peers for up to
+    // `PEER_TTL` after a restart: the restarted op's `seq 1,2,…` were ≤ the high-
+    // water mark peers still held from the prior session, so `Peers::observe`
+    // dropped them as duplicates. Seeding from `now_ms()` makes every new session's
+    // beacons strictly exceed any prior session's. The `max(now, last + 1)` floor
+    // keeps `seq` strictly increasing across same-millisecond beacons and immune to
+    // a backward clock step mid-session. Only ever compared within one peer's own
+    // stream, so the absolute value is irrelevant — only monotonicity matters.
+    let mut last_seq = 0u64;
     let mut tick = tokio::time::interval(SNAPSHOT_INTERVAL);
 
     // Subscribe (State, Exact) to the two inputs. `.ok()` so a subscribe failure
@@ -255,7 +316,8 @@ async fn beacon_loop(
     loop {
         tokio::select! {
             _ = tick.tick() => {
-                seq += 1;
+                let seq = (types::now_ms() as u64).max(last_seq + 1);
+                last_seq = seq;
                 let snap = StationSnapshot {
                     station: station.clone(),
                     seq,
@@ -344,7 +406,13 @@ fn assemble_working(
     })
 }
 
-async fn recv_loop(socket: Arc<UdpSocket>, bus: BusHandle, peers: Peers, me: StationId) {
+async fn recv_loop(
+    socket: Arc<UdpSocket>,
+    bus: BusHandle,
+    peers: Peers,
+    me: StationId,
+    gset: Gset,
+) {
     let mut buf = vec![0u8; RECV_BUF];
     loop {
         let (n, from) = match socket.recv_from(&mut buf).await {
@@ -371,7 +439,8 @@ async fn recv_loop(socket: Arc<UdpSocket>, bus: BusHandle, peers: Peers, me: Sta
         match frame.msg {
             Wire::Snapshot(snap) => {
                 let station = frame.from.clone();
-                if peers.observe(&station, from, snap.seq, Instant::now()) {
+                let obs = peers.observe(&station, from, snap.seq, Instant::now());
+                if obs.fresh {
                     tracing::info!(
                         station = %station.0,
                         seq = snap.seq,
@@ -381,26 +450,255 @@ async fn recv_loop(socket: Arc<UdpSocket>, bus: BusHandle, peers: Peers, me: Sta
                     // Re-publish onto the bus; panels read `station/*/snapshot`.
                     let _ = bus.publish(&Topic::StationSnapshot(station), snap);
                 }
+                if obs.new_station {
+                    // First contact with this peer: one-shot bulk catch-up of OUR
+                    // OWN log (mine-only, matching the push guard — in a full mesh
+                    // every pair exchanges its own, so all logs converge). MTU-
+                    // chunked so no datagram IP-fragments. Cheap stand-in for the
+                    // full anti-entropy pull (step 2b).
+                    let mine = gset.mine(&me);
+                    // Logged unconditionally — an empty catch-up (the race where
+                    // this fires before our backlog is in the G-set, or before any
+                    // contact is logged) is now visible, not silent. The periodic
+                    // `repush_loop` is what eventually closes that gap.
+                    tracing::info!(
+                        peer = %from,
+                        entries = mine.len(),
+                        "net: catch-up OUT to new peer",
+                    );
+                    if !mine.is_empty() {
+                        let datagrams = pack_log_push(&mine, &me);
+                        for dgram in datagrams {
+                            if let Err(e) = socket.send_to(&dgram, from).await {
+                                tracing::debug!(%from, error = %e, "net: catch-up send failed");
+                            }
+                        }
+                    }
+                }
             }
-            // Log-sync (LogPush/LogDigest/LogRequest/LogReply) is step 2.
-            other => tracing::trace!(?other, "net: log-sync frame (step 2)"),
+            // Inbound log merge. `LogReply` (a pull answer) is treated identically
+            // to `LogPush` (a proactive push): both carry entries to merge.
+            //
+            // CURATED BOUNDARY (security-critical): a peer's `LogEntry` only ever
+            // re-enters this instance on `logbook/entries` — never on any local-
+            // authority topic (`rig/command`, `radio/*/audio_tx`, `qso/*/state`).
+            // The logbook service is subscribed there and persists each new entry;
+            // the GUI / worked-status update for free.
+            Wire::LogPush(entries) | Wire::LogReply(entries) => {
+                let received = entries.len();
+                let mut new = 0usize;
+                for entry in entries {
+                    if gset.insert(entry.clone()) {
+                        new += 1;
+                        let _ = bus.publish(&Topic::LogbookEntries, entry);
+                    }
+                    // Already held → idempotent drop (no re-publish, no echo).
+                }
+                tracing::info!(from = %from, received, new, "net: log-sync IN");
+            }
+            // Anti-entropy (`LogDigest` digest exchange / `LogRequest` range serve)
+            // is step 2b — deliberately inert in the MVP. We never advertise a
+            // digest, so we never solicit a request; an unsolicited `LogRequest` is
+            // a no-op rather than a serve.
+            other @ (Wire::LogDigest(_) | Wire::LogRequest(_)) => {
+                tracing::trace!(?other, "net: anti-entropy frame (step 2b — not built)");
+            }
         }
     }
+}
+
+/// The outbound half of the shared logbook: fold every entry on `logbook/entries`
+/// into the G-set, and proactively [`Wire::LogPush`] the ones we *authored* to
+/// every known peer.
+///
+/// **Push guard (echo-storm prevention):** only `origin == me` entries are pushed.
+/// Entries with `origin != me` are peer contacts *we* injected back onto
+/// `logbook/entries` from [`recv_loop`]; they still populate the G-set (so we can
+/// relay them later and our catch-up dedups correctly), but re-pushing them would
+/// bounce them around an N-peer mesh forever. The guard is on **push only**.
+///
+/// At startup the logbook replays its full backlog onto this (StreamLossless)
+/// topic; those replays populate the G-set the same way. Because mDNS hasn't found
+/// peers yet at that instant, the resulting pushes target an empty peer set (a
+/// no-op) — history reaches peers via the new-peer catch-up in [`recv_loop`].
+async fn outbound_log_loop(
+    socket: Arc<UdpSocket>,
+    bus: BusHandle,
+    peers: Peers,
+    me: StationId,
+    gset: Gset,
+) {
+    let mut sub = match bus.subscribe::<LogEntry>(TopicSelector::Exact(Topic::LogbookEntries)) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = ?e, "net: cannot subscribe logbook/entries; outbound log sync disabled");
+            return;
+        }
+    };
+    loop {
+        match sub.recv().await {
+            Ok(entry) => {
+                let mine = entry.id.origin == me;
+                // Insert *before* the guard so peer entries still join the G-set.
+                let is_new = gset.insert(entry.clone());
+                if mine && is_new {
+                    // Snapshot the sendable targets once: it's both the send list
+                    // and the `peers` count we log.
+                    let targets: Vec<SocketAddr> =
+                        peers.targets().into_iter().filter(is_sendable).collect();
+                    tracing::info!(
+                        origin = %entry.id.origin.0,
+                        seq = entry.id.seq,
+                        peers = targets.len(),
+                        "net: log-push OUT (live)",
+                    );
+                    let frame = Frame {
+                        version: PROTO_VERSION,
+                        from: me.clone(),
+                        msg: Wire::LogPush(vec![entry]),
+                    };
+                    match wire::encode(&frame) {
+                        Ok(bytes) => {
+                            for addr in targets {
+                                if let Err(e) = socket.send_to(&bytes, addr).await {
+                                    tracing::debug!(%addr, error = %e, "net: log-push send failed");
+                                }
+                            }
+                        }
+                        Err(e) => tracing::warn!(error = %e, "net: log-push encode failed"),
+                    }
+                }
+            }
+            // StreamLossless: a lag is impossible in practice, but stay exhaustive.
+            Err(BusError::Lagged { .. }) => continue,
+            Err(_) => break, // producer/bus gone — end the task.
+        }
+    }
+}
+
+/// Pack `entries` into as few `Wire::LogPush` datagrams as fit under
+/// [`PUSH_MTU_BUDGET`], each framed with `from` as the sender. Greedy: grow a
+/// batch until adding the next entry would exceed budget, then flush. A single
+/// entry that alone exceeds budget still ships on its own (better fragmented than
+/// dropped). Used only for the one-shot new-peer catch-up, so the re-encode cost
+/// of size-probing is irrelevant.
+fn pack_log_push(entries: &[LogEntry], from: &StationId) -> Vec<Vec<u8>> {
+    let encode_batch = |batch: &[LogEntry]| -> Option<Vec<u8>> {
+        if batch.is_empty() {
+            return None;
+        }
+        let frame = Frame {
+            version: PROTO_VERSION,
+            from: from.clone(),
+            msg: Wire::LogPush(batch.to_vec()),
+        };
+        match wire::encode(&frame) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                tracing::warn!(error = %e, "net: catch-up encode failed");
+                None
+            }
+        }
+    };
+
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    let mut batch: Vec<LogEntry> = Vec::new();
+    for entry in entries {
+        batch.push(entry.clone());
+        // Only probe once the batch holds >1 entry — a lone entry always ships,
+        // even if oversized.
+        if batch.len() > 1
+            && let Some(bytes) = encode_batch(&batch)
+            && bytes.len() > PUSH_MTU_BUDGET
+        {
+            // This entry tipped us over: flush the prior batch, start a new one
+            // carrying just this entry.
+            batch.pop();
+            if let Some(bytes) = encode_batch(&batch) {
+                out.push(bytes);
+            }
+            batch = vec![entry.clone()];
+        }
+    }
+    if let Some(bytes) = encode_batch(&batch) {
+        out.push(bytes);
+    }
+    out
+}
+
+/// Periodically re-push our own log G-set to every peer — a brute-force
+/// convergence backstop standing in for the deferred anti-entropy pull (step 2b).
+///
+/// **Why it's needed.** The only other backlog mechanism is the one-shot new-peer
+/// catch-up in [`recv_loop`], which silently delivers nothing if it fires before
+/// our backlog is in the G-set or before any contact is logged. This loop re-pushes
+/// regardless of join order, so a peer eventually receives our log no matter how the
+/// catch-up race resolves. Bounded at Field-Day log sizes, and the receiver dedups by
+/// `QsoId`, so each round is idempotent.
+///
+/// **Mine-only**, the same guard as the live push and catch-up: we re-push only
+/// entries we *authored* (`origin == me`), never peer-authored ones — that's the
+/// echo-storm guard. The inbound merge/inject path and the curated boundary are
+/// untouched; peer entries still only ever republish onto `Topic::LogbookEntries`.
+async fn repush_loop(socket: Arc<UdpSocket>, peers: Peers, me: StationId, gset: Gset) {
+    let mut tick = tokio::time::interval(REPUSH_INTERVAL);
+    // `interval` fires the first tick immediately; skip it so the first re-push
+    // waits a full interval (t=0 is already covered by the live push + catch-up).
+    tick.tick().await;
+    loop {
+        tick.tick().await;
+        repush_once(&socket, &peers, &me, &gset).await;
+    }
+}
+
+/// One re-push pass: send our authored backlog to every sendable peer. Factored out
+/// of [`repush_loop`] so it's directly testable without waiting on the timer. A
+/// no-op (no datagram, no log) when we've authored nothing yet or no peer is
+/// reachable. Returns the number of peers it sent to.
+async fn repush_once(socket: &UdpSocket, peers: &Peers, me: &StationId, gset: &Gset) -> usize {
+    let mine = gset.mine(me);
+    if mine.is_empty() {
+        return 0;
+    }
+    let targets: Vec<SocketAddr> = peers.targets().into_iter().filter(is_sendable).collect();
+    if targets.is_empty() {
+        return 0;
+    }
+    let datagrams = pack_log_push(&mine, me);
+    tracing::info!(
+        entries = mine.len(),
+        peers = targets.len(),
+        "net: periodic log re-push",
+    );
+    for addr in &targets {
+        for dgram in &datagrams {
+            if let Err(e) = socket.send_to(dgram, addr).await {
+                tracing::debug!(%addr, error = %e, "net: re-push send failed");
+            }
+        }
+    }
+    targets.len()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv6Addr};
-    use types::{AbsHz, Callsign, Meters, OffsetHz, QsoPhase, RigMode};
+    use types::{
+        AbsHz, Callsign, Meters, OffsetHz, OverAirMode, QsoId, QsoPhase, RigMode, Timestamp,
+    };
 
     // The IPv4 / IPv6 filter that keeps IPv6 link-local mDNS addresses off our
     // IPv4-only socket: IPv4 is sendable, anything else (here a `fe80::…`) is not.
     #[test]
     fn is_sendable_accepts_ipv4_rejects_ipv6() {
         let v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)), 4040);
-        let v6_link_local = SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)), 4040);
-        assert!(is_sendable(&v4), "IPv4 target is sendable from the IPv4 socket");
+        let v6_link_local =
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)), 4040);
+        assert!(
+            is_sendable(&v4),
+            "IPv4 target is sendable from the IPv4 socket"
+        );
         assert!(
             !is_sendable(&v6_link_local),
             "IPv6 link-local target must be filtered out"
@@ -426,7 +724,10 @@ mod tests {
         }
         assert_eq!(
             peers.targets(),
-            vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)), port)],
+            vec![SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)),
+                port
+            )],
             "only the IPv4 address becomes a beacon target",
         );
     }
@@ -480,8 +781,12 @@ mod tests {
     fn assemble_none_without_offset() {
         let radio = RadioId(DEFAULT_RADIO_ID.into());
         assert!(
-            assemble_working(&Some(qso(Some("N0JDC"), None)), &Some(rig(14_074_000)), &radio)
-                .is_none()
+            assemble_working(
+                &Some(qso(Some("N0JDC"), None)),
+                &Some(rig(14_074_000)),
+                &radio
+            )
+            .is_none()
         );
     }
 
@@ -489,10 +794,151 @@ mod tests {
     #[test]
     fn assemble_some_with_no_partner() {
         let radio = RadioId(DEFAULT_RADIO_ID.into());
-        let w = assemble_working(&Some(qso(None, Some(1500.0))), &Some(rig(14_074_000)), &radio)
-            .expect("offset + band present even when idle → Some");
+        let w = assemble_working(
+            &Some(qso(None, Some(1500.0))),
+            &Some(rig(14_074_000)),
+            &radio,
+        )
+        .expect("offset + band present even when idle → Some");
         assert_eq!(w.call, None);
         assert_eq!(w.band, Band::B20m);
         assert_eq!(w.offset, OffsetHz(1500.0));
+    }
+
+    fn log_entry(seq: u64) -> LogEntry {
+        LogEntry {
+            id: QsoId {
+                origin: StationId("me".into()),
+                seq,
+            },
+            radio: None,
+            call: Callsign(format!("K{seq}XYZ")),
+            mode: OverAirMode::Ft8,
+            band: Band::B20m,
+            freq: AbsHz(14_074_000),
+            time: Timestamp(1_700_000_000_000 + seq as i64),
+            exchange_sent: "-10".into(),
+            exchange_rcvd: "-12".into(),
+            grid: None,
+            section: None,
+        }
+    }
+
+    // Same shape as `log_entry` but authored by a peer (a different `origin`) —
+    // the kind of entry the re-push guard must never put back on the wire.
+    fn peer_entry(origin: &str, seq: u64) -> LogEntry {
+        let mut e = log_entry(seq);
+        e.id.origin = StationId(origin.into());
+        e
+    }
+
+    // Decode a produced datagram back to the entries it carries.
+    fn unpack(bytes: &[u8]) -> Vec<LogEntry> {
+        match wire::decode(bytes).unwrap().msg {
+            Wire::LogPush(es) => es,
+            other => panic!("expected LogPush, got {other:?}"),
+        }
+    }
+
+    // The bulk catch-up packs *every* entry across MTU-bounded datagrams, with no
+    // datagram exceeding the budget (a multi-entry one would IP-fragment otherwise)
+    // and no entry lost or duplicated.
+    #[test]
+    fn pack_log_push_chunks_under_mtu_and_preserves_all() {
+        let from = StationId("me".into());
+        let entries: Vec<LogEntry> = (0..50).map(log_entry).collect();
+        let datagrams = pack_log_push(&entries, &from);
+
+        assert!(
+            datagrams.len() > 1,
+            "50 entries must span several datagrams, got {}",
+            datagrams.len()
+        );
+
+        let mut seqs = Vec::new();
+        for dgram in &datagrams {
+            // A datagram carrying >1 entry must fit the budget; a lone oversized
+            // entry is allowed to exceed it (better fragmented than dropped).
+            let carried = unpack(dgram);
+            if carried.len() > 1 {
+                assert!(
+                    dgram.len() <= PUSH_MTU_BUDGET,
+                    "multi-entry datagram {} B exceeds budget {PUSH_MTU_BUDGET}",
+                    dgram.len()
+                );
+            }
+            seqs.extend(carried.into_iter().map(|e| e.id.seq));
+        }
+        seqs.sort_unstable();
+        assert_eq!(
+            seqs,
+            (0..50).collect::<Vec<_>>(),
+            "every entry is delivered exactly once, none lost or duplicated"
+        );
+    }
+
+    // A single entry always produces exactly one datagram.
+    #[test]
+    fn pack_log_push_single_entry_one_datagram() {
+        let from = StationId("me".into());
+        let datagrams = pack_log_push(&[log_entry(1)], &from);
+        assert_eq!(datagrams.len(), 1);
+        assert_eq!(unpack(&datagrams[0]).len(), 1);
+    }
+
+    // No entries → no datagrams (the empty-backlog catch-up is a no-op).
+    #[test]
+    fn pack_log_push_empty_is_empty() {
+        let from = StationId("me".into());
+        assert!(pack_log_push(&[], &from).is_empty());
+    }
+
+    // The periodic re-push delivers our authored backlog to a peer, and ONLY our
+    // own entries — a peer-authored entry held in the G-set is never re-pushed
+    // (the echo-storm guard). Drives `repush_once` directly so there's no wait on
+    // the 15 s timer.
+    #[tokio::test]
+    async fn repush_once_delivers_mine_only_to_peer() {
+        let me = StationId("me".into());
+
+        // A receiver socket stands in for the peer; `sender` is our gossip socket.
+        let peer_sock = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let peer_addr = peer_sock.local_addr().unwrap();
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+
+        // Two of our own contacts plus one peer-authored contact in the G-set.
+        let gset = Gset::default();
+        assert!(gset.insert(log_entry(1)));
+        assert!(gset.insert(log_entry(2)));
+        assert!(gset.insert(peer_entry("w4ll", 9)));
+
+        let peers = crate::peers::Peers::default();
+        peers.add_target(peer_addr);
+
+        let sent_to = repush_once(&sender, &peers, &me, &gset).await;
+        assert_eq!(sent_to, 1, "the re-push reaches the single peer");
+
+        // Drain datagrams until both of our entries are accounted for (mine fit
+        // one datagram, but stay robust to MTU chunking); assert the peer's entry
+        // never appears.
+        let mut got: Vec<u64> = Vec::new();
+        let mut buf = vec![0u8; RECV_BUF];
+        while got.len() < 2 {
+            let (n, _) =
+                tokio::time::timeout(Duration::from_secs(5), peer_sock.recv_from(&mut buf))
+                    .await
+                    .expect("peer never received the re-push")
+                    .unwrap();
+            for e in unpack(&buf[..n]) {
+                assert_eq!(e.id.origin, me, "only our own entries are re-pushed");
+                got.push(e.id.seq);
+            }
+        }
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec![1, 2],
+            "both authored entries delivered, the peer's entry excluded",
+        );
     }
 }

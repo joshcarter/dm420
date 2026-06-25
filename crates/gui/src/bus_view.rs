@@ -193,6 +193,12 @@ pub struct BusView {
     /// each frame (via [`Self::peers`]) to draw other operators' working offsets so
     /// the operator can avoid stomping them — display-only deconfliction.
     peers: Arc<Mutex<HashMap<StationId, PeerSnapshot>>>,
+    /// This operator's own configured multi-op identity — the `origin` the QSO
+    /// engine stamps on every contact we log and the gossip key `net` advertises
+    /// (pulled from `core_config.station_id`, the single configured identity).
+    /// Read via [`Self::my_station_id`] so consumers compare a [`LogEntry`]'s
+    /// `id.origin` against one owned value instead of re-deriving "mine vs peer".
+    my_station_id: StationId,
 
     /// Handle for live reconfiguration of the running producers (real mode only;
     /// empty otherwise).
@@ -351,6 +357,7 @@ impl BusView {
             selection,
             health,
             peers,
+            my_station_id: station_id,
             control,
             qso_control,
             applied,
@@ -416,14 +423,30 @@ impl BusView {
         v
     }
 
-    /// The `n` most recent log entries, newest first.
+    /// The `n` most recent log entries by timestamp, newest first.
+    ///
+    /// Sorts by `LogEntry.time` rather than trusting the ring's arrival order:
+    /// peer catch-up injects a station's backlog in `HashMap` (arbitrary) order,
+    /// so arrival order can be out of time-sequence. The ring is small (~512), so
+    /// a per-call sort is cheap.
     pub fn recent_logs(&self, n: usize) -> Vec<LogEntry> {
-        self.logs.snapshot().into_iter().rev().take(n).collect()
+        let mut all = self.logs.snapshot();
+        all.sort_by_key(|e| std::cmp::Reverse(e.time.0));
+        all.truncate(n);
+        all
     }
 
     /// How many log entries are currently held (capped at the ring size).
     pub fn log_count(&self) -> usize {
         self.logs.buf.lock().unwrap().len()
+    }
+
+    /// This operator's own multi-op [`StationId`] (as a `&str`) — the single
+    /// configured identity stamped as `origin` on every contact we log. The Log
+    /// Book compares a [`LogEntry`]'s `id.origin` against it to tell our own
+    /// contacts from peers' on the shared (LAN-gossiped) logbook — *mine ≠ peer*.
+    pub fn my_station_id(&self) -> &str {
+        &self.my_station_id.0
     }
 
     /// The latest authoritative worked set from the `core::worked` producer, or an

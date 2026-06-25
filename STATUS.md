@@ -48,7 +48,6 @@
 - Map: grid squares drawn in the wrong places
 - Map: turn off crosshairs after a QSO clears; highlight a station that answers my CQ
 - After a QSO finishes: unhighlight traffic + reset the Send box to CQ
-- Remember the last FT4/FT8 operating mode across restarts
 - RX clipping indicator (audio level)
 - Clear-lane finder: jump to an optimum CQ calling frequency (occupancy map + lane scoring) — `lane-finder` branch
 - Band-scanner enhancements: per-offset sweep, FD-only filter, SNR floor, configurable dwell

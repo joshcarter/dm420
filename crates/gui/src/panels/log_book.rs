@@ -98,9 +98,17 @@ impl Panel for LogBook {
             Stroke::new(1.0, pal.dim.gamma_multiply(0.4)),
         );
 
+        // Our own multi-op identity: a row whose `id.origin` differs is another
+        // operator's contact, gossiped onto the shared logbook over the LAN.
+        let my_id = ctx.bus.my_station_id();
         for (i, e) in logs.iter().enumerate() {
             let ry = first_row_y + i as f32 * ROW_H;
             let grid = e.grid.as_ref().map(|g| g.0.as_str()).unwrap_or("----");
+            // Mine vs. peer: a peer's row renders identically to mine — same colors,
+            // no tint — except for a single ↔-led station-id badge past the callsign,
+            // the same "accent = someone else, not me" language the waterslide's
+            // deconfliction overlay uses (heard ≠ mine), dialed back to one quiet marker.
+            let mine = e.id.origin.0.as_str() == my_id;
             painter.text(
                 Pos2::new(l, ry),
                 Align2::LEFT_CENTER,
@@ -108,13 +116,32 @@ impl Panel for LogBook {
                 mono(10.0),
                 pal.dim,
             );
-            painter.text(
+            let call_rect = painter.text(
                 Pos2::new(x_call, ry),
                 Align2::LEFT_CENTER,
                 tracked(&e.call.0),
                 heading(10.0),
                 pal.body,
             );
+            // Peer rows get a ↔-prefixed badge of the author's station id just past
+            // the callsign — the overlay's "↔ = a peer, not us" marker. Drawn only
+            // when it clears the GRID column; in a too-narrow panel the bare arrow
+            // still flags the row.
+            if !mine {
+                let badge_x = call_rect.right() + 6.0;
+                let full = format!("\u{2194} {}", e.id.origin.0);
+                let galley = painter.layout_no_wrap(full, mono(10.0), pal.accent);
+                let badge = if badge_x + galley.size().x <= x_grid - 6.0 {
+                    galley
+                } else {
+                    painter.layout_no_wrap("\u{2194}".to_owned(), mono(10.0), pal.accent)
+                };
+                painter.galley(
+                    Pos2::new(badge_x, ry - badge.size().y * 0.5),
+                    badge,
+                    pal.accent,
+                );
+            }
             painter.text(
                 Pos2::new(x_grid, ry),
                 Align2::LEFT_CENTER,

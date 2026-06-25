@@ -63,9 +63,11 @@ shape the protocol:
 
 These fill the `§9 — DEFERRED` placeholder in `crates/types/src/lib.rs`. All derive
 the catalog's mandated `Serialize, Deserialize, Clone, Debug, PartialEq`. `seq` is a
-per-station monotonic counter (process-lifetime or persisted), used for ordering and
-as the G-set key — **never** a wall-clock, so clock skew between operators can't
-reorder anything.
+per-station monotonic counter, used for ordering and as the G-set key. The log
+(`QsoId`) `seq` is seeded once from the wall clock at startup, then incremented per
+contact — `now_ms()` at launch always exceeds any prior session's seqs, so ids stay
+unique across restarts with **no sidecar**. Because each `origin` is the sole writer
+of its own `seq`s, clock skew between operators can never reorder anything.
 
 ```rust
 // §9  Cross-station gossip
@@ -268,11 +270,6 @@ The transport delivers peer data onto existing bus topics; the panels then have 
 
 - **Encoding:** `serde_json` (debuggable, larger) vs. `bincode` (compact). Lean
   `bincode` for datagrams once the schema stabilizes; JSON during bring-up.
-- **`seq` persistence:** persist the per-station log `seq` across restarts (so a
-  restarted op doesn't reissue ids a peer already merged), or accept that a restart
-  starts a fresh `seq` run and rely on `(origin, seq)` still being globally unique
-  because `origin` is stable? Persisting is safer — write the high-water mark next
-  to the logbook JSON.
 - **Security:** LAN-trust only for v1 (Field Day club network). No auth/encryption;
   revisit if it ever leaves a trusted segment.
 - **Heard-station privacy/volume:** whether to cap shared heard stations by band or
