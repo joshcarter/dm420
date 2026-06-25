@@ -267,6 +267,51 @@ one), which is what tells `(CallingCq, Standard, grid)` to *open* a contact when
 you're calling CQ but to *ignore a repeat* when you're already mid-exchange. That
 phase distinction is the subtle part — and it's the heart of the refactor below.
 
+### As a classic transition table (state · trigger · next state · effects)
+
+If you picture the FSM the textbook way — a graph of states, keyed by **current
+state → trigger → next state**, with the **outputs/side-effects** of each edge —
+here is the *same machine* drawn that way. (Remember from above: the fine state
+isn't actually stored; this is the conceptual graph. The implementation-shaped
+Tables A–E further down carry the identical edges, just keyed by phase+content
+instead of by the state column.) Each state has a **color chip** so you can trace
+an edge by matching the chip in *Current state* to the one in *New state*.
+
+**States:** ⬜ Idle · 🟦 Calling CQ · 🟪 Armed · 🟩 Replying · 🟨 Report ·
+🟧 RogerReport · 🟥 Rogers · ⬛ Signoff.
+**Effects:** 📤 transmit (with WSJT-X `Tx` slot) · 📝 write the log · 💾 save a
+fact for the log · ↳ follow-on transition after our *own* TX.
+
+| Current state | Trigger — `role · contest · event` | → New state | Effects (outputs / side-effects) |
+|---|---|---|---|
+| ⬜ **Idle** | op: **Call CQ** | 🟦 Calling | begin calling CQ |
+| ⬜ **Idle** | op: **Arm** to a target | 🟪 Armed | go receive-only; publish "working this one" |
+| ⬜ **Idle** | op: **Resume** a line to us | 🟩/🟨/🟧 *(rebuilt)* | reconstruct a contact from that line (Table E) · 📤 the implied reply |
+| 🟦 **Calling** | tick · our slot · no answer | 🟦 Calling | 📤 `CQ …`; auto-QSY after 3 unanswered (if on) |
+| 🟦 **Calling** | `CallingCq · Std` · rx **grid** → us | 🟨 Report | 📤 report `Tx2` · 💾 their grid |
+| 🟦 **Calling** | `CallingCq · Std` · rx **report** → us (P3) | 🟧 RogerReport | 📤 roger+report `Tx3` · 💾 their report |
+| 🟦 **Calling** | `CallingCq · FD` · rx **exchange** → us | 🟧 RogerReport | 📤 roger+exchange `Tx3` · 💾 their class+section |
+| 🟦 **Calling** | op: **Abort** | ⬜ Idle | stop |
+| 🟦 **Calling** | any other inbound | 🟦 Calling | ignored — keep calling CQ |
+| 🟪 **Armed** | **target calls CQ** | 🟩 Replying | 📤 opener (grid `Tx1` Std / exchange `Tx2` FD) · 💾 target's grid |
+| 🟪 **Armed** | target works **someone else** | 🟪 Armed | stay armed; wait for its next CQ |
+| 🟪 **Armed** | op: **Abort** | ⬜ Idle | stop |
+| 🟩 **Replying** | `Answering · Std` · rx **report** → us | 🟧 RogerReport | 📤 roger+report `Tx3` · 💾 their report |
+| 🟩 **Replying** | `Answering · FD` · rx **R-exchange** → us | 🟥 Rogers | 📤 `RR73` `Tx4` · 📝 **on send** · 💾 their class+section · ↳ ⬜ Idle once it sends |
+| 🟨 **Report** | `CallingCq · Std` · rx **R-report** → us | 🟥 Rogers | 📤 `RR73` `Tx4` · 📝 **on send** · await their 73 |
+| 🟧 **RogerReport** / 🟥 **Rogers** | rx **sign-off** (RRR/RR73/73) → us | ⬛ Signoff ↳ ⬜ Idle *(answering)* / 🟦 Calling *(CQ side)* | 📝 **on receive** (if not yet logged) · 📤 courtesy `73` `Tx5` when we hold the slot (answering, or FD CQ side on RR73); Std CQ side already logged-on-send → no 73 |
+| 🟩🟨🟧🟥 **any in-contact** | partner addresses **someone else** | 🟪 Armed *(answering)* / 🟦 Calling *(CQ side)* | abandon — lost race |
+| 🟩🟨🟧🟥 **any in-contact** | **no progress** for N overs (tick) | 🟦 Calling / ⬜ Idle | one-shot `TimedOut`, then fall back |
+| 🟩🟨🟧🟥 **any in-contact** | repeated / contest-mismatched / non-partner msg | *(unchanged)* | ignored — re-📤 current msg; give-up counter climbs |
+| 🟩🟨🟧🟥 **any in-contact** | op: **Abort** | ⬜ Idle | stop |
+
+> Two things to notice, both tying back to *why the code doesn't key on this
+> state column*: (1) the very same `(role, contest, received-kind)` key from
+> Tables A–E is here too — it's just folded into the **Trigger** column; and
+> (2) `🟧 RogerReport` is reached from **three** different lanes (answering-Std,
+> CQ-FD, CQ-Std-P3) and `🟥 Rogers` from two — that redundancy down the state
+> column is exactly what collapses away when you key on phase+content instead.
+
 ---
 
 ## Part 4 — The refactor we're about to do
