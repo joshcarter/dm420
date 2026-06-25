@@ -4,7 +4,7 @@ Once QSO finishes, unhighlight that station's traffic and set our "send" box bac
 
 When someone hops on the RR73 with a call, answer instead of calling CQ
 
-Audio option: RX clipping indicator
+I'm pretty sure the map is displaying grid squares in wrong places
 
 
 # Soon
@@ -13,14 +13,9 @@ Map Panel: Once QSO is cleared, turn off crosshairs
 
 Map Panel: When a station answers my CQ, highlight them on the map
 
-I'm not sure what to do when a station I'm trying to work goes and chases other stations. Cancel? Or just wait? Wait on same offset?
-
-Review if hashed callsigns are properly implemented.
-
-Need to determine actual limits of audio offset for
-transmit--currently a hard window, something like 1000-2000Hz.
-
 Remember FT4/FT8 last operating mode.
+
+Audio option: RX clipping indicator
 
 # Field Day Specific
 
@@ -45,7 +40,11 @@ different band counts as a different contact. Maybe when UI is
 unlocked, have a "reset" button on the log book which moves the old
 log book to a new file name.
 
-# Optional
+# Future
+
+CQ has a distinctive pattern on the spectrogram. Could we queue a "respond to that station" before we have the message fully decoded?
+
+I'm not sure what to do when a station I'm trying to work goes and chases other stations. Cancel? Or just wait? Wait on same offset?
 
 Unlocked view should show the keyboard shortcut for each panel.
 
