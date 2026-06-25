@@ -6,8 +6,9 @@ use egui::{Align2, Color32, ColorImage, Pos2, Rect, TextureHandle, TextureOption
 use std::collections::{HashMap, HashSet};
 
 use types::{
-    AbsHz, Band, Decode, DecodeContent, HealthState, OverAirMode, ParsedMessage, QsoPhase, SlotId,
-    SpectrumRow, SubsystemHealth, SubsystemId,
+    AbsHz, Band, Callsign, Decode, DecodeContent, DecodeRef, HealthState, OffsetHz, OverAirMode,
+    ParsedMessage, QsoPhase, Selection, SelectionContext, SlotId, SpectrumRow, SubsystemHealth,
+    SubsystemId,
 };
 
 use app_core::{LineProfile, Protocol, SerialConfig};
@@ -22,12 +23,10 @@ use crate::settings::{DEFAULT_BAUD, HardwareConfig, KENWOOD_BAUDS};
 use crate::theme::*;
 use crate::waterslide_panel::Target;
 
-/// The real-mode click selection tracked by the panel. The live waterslide is
-/// draw-only (the mock sim's `ui()` owns selection in mock mode), so in real mode
-/// the panel records the clicked target itself.
-///
-/// The TX **offset is no longer here** — the QSO engine is its sole owner (read via
-/// `QsoState.tx_offset`); the panel only records *who* is selected.
+/// What a waterslide click *resolved to* — the click-resolution payload returned by
+/// `draw_waterslide`, not stored on the panel. The panel turns it into a selection on
+/// the bus ([`BusView::select`]); the single owner of "who is selected" is the
+/// published `Selection`, not this.
 #[derive(Clone, Default)]
 struct RealSel {
     /// The station to work (its base call + the slot its decode landed in, for the
@@ -39,9 +38,9 @@ struct RealSel {
     resume: Option<(ParsedMessage, i8)>,
 }
 
-/// A resolved waterslide click: the audio offset under the cursor (sent to the
-/// engine via `set_tx_offset`, which ignores it while locked) plus the selection it
-/// lands on (a decoded station, or a bare offset with no target).
+/// A resolved waterslide click: the audio offset under the cursor plus the selection
+/// it lands on (a decoded station, or a bare offset with no target). The panel
+/// publishes this as a `Selection`; its handler then places the TX offset.
 struct WsClick {
     offset: f32,
     sel: RealSel,
@@ -53,9 +52,21 @@ pub struct Waterfall {
     /// Send-row text-box / slash-command state. The transmit lifecycle itself
     /// lives in the QSO engine (`QsoState`), which this row renders and commands.
     send: SendState,
-    /// Click selection (offset + optional station); the live waterslide is
-    /// draw-only, so the panel records the clicked target itself.
-    real_sel: RealSel,
+    /// The last selection this panel's operating handler acted on, for *new*-selection
+    /// detection: when the published `Selection` differs from this, the handler applies
+    /// its response (place the TX offset, retune if out-of-passband + unlocked) once,
+    /// then records it here so it never re-fires every frame.
+    applied_selection: Option<Selection>,
+    /// Panel-local resume hint for the selected decode: when the clicked line is
+    /// addressed to *us*, the parsed message + its SNR so SEND resumes mid-stream
+    /// instead of arming for a CQ. Tagged with the `DecodeRef` it belongs to so a
+    /// later selection change (e.g. a map pick) can't misapply it — it's used only
+    /// while it matches the current selection's target. (It can't ride in `Selection`,
+    /// which carries who + where, not a `ParsedMessage`.)
+    resume: Option<(DecodeRef, ParsedMessage, i8)>,
+    /// The QSO phase observed last frame, so a completed contact deselects exactly
+    /// once on the edge into `Complete` (rather than republishing every frame).
+    prev_phase: Option<QsoPhase>,
     /// The message latched on the air for the current over, held in the Send box
     /// until the transmission finishes — even after the engine has advanced its
     /// `next_tx` or gone idle (the final 73/RR73 keeps showing while it plays out).
@@ -103,7 +114,9 @@ impl Waterfall {
             spectro: Spectrogram::new(),
             form: ConfigForm::default(),
             send: SendState::default(),
-            real_sel: RealSel::default(),
+            applied_selection: None,
+            resume: None,
+            prev_phase: None,
             tx_hold: None,
             cq_assignments: HashMap::new(),
             last_assigned_slot_ms: 0,
@@ -125,6 +138,45 @@ impl Waterfall {
         let rows = ctx.bus.recent_spectrum();
         let decodes = ctx.bus.recent_decodes();
         crate::lane_finder::pick_cq_offset(&rows, &decodes, bw, now_ms)
+    }
+
+    /// Apply a *new* selection's operating response — the single place a selection
+    /// (this panel's own clicks/digits or a Contacts-map pick) turns into a TX-offset
+    /// move and an optional dial retune. Called once per new selection by the handler
+    /// in `ui`. The engine gates the offset on the lock; the retune is gated here on
+    /// `!offset_locked`, so a locked selection never tunes — it only selects.
+    fn apply_selection(&self, ctx: &PanelCtx, sel: &Selection) {
+        // Audio-offset window we'll snap onto rather than retune. Conservative: keep
+        // the station comfortably mid-passband (away from the filter edges).
+        const SNAP_LO: i64 = 300;
+        const SNAP_HI: i64 = 2500;
+        match &sel.context {
+            // A lane already inside the current passband (a waterslide click, a bare
+            // offset, or CLEAR QSY): just place the TX offset. The engine ignores the
+            // move while locked, so a locked click still selects without retuning.
+            Some(SelectionContext::Passband(off)) => ctx.bus.set_tx_offset(off.0),
+            // A map pick at a known absolute frequency. The Digital panel owns the
+            // passband decision (the map has none): snap onto the offset when the
+            // station is reachable in the current passband; otherwise retune the dial
+            // so it lands at 1500 Hz audio — but only when the offset is unlocked.
+            // Locked + out-of-passband ⇒ select-only (no offset move, no retune).
+            Some(SelectionContext::AbsFreq(abs)) => {
+                let Some(vfo) = ctx.bus.rig_state().map(|r| r.vfo.0) else {
+                    return;
+                };
+                let candidate = abs.0 as i64 - vfo as i64;
+                if (SNAP_LO..=SNAP_HI).contains(&candidate) {
+                    ctx.bus.set_tx_offset(candidate as f32);
+                } else if !ctx.bus.offset_locked() {
+                    let new_dial = (abs.0 as i64 - 1500).max(0) as u64;
+                    ctx.bus.set_freq(new_dial);
+                    ctx.bus.set_tx_offset(1500.0);
+                }
+            }
+            // Select-by-call with no known frequency (a worked-only map spot): select
+            // the station, move nothing. Enter still arms (the engine matches on call).
+            None => {}
+        }
     }
 
     /// The bottom "Send" row: `Send:` label, recessed message box (mirrors the
@@ -188,8 +240,11 @@ impl Waterfall {
                     && shortcuts_active
                 {
                     if let Some(off) = Self::best_cq_offset(ctx, now_ms) {
-                        ctx.bus.set_tx_offset(off);
-                        self.real_sel = RealSel::default();
+                        // Deselect onto a clear lane: a bare-offset selection. The
+                        // handler places the offset (engine ignores it while locked).
+                        ctx.bus
+                            .select(None, Some(SelectionContext::Passband(OffsetHz(off))));
+                        self.resume = None;
                     }
                     digit_consumed = true;
                     continue;
@@ -205,15 +260,20 @@ impl Waterfall {
                     if let Some(d) = self.cq_shortcuts[idx].clone()
                         && let Some((call, slot)) = decode_station(&d)
                     {
-                        // When the offset is locked, keep our (engine-owned) TX
-                        // frequency and arm there; unlocked, snap to the station's own
-                        // offset. The station's offset only matters for who we target.
-                        let arm_off = if locked { tx_off } else { d.offset.0 };
-                        self.real_sel = RealSel {
-                            target: Some((call.clone(), slot)),
-                            resume: None,
+                        // Select + arm in one gesture. Emit the selection (who + the
+                        // station's own lane); the handler places the offset, which the
+                        // engine ignores while locked — so a locked digit arms there
+                        // without moving the TX frequency, an unlocked one snaps to the
+                        // station. Then arm (Start carries only who, not the offset).
+                        let target = DecodeRef {
+                            radio: app_core::radio_id(),
+                            slot,
+                            call: Some(Callsign(call)),
                         };
-                        ctx.bus.answer_station(arm_off, call, slot);
+                        ctx.bus
+                            .select(Some(target.clone()), Some(SelectionContext::Passband(d.offset)));
+                        self.resume = None;
+                        ctx.bus.answer_station(target);
                     }
                     continue;
                 }
@@ -247,28 +307,28 @@ impl Waterfall {
             }
         }
 
-        // Where we're pointed. The panel owns the click selection (the live
-        // waterslide is draw-only). Resolve to a TX offset, the station to work
-        // (if a decoded line was clicked), and that decode's slot (threaded into
-        // the real `DecodeRef`).
-        let (sel_off, sel_call, sel_slot, sel_resume) = match &self.real_sel.target {
-            Some((call, slot)) => (
-                tx_off,
-                Some(call.clone()),
-                *slot,
-                self.real_sel.resume.clone(),
-            ),
-            None => (tx_off, None, SlotId(0), None),
-        };
+        // Where we're pointed. The selection is the single owner
+        // (`selection/{id}/active`), written by this panel's clicks/digits and the
+        // Contacts map; read it back for the arm target and the highlight. The resume
+        // hint can't round-trip through it (it carries a `ParsedMessage`), so it's kept
+        // panel-local, tagged with its target so a later selection change can't
+        // misapply it. The TX offset is engine-owned (`tx_off`).
+        let sel_target = ctx.bus.selection().and_then(|s| s.target);
+        let sel_call = sel_target.as_ref().and_then(|t| t.call.clone()).map(|c| c.0);
+        let sel_resume = self
+            .resume
+            .as_ref()
+            .filter(|(r, _, _)| Some(r) == sel_target.as_ref())
+            .map(|(_, m, s)| (m.clone(), *s));
 
         // Keep the buffer mirroring the would-be next message as a preview (unless
         // mid-command); the engine's authored message takes over once it's running.
         let preview = match &sel_call {
             Some(call) => Target::Station {
                 call: call.clone(),
-                off: sel_off as i32,
+                off: tx_off as i32,
             },
-            None => Target::Offset(sel_off as i32),
+            None => Target::Offset(tx_off as i32),
         };
         self.send.refresh_auto(&preview, mycall, mygrid);
 
@@ -408,9 +468,9 @@ impl Waterfall {
 
         // Enter or a button click activates: apply a slash command, else toggle
         // the engine. Toggle resolves against the live phase: abort if the engine
-        // is busy, otherwise arm — answer the selected station (threading its real
-        // slot), or call CQ on bare spectrum. The offset/target come from the
-        // resolved selection above (real-mode click state, or the mock sim).
+        // is busy, otherwise arm — answer the selected station, or call CQ on bare
+        // spectrum. The target comes from the published selection above; the TX offset
+        // is already placed (engine-owned), so arming carries only *who*.
         if activate || btn.clicked() {
             match self.send.activate() {
                 Activation::Command(cmd) => self.apply_command(ctx, cmd),
@@ -420,17 +480,21 @@ impl Waterfall {
                         // is set (top bar when unlocked, or the config file).
                     } else if active_qso {
                         ctx.bus.abort_qso();
-                    } else if let Some(call) = &sel_call {
+                    } else if let Some(target) = &sel_target {
                         // A line addressed to us (resume) picks the contact up
                         // mid-stream; otherwise arm the DM420 wait-for-CQ way.
                         if let Some((message, snr)) = &sel_resume {
-                            ctx.bus
-                                .resume_qso(sel_off, call.clone(), sel_slot, message.clone(), *snr);
+                            ctx.bus.resume_qso(
+                                target.clone(),
+                                message.clone(),
+                                *snr,
+                                OffsetHz(tx_off),
+                            );
                         } else {
-                            ctx.bus.answer_station(sel_off, call.clone(), sel_slot);
+                            ctx.bus.answer_station(target.clone());
                         }
                     } else {
-                        ctx.bus.call_cq(sel_off);
+                        ctx.bus.call_cq();
                     }
                 }
                 Activation::None => {}
@@ -458,11 +522,13 @@ impl Waterfall {
     fn apply_command(&mut self, ctx: &PanelCtx, cmd: Command) {
         match cmd {
             Command::ClearQsy => {
-                // No lock guard — the engine ignores the offset move while locked.
+                // Deselect onto a clear lane: a bare-offset selection. No lock guard —
+                // the handler places the offset and the engine ignores it while locked.
                 let now_ms = chrono::Utc::now().timestamp_millis();
                 if let Some(off) = Self::best_cq_offset(ctx, now_ms) {
-                    ctx.bus.set_tx_offset(off);
-                    self.real_sel = RealSel::default();
+                    ctx.bus
+                        .select(None, Some(SelectionContext::Passband(OffsetHz(off))));
+                    self.resume = None;
                 }
             }
             cmd => {
@@ -495,6 +561,22 @@ impl Panel for Waterfall {
         let painter = ctx.painter;
         let pal = ctx.pal;
 
+        // The single selection → operating handler. Both this panel's own gestures
+        // (waterslide clicks, digit shortcuts, CLEAR QSY) and the Contacts map write
+        // the selection (`selection/{id}/active`) via `BusView::select`; we observe
+        // the published value — the single owner — and, on a *new* selection, apply
+        // the operating response *once*: place the engine's TX offset (engine-gated by
+        // the lock) and, only when the station is outside the current passband *and*
+        // the offset is unlocked, retune the dial. Selecting always works regardless
+        // of lock; locked just means select-only (no tune).
+        let selection = ctx.bus.selection();
+        if selection != self.applied_selection {
+            self.applied_selection = selection.clone();
+            if let Some(sel) = &selection {
+                self.apply_selection(ctx, sel);
+            }
+        }
+
         // Hoist operating state so both the header chrome (CLEAR QSY button) and the
         // body chrome (frame tint, TX lane) share the same snapshot this frame.
         let op_phase = ctx
@@ -502,6 +584,14 @@ impl Panel for Waterfall {
             .qso_state()
             .map(|s| s.phase)
             .unwrap_or(QsoPhase::Idle);
+        // A completed contact (final 73 sent) deselects the worked station so the send
+        // box reverts to the default CQ. Clear the selection once, on the edge into
+        // `Complete`; the audio offset is left where it is (a bare deselect).
+        if op_phase == QsoPhase::Complete && self.prev_phase != Some(QsoPhase::Complete) {
+            ctx.bus.select(None, None);
+            self.resume = None;
+        }
+        self.prev_phase = Some(op_phase);
         let op_armed = !matches!(op_phase, QsoPhase::Idle);
         let now_ms = chrono::Utc::now().timestamp_millis();
         let op_transmitting = ctx.bus.tx_spectrum().is_some_and(|r| now_ms - r.t.0 < 500);
@@ -573,8 +663,10 @@ impl Panel for Waterfall {
         // (don't QSY mid-contact).
         if clear_resp.clicked() && !op_armed
             && let Some(off) = Self::best_cq_offset(ctx, now_ms) {
-                ctx.bus.set_tx_offset(off);
-                self.real_sel = RealSel::default();
+                // Deselect onto a clear lane (bare-offset selection); handler places it.
+                ctx.bus
+                    .select(None, Some(SelectionContext::Passband(OffsetHz(off))));
+                self.resume = None;
             }
         // When the mode actually changes, also retune to the calling frequency for
         // the new mode on the current band (FT8 and FT4 use different dial freqs).
@@ -772,13 +864,8 @@ impl Panel for Waterfall {
                         .unwrap_or(QsoPhase::Idle);
                     let armed = !matches!(phase, QsoPhase::Idle) || self.tx_hold.is_some();
 
-                    // A completed contact (final 73 sent) deselects the worked
-                    // station so the send box reverts to the default CQ next frame.
-                    // The audio offset is left where it is.
-                    if matches!(phase, QsoPhase::Complete) {
-                        self.real_sel.target = None;
-                        self.real_sel.resume = None;
-                    }
+                    // (The completed-contact deselect runs once on the `Complete` edge
+                    // at the top of `ui`, against the published selection.)
 
                     // Click-to-select on the live waterslide (mock mode selects via
                     // the sim's own `ui()`; the real waterslide is draw-only). We
@@ -801,8 +888,15 @@ impl Panel for Waterfall {
 
                     // Selection feedback: highlight the selected station's lane and
                     // tag it with the live QSO phase (ARMED while waiting for its CQ,
-                    // WORKING once the exchange is under way).
-                    let sel_call = self.real_sel.target.as_ref().map(|(c, _)| c.clone());
+                    // WORKING once the exchange is under way). The selected call is the
+                    // single owner's — the published selection, the same value the map
+                    // and Call Sign panels highlight.
+                    let sel_call = ctx
+                        .bus
+                        .selection()
+                        .and_then(|s| s.target)
+                        .and_then(|t| t.call)
+                        .map(|c| c.0);
                     let tag = sel_call.as_deref().map(|c| match phase {
                         QsoPhase::Armed => format!("ARMED ▸ {c}"),
                         QsoPhase::InExchange { .. } => format!("WORKING ▸ {c}"),
@@ -897,12 +991,26 @@ impl Panel for Waterfall {
                         self.view_lo_hz,
                         self.view_span_hz,
                     ) {
-                        // Send the clicked offset to the engine (the sole owner — it
-                        // ignores the move while locked, so a locked click still selects
-                        // a station without moving the TX frequency). The panel only
-                        // records who's selected.
-                        ctx.bus.set_tx_offset(click.offset);
-                        self.real_sel = click.sel;
+                        // Publish the click as a selection (the single owner) — who (a
+                        // decoded station, or none for bare spectrum) + where (the
+                        // clicked lane, in-passband). The handler at the top of `ui`
+                        // places the TX offset next frame (engine-gated by the lock), so
+                        // a locked click still selects without moving the frequency. The
+                        // resume hint can't ride in `Selection`, so keep it panel-local,
+                        // tagged with its target so a later selection can't misapply it.
+                        let target = click.sel.target.map(|(call, slot)| DecodeRef {
+                            radio: app_core::radio_id(),
+                            slot,
+                            call: Some(Callsign(call)),
+                        });
+                        self.resume = match (&target, click.sel.resume) {
+                            (Some(t), Some((msg, snr))) => Some((t.clone(), msg, snr)),
+                            _ => None,
+                        };
+                        ctx.bus.select(
+                            target,
+                            Some(SelectionContext::Passband(OffsetHz(click.offset))),
+                        );
                     }
 
                     // When locked, show a "LOCKED" key button at the right edge of
@@ -963,21 +1071,12 @@ impl Panel for Waterfall {
         if !ctx.unlocked {
             self.draw_send_row(ctx, send_row);
         }
-
-        // Publish the selected station so other panels (the Contacts map) can
-        // highlight it. Reads the live `real_sel`; `None` when a bare offset or
-        // nothing is selected.
-        *ctx.selected_station = self.selected_call();
+        // The selected-station highlight string is derived centrally (in `App::ui`)
+        // from the published selection — the single owner — so no panel writes it.
     }
 }
 
 impl Waterfall {
-    /// The callsign currently selected in the waterslide (the station to work), or
-    /// `None` when the selection is a bare spectrum offset or nothing is selected.
-    fn selected_call(&self) -> Option<String> {
-        self.real_sel.target.as_ref().map(|(c, _)| c.clone())
-    }
-
     /// The view window as fractions of the full `[0, WS_MAX_HZ]` range
     /// (`lo_frac`, `hi_frac`) — fed to the spectrogram so its texture crops to
     /// the same band the decode side shows.

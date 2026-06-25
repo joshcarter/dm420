@@ -608,6 +608,18 @@ impl eframe::App for App {
             self.focused = id;
         }
 
+        // The selection's callsign is the shared highlight string. Both the Digital
+        // and Contacts panels select by writing the `selection/{id}/active` bus topic
+        // (the single owner); derive the callsign back from it once here, so every
+        // panel (Digital lane, map crosshair, Call Sign) reads one consistent value
+        // instead of two panels racing to write it.
+        self.selected_station = self
+            .view
+            .selection()
+            .and_then(|s| s.target)
+            .and_then(|t| t.call)
+            .map(|c| c.0);
+
         // -------- body: chassis + resizable tile tree --------
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(pal.face_bottom))

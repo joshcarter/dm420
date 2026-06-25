@@ -1070,7 +1070,7 @@ fn is_roger(kind: Signoff) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use types::{ContestProfile, OverAirMode, SelectionContext, SignalSource, Timestamp};
+    use types::{AbsHz, ContestProfile, OverAirMode, SelectionContext, SignalSource, Timestamp};
 
     const ME: &str = "W9XYZ";
     const HIM: &str = "K1ABC";
@@ -1528,6 +1528,31 @@ mod tests {
         }));
         assert_eq!(e.selected(), None, "a bare-offset selection clears the target");
         assert_eq!(e.state().tx_offset, Some(OffsetHz(1500.0)));
+    }
+
+    /// Selecting a station always selects — even while the offset is locked. The lock
+    /// freezes the *offset*, never the *selection*; this backs the Digital panel's
+    /// "locked ⇒ select-only" behaviour (the station highlights, nothing tunes).
+    #[test]
+    fn select_records_target_even_while_locked() {
+        let mut e = engine(ContestProfile::Standard);
+        e.step(Event::Command(QsoCommand::SetOffsetLock(true)));
+        let target = DecodeRef {
+            radio: RadioId("rig0".into()),
+            slot: SlotId(1),
+            call: Some(call(HIM)),
+        };
+        e.step(Event::Select(Selection {
+            radio: RadioId("rig0".into()),
+            target: Some(target.clone()),
+            context: Some(SelectionContext::AbsFreq(AbsHz(14_075_000))),
+        }));
+        assert_eq!(e.selected(), Some(&target), "selection works while locked");
+        assert_eq!(
+            e.state().tx_offset,
+            Some(OffsetHz(1500.0)),
+            "the locked offset never moves",
+        );
     }
 
     /// Unlocking re-enables movement: a write rejected while locked applies once the

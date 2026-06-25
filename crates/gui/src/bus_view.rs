@@ -157,8 +157,6 @@ pub struct BusView {
     /// "which station/decode the operator picked". Written by both the Digital and
     /// Contacts panels via [`Self::select`] and read back by both (and the Call Sign
     /// panel) for their highlight; the Digital panel reads it to drive arm + offset.
-    /// Pumped now; its panel readers land in the map/Digital wiring commits.
-    #[allow(dead_code)]
     selection: Cell<Selection>,
     /// Latest health per hardware subsystem (real mode only). Drives the panels'
     /// fault display when a device is missing or disconnected.
@@ -564,9 +562,7 @@ impl BusView {
 
     /// The current published selection (who + where), if any — the single owner the
     /// Digital + Contacts panels read for their highlight, and the Digital panel reads
-    /// to drive the arm target + the TX-offset / retune response. (Readers land in the
-    /// map/Digital wiring commits.)
-    #[allow(dead_code)]
+    /// to drive the arm target + the TX-offset / retune response.
     pub fn selection(&self) -> Option<Selection> {
         self.selection.lock().unwrap().clone()
     }
@@ -594,52 +590,32 @@ impl BusView {
             .unwrap_or(false)
     }
 
-    /// Call CQ at `offset_hz`: set the outgoing offset (no retune) and start the
-    /// engine calling.
-    pub fn call_cq(&self, offset_hz: f32) {
-        self.publish_selection(offset_hz, None);
+    /// Start the engine calling CQ. The TX offset is **not** set here — the engine
+    /// already owns it (placed by the Digital panel's selection handler via
+    /// `SetTxOffset`); CQ transmits on the engine's current offset.
+    pub fn call_cq(&self) {
         self.send_qso_command(QsoCommand::CallCq);
     }
 
-    /// Arm to answer `call` at `offset_hz` (the DM420 wait-for-CQ model — the
-    /// engine replies when that station next calls CQ). `slot` is the slot the
-    /// target's decode landed in, threaded from the click so the `DecodeRef` is the
-    /// real one. (The engine still re-derives TX parity from the target's own CQ
-    /// when it commits, but the ref now carries the true slot for selection/gossip.)
-    pub fn answer_station(&self, offset_hz: f32, call: String, slot: SlotId) {
-        let target = DecodeRef {
-            radio: app_core::radio_id(),
-            slot,
-            call: Some(Callsign(call)),
-        };
-        self.publish_selection(offset_hz, Some(target.clone()));
+    /// Arm to answer `target` the DM420 wait-for-CQ way (the engine replies when that
+    /// station next calls CQ). The offset is the engine-owned one (the Digital panel
+    /// placed it from the selection); arming carries only *who*, not the offset.
+    pub fn answer_station(&self, target: DecodeRef) {
         self.send_qso_command(QsoCommand::Start { target });
     }
 
     /// Pick up a contact mid-stream from a decode addressed to us: the operator
     /// clicked a `<my call> <their call> …` line answering a call we'd already
-    /// disarmed from. Commits the engine at once (vs [`Self::answer_station`],
-    /// which arms and waits for a CQ). `message`/`snr` come from the clicked
-    /// decode; `slot` is the slot it landed in (for TX parity).
-    pub fn resume_qso(
-        &self,
-        offset_hz: f32,
-        call: String,
-        slot: SlotId,
-        message: ParsedMessage,
-        snr: i8,
-    ) {
-        let target = DecodeRef {
-            radio: app_core::radio_id(),
-            slot,
-            call: Some(Callsign(call)),
-        };
-        self.publish_selection(offset_hz, Some(target.clone()));
+    /// disarmed from. Commits the engine at once (vs [`Self::answer_station`], which
+    /// arms and waits for a CQ). `message`/`snr` come from the clicked decode;
+    /// `offset` is the engine-owned TX offset (already placed from the selection),
+    /// the lane the resumed contact transmits on.
+    pub fn resume_qso(&self, target: DecodeRef, message: ParsedMessage, snr: i8, offset: OffsetHz) {
         self.send_qso_command(QsoCommand::Resume {
             target,
             message,
             snr,
-            offset: OffsetHz(offset_hz),
+            offset,
         });
     }
 
@@ -757,15 +733,6 @@ impl BusView {
                 context,
             },
         );
-    }
-
-    /// Bridge used by the arming helpers below: record the selection (who + a
-    /// passband context for the panels' highlight) and place the engine-owned TX
-    /// offset. The offset reaches the engine via `SetTxOffset` (lock-gated), not the
-    /// selection — `Selection` no longer carries it.
-    fn publish_selection(&self, offset_hz: f32, target: Option<DecodeRef>) {
-        self.select(target, Some(SelectionContext::Passband(OffsetHz(offset_hz))));
-        self.set_tx_offset(offset_hz);
     }
 
     /// Fire a QSO command at the engine's command server. The engine reflects the
