@@ -77,6 +77,8 @@ The fixes are tractable and mostly additive (build the owner producers; subscrib
 
 **Fix.** Introduce a `Progress` enum on `Active` (CALLING/REPLYING/REPORT/ROGER_REPORT/ROGERS/SIGNOFF) and drive one transition table keyed on `(role, contest, received-kind) -> (reply, next-progress, log-trigger)`, replacing all four parallel match sites. Missing transitions become compile-visible holes instead of silent `_ => None`. Collapse `next`/`finish_after_tx`/`log_on_tx`/`step` into derived consequences. Also make `completed()` take `&Active` so the empty-callsign escape hatch (`engine.rs:909`) disappears.
 
+**Status — ✅ DONE** (item 3a, landed on `fd-progress-fsm`): all four sites route through **two** exhaustive tables (`open` + `advance`, plus `signoff_outcome`/`answer_opener`) — two rather than one, because `advance` is progress-agnostic and a single progress-keyed table would change the give-up/timeout drop-set (see `docs/joel/qsos-and-the-progress-fsm.md`). Every `_ => None`/`_ => {}` content catch-all is gone (a missing content case is now a compile error); `completed()` takes `&Active` (escape hatch removed). The `next`/`finish_after_tx`/`log_on_tx`/`step` fields stay on `Active` but are now set in **one place** (the appliers `open_at`/`apply_advance`), not removed. `Progress` lives on `Active` but is **internal** — the published phase is still `step`; surfacing `progress` on the bus is a follow-up. Behavior is characterization-pinned (the suite stayed green unchanged across every routing commit). The diagnosis above is kept for the record; `engine.rs:444/697/909` line refs are pre-refactor.
+
 ---
 
 #### 5. Config and station identity apply imperatively on the lock edge, through GUI-held producer handles (severity: high, effort: M)

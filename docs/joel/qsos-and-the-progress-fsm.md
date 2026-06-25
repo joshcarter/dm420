@@ -5,7 +5,7 @@
 > `docs/qso_flow.md`, `docs/wsjtx_qso_sequencing.md`, and the code in
 > `crates/qso`. This file is a from-the-ground-up companion: what a QSO *is*, how
 > you run one in DM420, the same thing drawn as a state machine, and a summary of
-> the refactor we're about to do.
+> the refactor (now landed).
 
 ---
 
@@ -314,7 +314,15 @@ fact for the log · ↳ follow-on transition after our *own* TX.
 
 ---
 
-## Part 4 — The refactor we're about to do
+## Part 4 — The refactor (the plan, now landed)
+
+> ✅ **Landed** on branch `fd-progress-fsm` — test-first, green-gated, one commit per
+> step. All four decision sites now route through the `open` / `advance` tables and
+> every `_ => None` content catch-all is gone, so a missing or new content case is a
+> compile error, not a silent dropped step. Behavior was preserved exactly: the
+> characterization suite stayed green *unchanged* across every routing commit. The
+> text below is the plan as written; the authoritative code is
+> `crates/qso/src/engine.rs`.
 
 ### The problem
 
@@ -336,9 +344,10 @@ every contact — both roles, Standard and Field Day — exactly as it does toda
 
 ### The shape
 
-- A typed **`Progress`** enum (the states in Part 3) becomes the legible,
-  published phase of a contact. Published `step` stays byte-identical for now;
-  `Progress` is the authoritative label.
+- A typed **`Progress`** enum (the states in Part 3) is the legible phase a contact
+  carries (`Active.progress`), set by the appliers. The **published** phase stays
+  `step` (byte-identical); `Progress` is the authoritative *internal* label, to be
+  surfaced on the bus in a follow-up.
 - **Two exhaustive tables**, not one: `open(...)` for entering a contact (the
   openers) and `advance(...)` for continuing one. Each matches **every** received
   message-kind by name — no `_` — so deliberate no-ops are explicit and new kinds
@@ -384,9 +393,8 @@ exchange, on both roles, and confirm the progression is identical to before.
 
 ## The transition tables (tabular)
 
-The readable twin of the code in the appendix below — the same decisions, every
-value reconstructed from the four current sites in `engine.rs`. **Keep these and the
-code in sync.** Legend: *Reply* names the message we queue (with its WSJT-X `Tx`
+The readable twin of the code in the appendix below — the same decisions the engine's
+`open` / `advance` tables make. **Keep these and the code in sync.** Legend: *Reply* names the message we queue (with its WSJT-X `Tx`
 slot); *Progress* is the descriptive label set on the contact; *step* is the
 display-only number published in `QsoState`; *Log* is when the contact is written
 (`on send` = when the queued message transmits; `on receive` = immediately);
@@ -468,12 +476,14 @@ Field Day reverse the side that holds `RR73`), then routes into Table A or C.
 
 ## Appendix — the code: `Progress` and the transition tables
 
-> **Proposed shape, ahead of implementation.** This is the design written out
-> concretely so it can be read before any engine code changes — it is **not yet in
-> `crates/qso`**. The `Progress` *labels* are descriptive and **Joel owns the final
-> taxonomy**; what is behavior-bearing (and must stay byte-identical to today) is
-> each transition's `reply`, `step`, `capture`, `log`, and `settle`. Every value
-> below was reconstructed from the four current decision sites in `engine.rs`.
+> **Landed — `crates/qso/src/engine.rs` is authoritative.** This sketch matches the
+> code as built, with two naming differences worth knowing: the advance-result enum is
+> **`Transition`** (not `Step` — the engine already has a public `Step` output struct),
+> and the resume role-inference stayed **inline in `resume_from`** rather than the
+> standalone `resume_role` shown below (openers there are gated via `open()`). The
+> `Progress` *labels* are descriptive (**Joel owns the final taxonomy**); the
+> behavior-bearing fields are each transition's `reply`, `step`, `capture`, `log`, and
+> `settle`. Prefer the code if this drifts.
 
 ### The state label, and the table key/value types
 
@@ -547,9 +557,10 @@ struct Outcome {
     settle: Settle,
 }
 
-/// `advance()`'s result. `Ignore` is the old silent `_ => None`, now explicit:
-/// leave the contact untouched (it keeps repeating; the give-up counter climbs).
-enum Step { Ignore, Act(Outcome) }
+/// `advance()`'s result (named `Transition` in the code — see the preamble). `Ignore`
+/// is the old silent `_ => None`, now explicit: leave the contact untouched (it keeps
+/// repeating; the give-up counter climbs).
+enum Transition { Ignore, Act(Outcome) }
 ```
 
 ### Table 1 — openers (entering a contact)
@@ -610,32 +621,32 @@ fn open(fd: bool, kind: MsgKind) -> Option<(Role, Outcome)> {
 /// lost-race (abandon) pre-check has already run, so anything here is a directed
 /// message from our partner. Exhaustive over `MsgKind` — `Ignore` is the old silent
 /// `_ => None`, now explicit (the contact keeps repeating, give-up counter climbs).
-fn advance(role: Role, fd: bool, kind: MsgKind) -> Step {
+fn advance(role: Role, fd: bool, kind: MsgKind) -> Transition {
     use MsgKind::*;
     use Role::*;
     match kind {
         // Standard, answering side: their report → roger+report (Tx3).
-        Report(r) if role == Answering && !fd => Step::Act(Outcome {
+        Report(r) if role == Answering && !fd => Transition::Act(Outcome {
             reply: Reply::RogerReport, progress: Progress::RogerReport, step: 2,
             capture: Capture::Report(r), log: LogWhen::Never, settle: Settle::StayActive,
         }),
         // Field Day, answering side: their R+exchange → RR73; log on send, then idle.
-        FdRoger { class, section } if role == Answering && fd => Step::Act(Outcome {
+        FdRoger { class, section } if role == Answering && fd => Transition::Act(Outcome {
             reply: Reply::Rr73, progress: Progress::Rogers, step: 2,
             capture: Capture::Fd(class, section), log: LogWhen::OnSend,
             settle: Settle::FinishOnSend(Finish::Idle),
         }),
         // Standard, CQ side: their R-report → RR73; log on send (then hold for a 73).
-        RogerReport(r) if role == CallingCq && !fd => Step::Act(Outcome {
+        RogerReport(r) if role == CallingCq && !fd => Transition::Act(Outcome {
             reply: Reply::Rr73, progress: Progress::Rogers, step: 2,
             capture: Capture::Report(r), log: LogWhen::OnSend, settle: Settle::StayActive,
         }),
         // Any directed sign-off (RRR / RR73 / 73) completes the contact (P2).
-        Signoff(k) => Step::Act(signoff_outcome(role, fd, k)),
+        Signoff(k) => Transition::Act(signoff_outcome(role, fd, k)),
         // Explicit holes — every variant named, no `_`. A repeated/wrong-phase
         // message, a contest mismatch, another CQ, or unclassified text is ignored.
         Report(_) | RogerReport(_) | FdBare { .. } | FdRoger { .. }
-        | Grid(_) | Cq { .. } | Other => Step::Ignore,
+        | Grid(_) | Cq { .. } | Other => Transition::Ignore,
     }
 }
 
