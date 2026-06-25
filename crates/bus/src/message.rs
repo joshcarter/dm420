@@ -47,6 +47,7 @@ bus_message!(QsoState, State);
 bus_message!(ScannerState, State);
 bus_message!(ClockStatus, State);
 bus_message!(Vec<BandActivity>, State); // scanner/candidates payload — full per-scan snapshot
+bus_message!(BandStatus, State); // band/status — always-on per-(band,mode) aggregate
 bus_message!(StationSnapshot, State); // station/{id}/snapshot (State, gossiped — §9)
 bus_message!(SubsystemHealth, State); // health/{id} (State, latest-wins per subsystem)
 
