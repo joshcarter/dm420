@@ -187,5 +187,6 @@ This is the most important rule in the codebase.
 - `eframe` is immediate-mode: never block the UI thread; all I/O lives behind the bus +
   `BusView` pumps. CPU-heavy decode runs off-thread in `core::decode`.
 
-Open work and known issues are tracked in `TODO.md`, `JOELS_ROADMAP.md`,
-`ARCHITECTURE_REVIEW.md`, and `docs/live_pipeline_notes.md` — not here.
+Open work is tracked in **`STATUS.md`** (the single owner). Architecture rationale
+lives in `ARCHITECTURE_REVIEW.md`; component specs in `docs/`; live-pipeline known
+issues in `docs/live_pipeline_notes.md` — not here.

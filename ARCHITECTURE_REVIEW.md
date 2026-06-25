@@ -71,7 +71,7 @@ The fixes are tractable and mostly additive (build the owner producers; subscrib
 
 #### 4. QSO exchange progress is implicit field-soup, not a typed state — the direct source of "weird transitions" (severity: high, effort: M)
 
-**Where it hurts now.** This is the owner's "bugs from weird state transitions" complaint, literally. Inside `State::Active`, the real "where are we in the exchange" is implicit in the *combination* of `next` + `finish_after_tx` + `log_on_tx` + `logged` + `step` + `overs_since_progress` plus captured facts (`engine.rs:115-144`). Transitions are hand-enumerated `(role, contest, msg)` match arms that fall through to `_ => None` (`engine.rs:444, 697`). `qso_engine_improvements.md` documents that the A1 (report-opener ignored) and A2 (bare-73 ignored) "never replies" bugs happened *precisely because* "the arms are hand-enumerated and easy to leave a hole in." The same content→action mapping is duplicated across four functions (`commit_from_cq`, `commit_from_armed`, `advance_active`, `resume_from`), so a hole in one is invisible — `resume_from` already handles a report-to-us differently than the live path because it only reaches that case via a `_ => advance_active` fallthrough that has no report-opener arm.
+**Where it hurts now.** This is the owner's "bugs from weird state transitions" complaint, literally. Inside `State::Active`, the real "where are we in the exchange" is implicit in the *combination* of `next` + `finish_after_tx` + `log_on_tx` + `logged` + `step` + `overs_since_progress` plus captured facts (`engine.rs:115-144`). Transitions are hand-enumerated `(role, contest, msg)` match arms that fall through to `_ => None` (`engine.rs:444, 697`). `qso_engine_improvements.md` documents that the report-opener-ignored and bare-73-ignored "never replies" bugs (A1/A2 in `qso_engine_improvements.md`) happened *precisely because* "the arms are hand-enumerated and easy to leave a hole in." The same content→action mapping is duplicated across four functions (`commit_from_cq`, `commit_from_armed`, `advance_active`, `resume_from`), so a hole in one is invisible — `resume_from` already handles a report-to-us differently than the live path because it only reaches that case via a `_ => advance_active` fallthrough that has no report-opener arm.
 
 **Root cause.** `qso_flow.md` and `wsjtx_qso_sequencing.md` mandate mirroring WSJT-X's `m_QSOProgress` enum as the authoritative state with `step` display-only; `step` is display-only but no enum replaced it, so progress remained a derived combination of six fields advanced by parallel match arms.
 
@@ -215,9 +215,11 @@ A couple of bus-internal sharp edges to fix opportunistically: wildcard `State` 
 
 ---
 
+> **Reading the task IDs.** Phases run **0 → A → 1 → 2 → 3 → 4 → 5** — Phase **A** (dead-weight removal) was deliberately pulled in *between* Phase 0 and Phase 1. A task ID is `<phase><letter>` (e.g. `2b`); **drivers** are `#1–#10` (the root-cause diagnoses tasks reference); **steps** (`step 1–4`) are `networking.md`'s multi-op build order — a separate axis. The original sequence's `1b` (shared-utility pass) is now **`A3`**. (`A1`/`A2` in driver #4 are *qso bug IDs* from `qso_engine_improvements.md`, unrelated to the Phase-A tasks.) **Live open-work status lives in [`STATUS.md`](STATUS.md), not here** — this section is the task taxonomy and sequence.
+
 ### Recommended Refactor Sequence
 
-> **⚠ Superseded** by the **Revised refactor sequence** in the *Mock Removal & Multi-Operator Sequencing* addendum below (re-ordered + renumbered — e.g. old `1b` → `A3`). This original is kept for its rationale; **follow the Revised sequence for phase numbers** (including where the *Unblocking summary* below still uses the old `1b`).
+> **⚠ Superseded** by the **Revised refactor sequence** in the *Mock Removal & Multi-Operator Sequencing* addendum below (re-ordered + renumbered — e.g. old `1b` → `A3`). This original is kept for its rationale; **follow the Revised sequence for phase numbers**.
 
 The ordering maximizes stability per unit effort: safety first, then a cheap shared-foundation pass that unblocks the big wins, then the single-owner conversions, then structural splits done opportunistically alongside.
 
@@ -244,7 +246,7 @@ The ordering maximizes stability per unit effort: safety first, then a cheap sha
 **Phase 4 — Structure (M–L, interleave, don't big-bang):**
 - Split the five GUI god-files and `decode::run_stream` *as you touch them* in Phases 1–3, so each correctness fix lands in a smaller file. Reconcile `message-catalog.md` with reality (build or delete each dead topic). Relocate the large test blocks in `types`/`engine` for navigability.
 
-**Unblocking summary:** 0b unblocks 1a; 1b's `Band::from_hz` unblocks 2b's per-band rule; 2a unblocks all of 2b/2c; closing the loop (1a) removes the abort hack that the deferred-publish race depends on. The two items that should not wait for anything are the safety pass (0a/0b) and the shared-utility pass (1b) — both are cheap and both remove latent bugs immediately.
+**Unblocking summary:** 0b unblocks 1a; A3's `Band::from_hz` unblocks 2b's per-band rule; 2a unblocks all of 2b/2c; closing the loop (1a) removes the abort hack that the deferred-publish race depends on. The two items that should not wait for anything are the safety pass (0a/0b) and the shared-utility pass (A3) — both are cheap and both remove latent bugs immediately.
 
 ---
 
@@ -350,7 +352,7 @@ The throughline: **Phase 2's owners are the gossip inputs.** `decodes_enriched` 
 
 1. ~~Screenshot population~~ — **RESOLVED:** captured against a real radio; mock deletes cleanly.
 2. ~~`logbook/query`~~ — **RESOLVED:** delete it in the Phase-4 catalog reconciliation.
-3. **`seq` persistence** (`networking.md` open Q) — **finding:** the high-water is *already on disk*. `LogEntry.id` is a `QsoId { origin, seq }` (`types` lib.rs:548/571) and the logbook already replays every entry into a `seen: HashSet<QsoId>` on startup (`logbook/lib.rs:50`). So persistence needs **no sidecar** — on startup, resume minting from `1 + max(seq where origin == me)` derived from the replayed log. **Decided — folded into Phase 2 (2a)** (the logbook is already open there for the band/freq fix); deriving from the log can't drift from the log the way a separate high-water file could. The separate, milder restart bug is the **snapshot** `seq` (`net/lib.rs:154` starts at 0 each process), which makes a restarted op look *stale* to peers until `PEER_TTL` ages out their record — fix alongside, but it self-heals where the log `seq` collision silently *loses data*.
+3. **`seq` persistence** (`networking.md` open Q) — **finding:** the high-water is *already on disk*. `LogEntry.id` is a `QsoId { origin, seq }` (`types` lib.rs:548/571) and the logbook already replays every entry into a `seen: HashSet<QsoId>` on startup (`logbook/lib.rs:50`). So persistence needs **no sidecar** — on startup, resume minting from `1 + max(seq where origin == me)` derived from the replayed log. **Decided — folded into Phase 2 (2a)** (the logbook is already open there for the band/freq fix); deriving from the log can't drift from the log the way a separate high-water file could. The separate, milder restart bug is the **snapshot** `seq` (`net/lib.rs:154` starts at 0 each process), which makes a restarted op look *stale* to peers until `PEER_TTL` ages out their record — fix alongside, but it self-heals where the log `seq` collision silently *loses data*. **Note — as shipped, the code seeds `seq` from the wall clock (`qso/shell.rs`), not the decided log-high-water `1 + max(seq where origin == me)`** — a pragmatic collision-avoidance choice; revisit if a restart collision surfaces.
 
 ---
 

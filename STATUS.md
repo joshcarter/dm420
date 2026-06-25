@@ -1,0 +1,55 @@
+# DM420 — Status & Open Work
+
+> Single source of truth for **open** work. Done work is **not** tracked here — `git log` is its record. The *why* behind architecture tasks lives in `ARCHITECTURE_REVIEW.md`; component specs in `docs/`; the multi-op protocol in `docs/networking.md`. Owners: **J** = Josh/N0JDC, **W** = Joel/W4LL, **—** = either. _Updated 2026-06-25._
+
+## 🔴 Field Day blockers (June 27–28)
+- [ ] **Per-band/per-mode "unworked" tracking + Field-Day log reset** — J — the core FD dupe rule; reset path + per-`(call,band)` worked display
+- [ ] **First on-air FT4 QSO** — W/J — encode verified offline (r=1.0 vs ft8_lib) but never keyed; confirm TX path + FT4 watchdog on a real radio
+- [ ] **QSO correctness investigation** — W/J — on-air symptoms observed, not yet pinned; reproduce + diagnose
+- [ ] **CQ answered with a report (not grid) is ignored** — J — drops real FD contacts; fix drafted+reverted on `lane-finder` branch, needs landing + regression test
+- [ ] **Logbook shows class/section, not signal report** — — — the FD exchange is class+section, not SNR
+- [ ] **Send box doesn't update live during a QSO** — J — only refreshes after TX (`tx_hold` latch); operational blindness mid-over
+- [ ] **Shared logbook MVP (multi-op headline)** — J — Network Step 2; full anti-entropy is risky in 2 days, but an outbound-push + inbound-merge MVP may land (see `docs/networking.md`)
+
+## After Field Day
+
+**Architecture rework (open)** — IDs reference `ARCHITECTURE_REVIEW.md`:
+- [ ] **1a — close the TX-outcome loop** ⚠ *the deepest fault*: the FSM advances open-loop (`TxAck` only has `Accepted`); a denied/failed over advances like a sent one → logged contacts that never aired. Safety-adjacent.
+- [ ] 1c — clock unification (wire the dead `BusView.clock`; remaining direct `Utc::now()` reads) — spectrogram drift only partly fixed
+- [ ] 2c — publish `OperatingState` (the mode+band owner) + a `SessionCommand` bus path — retires the interim band-from-`RigState` workaround in the beacon
+- [ ] 3b — per-radio control lease (Operate | Scanning | Configuring) + operate⊥configure invariant; config off the lock edge
+- [ ] 0a — derive watchdog / `max_tx` / `grant_ttl` from one `slot_period` + `debug_assert`; explicit `ForceUnkey` (the stale comments are already fixed)
+- [ ] 0b — wire `Granter::revoke` into the QSO-Stop / scan-cancel abort path (the method exists but is unused)
+- [ ] A2 — carve the dead prototype tables (`panel_data.rs`) + the mock-only `waterslide_panel.rs`
+- [ ] Phase 4 — reconcile `docs/message-catalog.md` with reality (mark each topic built / delete the dead ones)
+
+**Multi-op feature track** — see `docs/networking.md`:
+- [ ] Shared logbook, full (Step 2): outbound push, inbound merge, G-set, anti-entropy digest/request/reply, origin-distinct UI
+- [ ] Origin prerequisites: `origin: Mine|Peer` on the GUI `HeardEntry` / `MapSpot`; the worked producer emits `WorkedByNetwork`
+- [ ] Working-intent (Step 3): the deconfliction overlay shipped; remaining = auto-pick exclusion of peers' offsets
+- [ ] Heard/band aggregation (Step 4): peers' heard-stations + band-activity into the local views
+- [ ] Shared band-scan: beacon `band_activity`; show peers' scan results
+
+**Decoder** — see `docs/decoder_*.md` (W's lane):
+- [ ] FT4 coherent decode (still magnitude-only; baseline gap ~30%) — `docs/decoder_ft4_coherent_handoff.md`
+- [ ] Sensitivity Phase 3.1 fit + profiling
+
+**Reliability / live pipeline** — see `docs/live_pipeline_notes.md`:
+- [ ] Spectrogram ↔ decode-text drift: rebuild columns by `SpectrumRow.t` (🔴 — same fix as 1c)
+- [ ] Bound the per-slot decode threads (backpressure when decode > slot duration)
+- [ ] Clean capture shutdown (enables device/source switching)
+- [ ] Spectrum stream sampled lossily (a `Cell`, not a ring) — drain a ring per frame
+- [ ] NTP-drift detection / warning (slot timing silently depends on the system clock)
+- [ ] Brightness scale hardcoded (`COL_DB_FLOOR`/`CEIL`) — add a reference-level control / AGC
+
+## Backlog / under consideration
+- Map: grid squares drawn in the wrong places
+- Map: turn off crosshairs after a QSO clears; highlight a station that answers my CQ
+- After a QSO finishes: unhighlight traffic + reset the Send box to CQ
+- Remember the last FT4/FT8 operating mode across restarts
+- RX clipping indicator (audio level)
+- Clear-lane finder: jump to an optimum CQ calling frequency (occupancy map + lane scoring) — `lane-finder` branch
+- Band-scanner enhancements: per-offset sweep, FD-only filter, SNR floor, configurable dwell
+- Decode-archive analytics: querying, logbook recovery, whole-QSO view, SQLite, origin stamping
+- Waterfall render gap on refocus (the App-Nap *unkey* is already fixed; spectrogram-freeze-on-refocus remains)
+- _Design calls to settle:_ wait-for-CQ vs answer-immediately (`docs/joel/joels-notes.md`); jump on a station after their RR73; behavior when clicking another station (decode or map) while armed / mid-QSO; drop SNR from own transmissions
