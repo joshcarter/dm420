@@ -167,20 +167,21 @@ const TX_CAP_DEFAULT: u8 = 3;
 /// couple for insurance, then resume CQ.
 const TX_CAP_AFTER_LOG: u8 = 2;
 
-// --------------------------------------------- sequencer vocabulary (3a, inert)
+// ---------------------------------------------------- sequencer vocabulary (3a)
 //
-// The typed words the `Progress` transition tables (ARCHITECTURE_REVIEW.md item
-// 3a) are built from, added ahead of the tables + routing so they can be
-// unit-tested in isolation. Nothing in the decision path uses them yet — hence
-// `#[allow(dead_code)]`, removed piecewise as later steps wire each one in. See
-// docs/joel/qsos-and-the-progress-fsm.md.
+// The typed words the `open` / `advance` transition tables (ARCHITECTURE_REVIEW.md
+// item 3a) are built from, and that the four commit/advance sites route through.
+// See docs/joel/qsos-and-the-progress-fsm.md.
 
-/// Where we are in the exchange — WSJT-X's `m_QSOProgress`, mirrored. Will become
-/// the legible phase a contact carries once the tables produce it; the published
-/// `step` stays the display value. **[Joel owns the final taxonomy.]**
-#[allow(dead_code)]
+/// Where we are in the exchange — WSJT-X's `m_QSOProgress`, mirrored. The legible
+/// phase a contact carries (`Active.progress`), set by the appliers as the tables
+/// advance it; the published phase stays `step` (a follow-up can surface this on the
+/// bus). **[Joel owns the final taxonomy.]**
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Progress {
+    /// Pre-contact (the engine's `State::Calling`); kept to mirror `m_QSOProgress`
+    /// fully, but never carried by an `Active`, which spans only the in-contact phases.
+    #[allow(dead_code)]
     Calling,
     Replying,
     Report,
@@ -194,7 +195,6 @@ enum Progress {
 /// its `rogered` bit (the two cases the engine treats differently). Addressing
 /// (`to`/`from`/`caller`) is intentionally dropped: the routing sites check it
 /// before consulting the tables.
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq)]
 enum MsgKind {
     Cq { grid: Option<GridSquare> },
@@ -211,7 +211,6 @@ enum MsgKind {
 impl MsgKind {
     /// Classify an inbound message into the closed set the tables key on. Pure, and
     /// it drops addressing (the routing pre-checks own that).
-    #[allow(dead_code)]
     fn classify(m: &ParsedMessage) -> MsgKind {
         match m {
             ParsedMessage::Cq { grid, .. } => MsgKind::Cq { grid: grid.clone() },
@@ -245,7 +244,6 @@ impl MsgKind {
 /// The abstract reply a transition asks for; [`Engine::materialize`] turns it into a
 /// real [`OutgoingMessage`]. Keeps the tables pure data — they can't build messages,
 /// which need `&self.me`.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Reply {
     None,
@@ -258,7 +256,6 @@ enum Reply {
 }
 
 /// Which captured fact a transition records from the received message (for the log).
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq)]
 enum Capture {
     None,
@@ -269,7 +266,6 @@ enum Capture {
 
 /// When a transition logs the contact. `OnSend` is today's `log_on_tx` (log when the
 /// queued message transmits); `OnReceive` fires immediately on a received sign-off.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LogWhen {
     Never,
@@ -279,7 +275,6 @@ enum LogWhen {
 
 /// What to do once the reply is queued. `FinishOnSend` is today's `finish_after_tx`
 /// (applied after the message goes out); `ResumeCqNow` resumes CQ immediately.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Settle {
     StayActive,
@@ -290,7 +285,6 @@ enum Settle {
 /// One transition's full consequence — pure data the engine then materializes (the
 /// reply) and applies (the fields). `step` is carried, not derived from `progress`, to
 /// keep the published display number byte-identical.
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq)]
 struct Outcome {
     reply: Reply,
@@ -304,7 +298,6 @@ struct Outcome {
 /// The result of advancing a committed contact: `Ignore` is the old silent `_ => None`
 /// made explicit (leave the contact untouched; it repeats and the give-up counter
 /// climbs toward the timeout).
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq)]
 enum Transition {
     Ignore,
@@ -327,7 +320,6 @@ struct Seed {
 /// Standard, our FD exchange in Field Day — see [`Engine::opener`]); we capture the
 /// target's grid from its CQ. Used by the armed trigger after it checks
 /// `caller == target`.
-#[allow(dead_code)]
 fn answer_opener(target_grid: Option<GridSquare>) -> Outcome {
     Outcome {
         reply: Reply::Opener,
@@ -343,7 +335,6 @@ fn answer_opener(target_grid: Option<GridSquare>) -> Outcome {
 /// the resume opener path; both have already checked the line is `to == me`. `None`
 /// means "not an opener" → stay calling CQ. **Exhaustive over `MsgKind` — no `_`**, so
 /// a new content variant fails to compile until it's classified here.
-#[allow(dead_code)]
 fn open(fd: bool, kind: MsgKind) -> Option<(Role, Outcome)> {
     use MsgKind::*;
     match kind {
@@ -394,7 +385,6 @@ fn open(fd: bool, kind: MsgKind) -> Option<(Role, Outcome)> {
 /// lost-race (`abandon`) pre-check has already run, so this is a directed message from
 /// our partner. **Exhaustive over `MsgKind` — `Ignore` is the explicit no-op** that
 /// used to be a silent `_ => None`.
-#[allow(dead_code)]
 fn advance(role: Role, fd: bool, kind: MsgKind) -> Transition {
     use MsgKind::*;
     use Role::*;
@@ -440,7 +430,6 @@ fn advance(role: Role, fd: bool, kind: MsgKind) -> Transition {
 /// the Field Day CQ side on their roger); otherwise we've already logged on RR73-sent
 /// (Standard CQ side) and just resume CQ. Logging-on-receive is gated on `!logged` by
 /// the applier reading the live contact, so it isn't decided here.
-#[allow(dead_code)]
 fn signoff_outcome(role: Role, fd: bool, k: Signoff) -> Outcome {
     let courtesy = role == Role::Answering || (fd && is_roger(k));
     if courtesy {
@@ -1181,8 +1170,7 @@ impl Engine {
 
     /// Turn an abstract [`Reply`] tag into the message to transmit, using our station
     /// config, the partner call, and our report of them (`snr`, for the report
-    /// messages). The 1:1 map onto the `message::*` builders the tables will lean on.
-    #[allow(dead_code)]
+    /// messages). The 1:1 map onto the `message::*` builders the tables lean on.
     fn materialize(&self, reply: Reply, his: &Callsign, snr: i8) -> Option<OutgoingMessage> {
         Some(match reply {
             Reply::None => return None,
@@ -2510,7 +2498,7 @@ mod tests {
         assert_eq!(s.state.phase, QsoPhase::Idle, "grid opener not resumable in Field Day");
     }
 
-    // ---- step 3: inert sequencer vocabulary (classify + materialize)
+    // ---- sequencer vocabulary: classify + materialize
 
     #[test]
     fn classify_maps_each_message_kind() {
@@ -2616,7 +2604,7 @@ mod tests {
         );
     }
 
-    // ---- step 4: the pure transition tables (open / advance / signoff / answer)
+    // ---- the pure transition tables (open / advance / signoff / answer)
 
     fn fd_bare() -> MsgKind {
         MsgKind::FdBare {
