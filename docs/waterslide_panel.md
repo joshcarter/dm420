@@ -54,6 +54,17 @@ including how clicking text vs. empty spectrum maps to answering vs.
 calling CQ, and how multiple answering stations are highlighted and
 selected — is specified in [`qso_flow.md`](qso_flow.md).
 
+As built, the outgoing/TX offset is **owned by the QSO engine**, not the
+panel: the panel renders `QsoState.tx_offset` and moves it only by
+issuing `SetTxOffset` (which the engine ignores while the offset is
+locked). This panel is also the **single operating authority for
+selection**: both its own gestures (a waterslide click, a digit
+shortcut, CLEAR QSY) and a Contacts-map pick flow through one handler
+that reads the shared `selection/{id}/active` topic (the single owner)
+and, on a *new* selection, places the TX offset and — for a map pick
+outside the current passband, when unlocked — retunes the dial. A
+locked selection still selects (highlights); it just doesn't tune.
+
 During radio transmit, receive data will not be present. However our
 own transmission audo will be known. The graph should show our
 transmission FFT at the appropriate center point and our own

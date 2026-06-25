@@ -32,8 +32,20 @@ the theme accent color):
 - Unworked station calling CQ: filled circle (an answerable caller).
   Dims with last-heard time like the hollow circle.
 
-- Currently selected station (the call selected in the waterslide): a
-  full-screen accent crosshair plus a highlight ring on its marker.
+- Currently selected station: a full-screen accent crosshair plus a
+  highlight ring on its marker. The selection is shared — the
+  `selection/{id}/active` bus topic (the single owner), written by both
+  the waterslide and this map and read back here for the crosshair.
+
+Clicking a station marker **selects** that station: the map is a pure
+select-input. It emits one selection — who (the call, with its last
+sighting's slot and, when known, its absolute frequency) — and does
+nothing else. It performs no offset move, no dial retune, and has no
+lock awareness; the Digital (waterslide) panel is the single operating
+authority that reads the selection and places the TX offset / retunes
+(only when the station is outside the current passband and the offset
+is unlocked). A worked-only spot carries no frequency, so it selects by
+call without tuning; Enter on the waterslide still arms it.
 
 section identifiers during ARRL Field Day. If traffic doesn't have
 either of those, it shouldn't be displayed on the map.

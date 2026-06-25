@@ -160,14 +160,25 @@ pub enum SessionCommand {
 ## 5. Selection + QSO
 
 ```rust
-// selection/{id}/active  (State) — gesture, not action; the mode service interprets it.
-// `outgoing` is an offset *write*: the qso engine owns the TX offset and ignores this
-// (like SetTxOffset) while the offset is locked, so no path can move a frozen offset.
+// selection/{id}/active  (State) — which station/decode the operator picked. A gesture,
+// not an action: it records WHO is selected (`target`) and WHERE (`context`). The single
+// owner of the selection — both the Digital (waterslide) and Contacts (map) panels write
+// it via one select command and read it back for their highlight; the Call Sign panel
+// and the QSO engine (arm target) read it too. It is NOT the TX offset: the engine owns
+// the offset (set via SetTxOffset). The Digital panel is the single operating authority —
+// it reads a new selection and places the offset + retunes (map's `AbsFreq` only, and
+// only when out-of-passband AND unlocked). The map is a pure select-input.
 pub struct Selection {
     pub radio: RadioId,
-    pub outgoing: OffsetHz,        // where the next TX audio is tuned (engine-gated by the lock)
-    pub target: Option<DecodeRef>, // None = bare retune (click in FFT);
-                                   // Some = intent to work that decode (click on text)
+    pub target: Option<DecodeRef>,          // None = bare-offset / deselect; Some = work that decode
+    pub context: Option<SelectionContext>,  // where the selection is (for the offset/retune);
+                                            //   None = select-by-call, no known frequency
+}
+// The freq/offset CONTEXT — where the selected lane/station is, so the Digital panel can
+// place the TX offset and decide a retune. Not the TX offset itself (the engine owns that).
+pub enum SelectionContext {
+    Passband(OffsetHz),  // in-passband lane (waterslide click / bare offset / CLEAR QSY): set offset
+    AbsFreq(AbsHz),      // a map pick at a known absolute freq: snap in-passband, else retune (unlocked)
 }
 
 // Stable handle so a selection survives the decode batch it came from.
@@ -182,8 +193,10 @@ pub enum QsoCommand {
                                                  //   to us (no CQ wait) — clicked `<me> <them> …`
     CallCq,
     Abort,
-    SetTxOffset(OffsetHz),                       // move the outgoing TX offset (click / /clear /
-                                                 //   map-pick); ignored by the engine while locked
+    SetTxOffset(OffsetHz),                       // move the outgoing TX offset; issued only by the
+                                                 //   Digital panel's selection handler (click / digit
+                                                 //   / /clear / CLEAR QSY / placed map pick).
+                                                 //   Ignored by the engine while locked.
     SetOffsetLock(bool),                         // freeze/unfreeze the TX offset (Tab / LOCKED).
                                                  //   While locked NO offset move happens — not a
                                                  //   write, not auto-QSY. Enforced in the engine.
@@ -211,11 +224,18 @@ send button emits `QsoCommand` and the panel reflects `QsoState`.
 
 The **TX audio offset has a single owner: the QSO engine** — it's the only component that both
 reads the offset (to transmit: `TxIntent.offset` ← `Calling`/`Active` offset) and moves it
-autonomously (auto-QSY after unanswered CQs). Every offset writer (waterslide click, `/clear`,
-map-pick → `SetTxOffset`; arming gestures → `Selection.outgoing`) flows to the engine, which is the
-one place the lock is enforced: while `SetOffsetLock(true)`, **no** offset move happens — operator
-write *or* auto-QSY hop. The UI holds no offset of its own; it renders `QsoState.tx_offset` /
-`offset_locked`.
+autonomously (auto-QSY after unanswered CQs). Every offset move flows through one command —
+`SetTxOffset` — issued solely by the Digital panel's selection handler (waterslide click, digit,
+`/clear`, CLEAR QSY, and a map pick it placed). `Selection` no longer carries the offset; it only
+records the operator's pick. The engine is the one place the lock is enforced: while
+`SetOffsetLock(true)`, **no** offset move happens — `SetTxOffset` *or* auto-QSY hop. The UI holds
+no offset of its own; it renders `QsoState.tx_offset` / `offset_locked`.
+
+**Selection has a single owner too: the `selection/{id}/active` State.** Both the Digital and
+Contacts panels select by writing it (one select command) and read it back for their highlight; the
+Digital panel is the single operating authority that turns a *new* selection into the offset/retune
+response (the map does none of that). There is no reverse map→waterslide channel and no GUI-local
+selection copy.
 
 ## 6. TX handoff  —  `radio/{id}/audio_tx` (intent on the bus; codec co-located with rig mgr)
 
