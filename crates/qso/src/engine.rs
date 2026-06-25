@@ -1779,4 +1779,502 @@ mod tests {
         )));
         assert_eq!(s.state.phase, QsoPhase::Idle);
     }
+
+    // ============================================ characterization: the matrix
+    //
+    // These pin the *currently silent* cells of the (phase, role, contest, kind)
+    // sequencing matrix — the `_ => None` / `_ => {}` drops in `commit_from_cq`,
+    // `commit_from_armed`, `advance_active`, and `resume_from` — plus the exact
+    // published `step` numbers and the known entry-vs-resume role divergence. They
+    // assert *today's* behavior, so the 3a Progress-table refactor (which makes
+    // those drops explicit and exhaustive) is provably behavior-preserving as long
+    // as they stay green. See docs/joel/qsos-and-the-progress-fsm.md.
+
+    // ---- entry drops: a non-opener while calling CQ must not commit (stay Calling)
+
+    #[test]
+    fn calling_cq_ignores_bare_roger_report() {
+        // The CQ side opens only on a grid / report / FD-bare answer. A bare R-report
+        // is not an opener; it's dropped and we keep calling CQ. (If a flat
+        // (role,contest,kind) table ever committed here, this is the regression.)
+        let mut e = engine(ContestProfile::Standard);
+        e.step(Event::Command(QsoCommand::CallCq));
+        assert_eq!(tx_text(&mut e, 2).as_deref(), Some("CQ W9XYZ EM48"));
+        let s = e.step(Event::Decode(decode(
+            exch(ME, HIM, ExchangePayload::RogerReport(-3)),
+            3,
+            -8,
+        )));
+        assert_eq!(
+            s.state.phase,
+            QsoPhase::Calling,
+            "a bare R-report must not open a contact"
+        );
+        assert_eq!(tx_text(&mut e, 4).as_deref(), Some("CQ W9XYZ EM48"), "still calling CQ");
+    }
+
+    #[test]
+    fn calling_cq_ignores_signoff_while_calling() {
+        let mut e = engine(ContestProfile::Standard);
+        e.step(Event::Command(QsoCommand::CallCq));
+        assert_eq!(tx_text(&mut e, 2).as_deref(), Some("CQ W9XYZ EM48"));
+        let s = e.step(Event::Decode(decode(signoff(ME, HIM, Signoff::Rr73), 3, -8)));
+        assert_eq!(
+            s.state.phase,
+            QsoPhase::Calling,
+            "a sign-off opens nothing while calling CQ"
+        );
+    }
+
+    #[test]
+    fn calling_cq_ignores_wrong_contest_openers() {
+        // Standard: an FD bare exchange is not a Standard opener.
+        let mut e = engine(ContestProfile::Standard);
+        e.step(Event::Command(QsoCommand::CallCq));
+        let _ = tx_text(&mut e, 2);
+        let s = e.step(Event::Decode(decode(
+            exch(
+                ME,
+                HIM,
+                ExchangePayload::FieldDay {
+                    class: "2B".into(),
+                    section: Section("IL".into()),
+                    rogered: false,
+                },
+            ),
+            3,
+            -8,
+        )));
+        assert_eq!(s.state.phase, QsoPhase::Calling, "FD opener ignored in Standard");
+
+        // Field Day: a plain grid or bare report is a non-participant — ignored.
+        let mut e = engine(ContestProfile::ArrlFieldDay);
+        e.step(Event::Command(QsoCommand::CallCq));
+        let _ = tx_text(&mut e, 2);
+        let s = e.step(Event::Decode(decode(
+            exch(ME, HIM, ExchangePayload::Grid(GridSquare("FN42".into()))),
+            3,
+            -8,
+        )));
+        assert_eq!(s.state.phase, QsoPhase::Calling, "grid opener ignored in Field Day");
+        let s = e.step(Event::Decode(decode(
+            exch(ME, HIM, ExchangePayload::Report(-3)),
+            5,
+            -8,
+        )));
+        assert_eq!(s.state.phase, QsoPhase::Calling, "report opener ignored in Field Day");
+    }
+
+    #[test]
+    fn calling_cq_ignores_opener_addressed_to_someone_else() {
+        let mut e = engine(ContestProfile::Standard);
+        e.step(Event::Command(QsoCommand::CallCq));
+        let _ = tx_text(&mut e, 2);
+        let s = e.step(Event::Decode(decode(
+            exch("W1AAA", HIM, ExchangePayload::Grid(GridSquare("FN42".into()))),
+            3,
+            -8,
+        )));
+        assert_eq!(
+            s.state.phase,
+            QsoPhase::Calling,
+            "an opener addressed to someone else isn't ours"
+        );
+    }
+
+    #[test]
+    fn calling_cq_ignores_cq_and_free_text() {
+        let mut e = engine(ContestProfile::Standard);
+        e.step(Event::Command(QsoCommand::CallCq));
+        let _ = tx_text(&mut e, 2);
+        let s = e.step(Event::Decode(decode(cq_from("W1AAA", false), 3, -8)));
+        assert_eq!(s.state.phase, QsoPhase::Calling, "another CQ doesn't commit us");
+        let s = e.step(Event::Decode(decode(ParsedMessage::Free("CQ DX".into()), 5, -8)));
+        assert_eq!(s.state.phase, QsoPhase::Calling, "free text doesn't commit us");
+    }
+
+    // ---- advance drops: a non-advancing message mid-contact is ignored (overs climb)
+
+    #[test]
+    fn active_cq_side_ignores_redundant_grid_and_times_out() {
+        // CQ side, having sent our report: the partner re-sends their grid. It's
+        // dropped — no new reply — and the give-up counter is *not* reset, so the
+        // contact still times out on schedule.
+        let mut e = engine(ContestProfile::Standard);
+        e.step(Event::Command(QsoCommand::CallCq));
+        assert_eq!(tx_text(&mut e, 0).as_deref(), Some("CQ W9XYZ EM48"));
+        e.step(Event::Decode(decode(
+            exch(ME, HIM, ExchangePayload::Grid(GridSquare("FN42".into()))),
+            1,
+            -8,
+        )));
+        assert_eq!(tx_text(&mut e, 2).as_deref(), Some("K1ABC W9XYZ -08")); // over 1
+        let s = e.step(Event::Decode(decode(
+            exch(ME, HIM, ExchangePayload::Grid(GridSquare("FN42".into()))),
+            3,
+            -8,
+        )));
+        assert!(
+            matches!(s.state.phase, QsoPhase::InExchange { .. }),
+            "same contact, redundant grid ignored"
+        );
+        assert_eq!(tx_text(&mut e, 4).as_deref(), Some("K1ABC W9XYZ -08")); // over 2 (not reset)
+        assert_eq!(tx_text(&mut e, 6).as_deref(), Some("K1ABC W9XYZ -08")); // over 3
+        let s = e.step(Event::Tick { slot: SlotId(8) });
+        assert_eq!(
+            s.state.phase,
+            QsoPhase::TimedOut,
+            "times out on schedule despite the redundant grid"
+        );
+        assert_eq!(e.state().phase, QsoPhase::Calling);
+    }
+
+    #[test]
+    fn active_answering_ignores_roger_report() {
+        // Answering side, just sent our grid; a roger-report (we expected a plain
+        // report) is not a transition for this role → ignored, opener repeats.
+        let mut e = engine(ContestProfile::Standard);
+        e.step(Event::Command(start_target()));
+        e.step(Event::Decode(decode(cq_from(HIM, false), 4, -5)));
+        assert_eq!(tx_text(&mut e, 5).as_deref(), Some("K1ABC W9XYZ EM48"));
+        let s = e.step(Event::Decode(decode(
+            exch(ME, HIM, ExchangePayload::RogerReport(-3)),
+            6,
+            -5,
+        )));
+        assert!(matches!(s.state.phase, QsoPhase::InExchange { .. }));
+        assert_eq!(
+            tx_text(&mut e, 7).as_deref(),
+            Some("K1ABC W9XYZ EM48"),
+            "still sending our grid"
+        );
+    }
+
+    #[test]
+    fn active_ignores_contest_mismatch() {
+        // A Field Day message in a Standard contact → ignored.
+        let mut e = engine(ContestProfile::Standard);
+        e.step(Event::Command(start_target()));
+        e.step(Event::Decode(decode(cq_from(HIM, false), 4, -5)));
+        assert_eq!(tx_text(&mut e, 5).as_deref(), Some("K1ABC W9XYZ EM48"));
+        let s = e.step(Event::Decode(decode(
+            exch(
+                ME,
+                HIM,
+                ExchangePayload::FieldDay {
+                    class: "2B".into(),
+                    section: Section("IL".into()),
+                    rogered: true,
+                },
+            ),
+            6,
+            -5,
+        )));
+        assert!(matches!(s.state.phase, QsoPhase::InExchange { .. }));
+        assert_eq!(
+            tx_text(&mut e, 7).as_deref(),
+            Some("K1ABC W9XYZ EM48"),
+            "FD message ignored in a Standard contact"
+        );
+
+        // A Standard report in a Field Day contact → ignored.
+        let mut e = engine(ContestProfile::ArrlFieldDay);
+        e.step(Event::Command(start_target()));
+        e.step(Event::Decode(decode(cq_from(HIM, true), 4, -5)));
+        assert_eq!(tx_text(&mut e, 5).as_deref(), Some("K1ABC W9XYZ 3A WI"));
+        let s = e.step(Event::Decode(decode(
+            exch(ME, HIM, ExchangePayload::Report(-12)),
+            6,
+            -5,
+        )));
+        assert!(matches!(s.state.phase, QsoPhase::InExchange { .. }));
+        assert_eq!(
+            tx_text(&mut e, 7).as_deref(),
+            Some("K1ABC W9XYZ 3A WI"),
+            "Standard report ignored in an FD contact"
+        );
+    }
+
+    #[test]
+    fn active_fd_answering_ignores_bare_exchange() {
+        // FD answering side waits for the partner's *rogered* exchange; a bare one
+        // (no roger) doesn't advance us.
+        let mut e = engine(ContestProfile::ArrlFieldDay);
+        e.step(Event::Command(start_target()));
+        e.step(Event::Decode(decode(cq_from(HIM, true), 4, -5)));
+        assert_eq!(tx_text(&mut e, 5).as_deref(), Some("K1ABC W9XYZ 3A WI"));
+        let s = e.step(Event::Decode(decode(
+            exch(
+                ME,
+                HIM,
+                ExchangePayload::FieldDay {
+                    class: "2B".into(),
+                    section: Section("IL".into()),
+                    rogered: false,
+                },
+            ),
+            6,
+            -5,
+        )));
+        assert!(matches!(s.state.phase, QsoPhase::InExchange { .. }));
+        assert_eq!(
+            tx_text(&mut e, 7).as_deref(),
+            Some("K1ABC W9XYZ 3A WI"),
+            "bare exchange doesn't advance the FD answering side"
+        );
+    }
+
+    #[test]
+    fn active_fd_cq_side_ignores_further_exchange() {
+        // FD CQ side, having sent the combined R+exchange, waits for the partner's
+        // RR73; another exchange message doesn't advance us.
+        let mut e = engine(ContestProfile::ArrlFieldDay);
+        e.step(Event::Command(QsoCommand::CallCq));
+        assert_eq!(tx_text(&mut e, 0).as_deref(), Some("CQ FD W9XYZ EM48"));
+        e.step(Event::Decode(decode(
+            exch(
+                ME,
+                HIM,
+                ExchangePayload::FieldDay {
+                    class: "2B".into(),
+                    section: Section("IL".into()),
+                    rogered: false,
+                },
+            ),
+            1,
+            -8,
+        )));
+        assert_eq!(tx_text(&mut e, 2).as_deref(), Some("K1ABC W9XYZ R 3A WI"));
+        let s = e.step(Event::Decode(decode(
+            exch(
+                ME,
+                HIM,
+                ExchangePayload::FieldDay {
+                    class: "2B".into(),
+                    section: Section("IL".into()),
+                    rogered: true,
+                },
+            ),
+            3,
+            -8,
+        )));
+        assert!(matches!(s.state.phase, QsoPhase::InExchange { .. }));
+        assert_eq!(
+            tx_text(&mut e, 4).as_deref(),
+            Some("K1ABC W9XYZ R 3A WI"),
+            "further exchange ignored; still waiting for RR73"
+        );
+    }
+
+    #[test]
+    fn active_ignores_non_partner_and_cq() {
+        // Mid-contact, a directed line from a *different* station, and a CQ, are both
+        // ignored — neither is our partner advancing the exchange.
+        let mut e = engine(ContestProfile::Standard);
+        e.step(Event::Command(start_target()));
+        e.step(Event::Decode(decode(cq_from(HIM, false), 4, -5)));
+        assert_eq!(tx_text(&mut e, 5).as_deref(), Some("K1ABC W9XYZ EM48"));
+        let s = e.step(Event::Decode(decode(
+            exch(ME, "N0ONE", ExchangePayload::Report(-3)),
+            6,
+            -5,
+        )));
+        assert!(matches!(s.state.phase, QsoPhase::InExchange { .. }));
+        assert_eq!(
+            s.state.partner,
+            Some(call(HIM)),
+            "partner unchanged by a non-partner line"
+        );
+        let s = e.step(Event::Decode(decode(cq_from("W1AAA", false), 8, -5)));
+        assert!(matches!(s.state.phase, QsoPhase::InExchange { .. }));
+        assert_eq!(
+            tx_text(&mut e, 9).as_deref(),
+            Some("K1ABC W9XYZ EM48"),
+            "still working our partner"
+        );
+    }
+
+    // ---- the abandon (lost-race) branch on the CQ side
+
+    #[test]
+    fn abandon_on_cq_side_resumes_cq() {
+        // The answering-side lost-race is covered by `lost_race_mid_qso_rearms`; this
+        // pins the CQ side: our caller starts addressing someone else → we abandon and
+        // resume calling CQ (there's no target to re-arm to).
+        let mut e = engine(ContestProfile::Standard);
+        e.step(Event::Command(QsoCommand::CallCq));
+        assert_eq!(tx_text(&mut e, 0).as_deref(), Some("CQ W9XYZ EM48"));
+        e.step(Event::Decode(decode(
+            exch(ME, HIM, ExchangePayload::Grid(GridSquare("FN42".into()))),
+            1,
+            -8,
+        )));
+        assert_eq!(tx_text(&mut e, 2).as_deref(), Some("K1ABC W9XYZ -08"));
+        let s = e.step(Event::Decode(decode(
+            exch("W1AAA", HIM, ExchangePayload::Report(-3)),
+            3,
+            -8,
+        )));
+        assert_eq!(
+            s.state.phase,
+            QsoPhase::Calling,
+            "CQ side abandons to CQ, not Armed"
+        );
+    }
+
+    // ---- the published `step` numbers (display-only, but must stay byte-identical)
+
+    #[test]
+    fn step_published_at_each_phase() {
+        // `InExchange { step }` is display-only but published on QsoState; pin the
+        // exact numbers (irregular by design — note FD-CQ-opener == 1 vs Std-P3 == 2)
+        // so the refactor keeps the snapshot byte-identical.
+        let step_of = |p: &QsoPhase| match p {
+            QsoPhase::InExchange { step } => Some(*step),
+            _ => None,
+        };
+
+        // Standard, answering: grid(1) → roger-report(2) → sign-off(3).
+        let mut e = engine(ContestProfile::Standard);
+        e.step(Event::Command(start_target()));
+        let s = e.step(Event::Decode(decode(cq_from(HIM, false), 4, -5)));
+        assert_eq!(step_of(&s.state.phase), Some(1), "answer grid → step 1");
+        let _ = tx_text(&mut e, 5);
+        let s = e.step(Event::Decode(decode(
+            exch(ME, HIM, ExchangePayload::Report(-12)),
+            6,
+            -5,
+        )));
+        assert_eq!(step_of(&s.state.phase), Some(2), "their report → step 2");
+        let _ = tx_text(&mut e, 7);
+        let s = e.step(Event::Decode(decode(signoff(ME, HIM, Signoff::Rr73), 8, -5)));
+        assert_eq!(step_of(&s.state.phase), Some(3), "their RR73 → step 3");
+
+        // Standard, CQ side: report sent(1) → RR73(2).
+        let mut e = engine(ContestProfile::Standard);
+        e.step(Event::Command(QsoCommand::CallCq));
+        let _ = tx_text(&mut e, 0);
+        let s = e.step(Event::Decode(decode(
+            exch(ME, HIM, ExchangePayload::Grid(GridSquare("FN42".into()))),
+            1,
+            -8,
+        )));
+        assert_eq!(step_of(&s.state.phase), Some(1), "CQ side report → step 1");
+        let s = e.step(Event::Decode(decode(
+            exch(ME, HIM, ExchangePayload::RogerReport(-3)),
+            3,
+            -8,
+        )));
+        assert_eq!(step_of(&s.state.phase), Some(2), "CQ side RR73 → step 2");
+
+        // Standard P3 opener (report instead of grid): step 2 immediately.
+        let mut e = engine(ContestProfile::Standard);
+        e.step(Event::Command(QsoCommand::CallCq));
+        let _ = tx_text(&mut e, 0);
+        let s = e.step(Event::Decode(decode(
+            exch(ME, HIM, ExchangePayload::Report(-3)),
+            1,
+            -8,
+        )));
+        assert_eq!(step_of(&s.state.phase), Some(2), "P3 report-opener → step 2");
+
+        // Field Day CQ side opener (bare exchange): step 1.
+        let mut e = engine(ContestProfile::ArrlFieldDay);
+        e.step(Event::Command(QsoCommand::CallCq));
+        let _ = tx_text(&mut e, 0);
+        let s = e.step(Event::Decode(decode(
+            exch(
+                ME,
+                HIM,
+                ExchangePayload::FieldDay {
+                    class: "2B".into(),
+                    section: Section("IL".into()),
+                    rogered: false,
+                },
+            ),
+            1,
+            -8,
+        )));
+        assert_eq!(step_of(&s.state.phase), Some(1), "FD CQ opener → step 1");
+    }
+
+    // ---- the known entry-vs-resume role divergence (preserved, not fixed here)
+
+    #[test]
+    fn report_to_us_diverges_entry_vs_resume() {
+        // KNOWN ASYMMETRY, preserved deliberately: a bare report addressed to us is
+        // read as role CallingCq when it arrives while we're calling CQ (the P3
+        // opener), but as role Answering when the operator *resumes* from it. The
+        // endings differ — CQ side resumes CQ with no final 73; answering side sends
+        // 73 and goes idle. Pinned so the table refactor can't silently unify them.
+        // (Candidate follow-up; out of scope for the behavior-preserving 3a slice.)
+
+        // Entry while calling CQ → CallingCq → resumes CQ, no 73.
+        let mut e = engine(ContestProfile::Standard);
+        e.step(Event::Command(QsoCommand::CallCq));
+        let _ = tx_text(&mut e, 0);
+        e.step(Event::Decode(decode(
+            exch(ME, HIM, ExchangePayload::Report(-3)),
+            1,
+            -8,
+        )));
+        assert_eq!(tx_text(&mut e, 2).as_deref(), Some("K1ABC W9XYZ R-08"));
+        e.step(Event::Decode(decode(signoff(ME, HIM, Signoff::Rr73), 3, -8)));
+        assert_eq!(
+            e.state().phase,
+            QsoPhase::Calling,
+            "entry path is the CQ side → resumes CQ"
+        );
+
+        // Resume from the same kind of line → Answering → sends 73, goes idle.
+        let mut e = engine(ContestProfile::Standard);
+        e.step(Event::Command(resume_cmd(
+            exch(ME, HIM, ExchangePayload::Report(-12)),
+            6,
+            -5,
+        )));
+        assert_eq!(tx_text(&mut e, 7).as_deref(), Some("K1ABC W9XYZ R-05"));
+        e.step(Event::Decode(decode(signoff(ME, HIM, Signoff::Rr73), 8, -5)));
+        assert_eq!(
+            tx_text(&mut e, 9).as_deref(),
+            Some("K1ABC W9XYZ 73"),
+            "resume path is the answering side → sends 73"
+        );
+        assert_eq!(e.state().phase, QsoPhase::Idle, "answering side goes idle");
+    }
+
+    // ---- resume role-inference drops (lines that carry no resumable contact)
+
+    #[test]
+    fn resume_ignores_non_resumable_lines() {
+        // A bare 73 (non-roger sign-off): nothing left to send → not resumable.
+        let mut e = engine(ContestProfile::Standard);
+        let s = e.step(Event::Command(resume_cmd(signoff(ME, HIM, Signoff::Seven3), 6, -5)));
+        assert_eq!(s.state.phase, QsoPhase::Idle, "bare 73 is not resumable");
+
+        // A contest-mismatched opener is not resumable.
+        let mut e = engine(ContestProfile::Standard);
+        let s = e.step(Event::Command(resume_cmd(
+            exch(
+                ME,
+                HIM,
+                ExchangePayload::FieldDay {
+                    class: "2B".into(),
+                    section: Section("IL".into()),
+                    rogered: false,
+                },
+            ),
+            6,
+            -5,
+        )));
+        assert_eq!(s.state.phase, QsoPhase::Idle, "FD opener not resumable in Standard");
+
+        let mut e = engine(ContestProfile::ArrlFieldDay);
+        let s = e.step(Event::Command(resume_cmd(
+            exch(ME, HIM, ExchangePayload::Grid(GridSquare("FN42".into()))),
+            3,
+            -8,
+        )));
+        assert_eq!(s.state.phase, QsoPhase::Idle, "grid opener not resumable in Field Day");
+    }
 }
