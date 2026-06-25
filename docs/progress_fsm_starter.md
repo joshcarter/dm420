@@ -1,5 +1,11 @@
 # Starter prompt — Progress FSM refactor (ARCHITECTURE_REVIEW.md item 3a)
 
+> ✅ **Superseded — the refactor landed.** Item 3a is done (branch `fd-progress-fsm`):
+> characterization tests, the `Progress` enum, the `open`/`advance` transition tables,
+> and exhaustive routing of all four sites — behavior-preserving. This prompt is kept
+> for the record. See `docs/joel/qsos-and-the-progress-fsm.md` for the landed design
+> and `ARCHITECTURE_REVIEW.md` item 4 for status.
+
 This is a starter prompt for **Joel (W4LL)** to paste into a fresh Claude Code session
 in the DM420 repo. It refactors the QSO sequencer into a typed `Progress` transition
 table (behavior-preserving, test-first). Trim/adjust as you see fit — you know the

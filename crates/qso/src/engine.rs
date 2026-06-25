@@ -130,6 +130,11 @@ struct Active {
     logged: bool,
     /// Display-only over counter for `QsoPhase::InExchange { step }`.
     step: u8,
+    /// The authoritative exchange phase (WSJT-X `m_QSOProgress`), set in one place by
+    /// the appliers as the contact advances. Carried for legibility — the *published*
+    /// phase stays `step`; a follow-up slice can surface `progress` on the bus.
+    #[allow(dead_code)]
+    progress: Progress,
     // --- captured facts for the log ---
     partner_grid: Option<GridSquare>,
     /// Our report of the partner's signal (Standard), used for the report we send.
@@ -161,6 +166,297 @@ const TX_CAP_DEFAULT: u8 = 3;
 /// QSO already counts for us, so extra `RR73`s only help *them* log us: send a
 /// couple for insurance, then resume CQ.
 const TX_CAP_AFTER_LOG: u8 = 2;
+
+// ---------------------------------------------------- sequencer vocabulary (3a)
+//
+// The typed words the `open` / `advance` transition tables (ARCHITECTURE_REVIEW.md
+// item 3a) are built from, and that the four commit/advance sites route through.
+// See docs/joel/qsos-and-the-progress-fsm.md.
+
+/// Where we are in the exchange — WSJT-X's `m_QSOProgress`, mirrored. The legible
+/// phase a contact carries (`Active.progress`), set by the appliers as the tables
+/// advance it; the published phase stays `step` (a follow-up can surface this on the
+/// bus). **[Joel owns the final taxonomy.]**
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Progress {
+    /// Pre-contact (the engine's `State::Calling`); kept to mirror `m_QSOProgress`
+    /// fully, but never carried by an `Active`, which spans only the in-contact phases.
+    #[allow(dead_code)]
+    Calling,
+    Replying,
+    Report,
+    RogerReport,
+    Rogers,
+    Signoff,
+}
+
+/// The received content the sequencer reacts to — a flattened projection of
+/// [`ParsedMessage`] + [`ExchangePayload`], with the Field Day exchange split by
+/// its `rogered` bit (the two cases the engine treats differently). Addressing
+/// (`to`/`from`/`caller`) is intentionally dropped: the routing sites check it
+/// before consulting the tables.
+#[derive(Clone, Debug, PartialEq)]
+enum MsgKind {
+    Cq { grid: Option<GridSquare> },
+    Grid(GridSquare),
+    Report(i8),
+    RogerReport(i8),
+    FdBare { class: String, section: Section },
+    FdRoger { class: String, section: Section },
+    Signoff(Signoff),
+    /// Free / Raw / anything the decoder couldn't classify — never sequenced.
+    Other,
+}
+
+impl MsgKind {
+    /// Classify an inbound message into the closed set the tables key on. Pure, and
+    /// it drops addressing (the routing pre-checks own that).
+    fn classify(m: &ParsedMessage) -> MsgKind {
+        match m {
+            ParsedMessage::Cq { grid, .. } => MsgKind::Cq { grid: grid.clone() },
+            ParsedMessage::Exchange { payload, .. } => match payload {
+                ExchangePayload::Grid(g) => MsgKind::Grid(g.clone()),
+                ExchangePayload::Report(r) => MsgKind::Report(*r),
+                ExchangePayload::RogerReport(r) => MsgKind::RogerReport(*r),
+                ExchangePayload::FieldDay {
+                    class,
+                    section,
+                    rogered: false,
+                } => MsgKind::FdBare {
+                    class: class.clone(),
+                    section: section.clone(),
+                },
+                ExchangePayload::FieldDay {
+                    class,
+                    section,
+                    rogered: true,
+                } => MsgKind::FdRoger {
+                    class: class.clone(),
+                    section: section.clone(),
+                },
+            },
+            ParsedMessage::Signoff { kind, .. } => MsgKind::Signoff(*kind),
+            ParsedMessage::Free(_) | ParsedMessage::Raw(_) => MsgKind::Other,
+        }
+    }
+}
+
+/// The abstract reply a transition asks for; [`Engine::materialize`] turns it into a
+/// real [`OutgoingMessage`]. Keeps the tables pure data — they can't build messages,
+/// which need `&self.me`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reply {
+    None,
+    Opener,
+    Report,
+    RogerReport,
+    FdRogerExchange,
+    Rr73,
+    Seven3,
+}
+
+/// Which captured fact a transition records from the received message (for the log).
+#[derive(Clone, Debug, PartialEq)]
+enum Capture {
+    None,
+    Grid(Option<GridSquare>),
+    Report(i8),
+    Fd(String, Section),
+}
+
+/// When a transition logs the contact. `OnSend` is today's `log_on_tx` (log when the
+/// queued message transmits); `OnReceive` fires immediately on a received sign-off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LogWhen {
+    Never,
+    OnSend,
+    OnReceive,
+}
+
+/// What to do once the reply is queued. `FinishOnSend` is today's `finish_after_tx`
+/// (applied after the message goes out); `ResumeCqNow` resumes CQ immediately.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Settle {
+    StayActive,
+    FinishOnSend(Finish),
+    ResumeCqNow,
+}
+
+/// One transition's full consequence — pure data the engine then materializes (the
+/// reply) and applies (the fields). `step` is carried, not derived from `progress`, to
+/// keep the published display number byte-identical.
+#[derive(Clone, Debug, PartialEq)]
+struct Outcome {
+    reply: Reply,
+    progress: Progress,
+    step: u8,
+    capture: Capture,
+    log: LogWhen,
+    settle: Settle,
+}
+
+/// The result of advancing a committed contact: `Ignore` is the old silent `_ => None`
+/// made explicit (leave the contact untouched; it repeats and the give-up counter
+/// climbs toward the timeout).
+#[derive(Clone, Debug, PartialEq)]
+enum Transition {
+    Ignore,
+    Act(Outcome),
+}
+
+/// The triggering context for building a fresh contact — the facts only the commit
+/// site has (who answered, where, which slot, our report of them). Paired with an
+/// opener [`Outcome`] by [`Engine::open_at`].
+struct Seed {
+    role: Role,
+    partner: Callsign,
+    target: Option<DecodeRef>,
+    offset: OffsetHz,
+    tx_parity: u8,
+    snr: i8,
+}
+
+/// Armed → answering: our target finally called CQ. The opener is fixed (our grid in
+/// Standard, our FD exchange in Field Day — see [`Engine::opener`]); we capture the
+/// target's grid from its CQ. Used by the armed trigger after it checks
+/// `caller == target`.
+fn answer_opener(target_grid: Option<GridSquare>) -> Outcome {
+    Outcome {
+        reply: Reply::Opener,
+        progress: Progress::Replying,
+        step: 1,
+        capture: Capture::Grid(target_grid),
+        log: LogWhen::Never,
+        settle: Settle::StayActive,
+    }
+}
+
+/// A station answered our CQ (we become `CallingCq`). Shared by the CQ-side commit and
+/// the resume opener path; both have already checked the line is `to == me`. `None`
+/// means "not an opener" → stay calling CQ. **Exhaustive over `MsgKind` — no `_`**, so
+/// a new content variant fails to compile until it's classified here.
+fn open(fd: bool, kind: MsgKind) -> Option<(Role, Outcome)> {
+    use MsgKind::*;
+    match kind {
+        // Standard: they answered with their grid (Tx1) → we send the report (Tx2).
+        Grid(g) if !fd => Some((
+            Role::CallingCq,
+            Outcome {
+                reply: Reply::Report,
+                progress: Progress::Report,
+                step: 1,
+                capture: Capture::Grid(Some(g)),
+                log: LogWhen::Never,
+                settle: Settle::StayActive,
+            },
+        )),
+        // Standard (P3 skip-Tx1): they opened with a bare report → roger it (Tx3).
+        Report(r) if !fd => Some((
+            Role::CallingCq,
+            Outcome {
+                reply: Reply::RogerReport,
+                progress: Progress::RogerReport,
+                step: 2,
+                capture: Capture::Report(r),
+                log: LogWhen::Never,
+                settle: Settle::StayActive,
+            },
+        )),
+        // Field Day: they answered with the bare exchange (Tx2) → roger+exchange (Tx3).
+        FdBare { class, section } if fd => Some((
+            Role::CallingCq,
+            Outcome {
+                reply: Reply::FdRogerExchange,
+                progress: Progress::RogerReport,
+                step: 1,
+                capture: Capture::Fd(class, section),
+                log: LogWhen::Never,
+                settle: Settle::StayActive,
+            },
+        )),
+        // Explicit holes — every variant named, no `_`. A wrong-contest opener, a
+        // roger-report / sign-off / CQ, or unclassified text opens no contact.
+        Grid(_) | Report(_) | FdBare { .. } | FdRoger { .. } | RogerReport(_)
+        | Signoff(_) | Cq { .. } | Other => None,
+    }
+}
+
+/// Advance a committed contact. Role comes from the contact; the addressing /
+/// lost-race (`abandon`) pre-check has already run, so this is a directed message from
+/// our partner. **Exhaustive over `MsgKind` — `Ignore` is the explicit no-op** that
+/// used to be a silent `_ => None`.
+fn advance(role: Role, fd: bool, kind: MsgKind) -> Transition {
+    use MsgKind::*;
+    use Role::*;
+    match kind {
+        // Standard, answering side: their report → roger+report (Tx3).
+        Report(r) if role == Answering && !fd => Transition::Act(Outcome {
+            reply: Reply::RogerReport,
+            progress: Progress::RogerReport,
+            step: 2,
+            capture: Capture::Report(r),
+            log: LogWhen::Never,
+            settle: Settle::StayActive,
+        }),
+        // Field Day, answering side: their R+exchange → RR73; log on send, then idle.
+        FdRoger { class, section } if role == Answering && fd => Transition::Act(Outcome {
+            reply: Reply::Rr73,
+            progress: Progress::Rogers,
+            step: 2,
+            capture: Capture::Fd(class, section),
+            log: LogWhen::OnSend,
+            settle: Settle::FinishOnSend(Finish::Idle),
+        }),
+        // Standard, CQ side: their R-report → RR73; log on send (then hold for a 73).
+        RogerReport(r) if role == CallingCq && !fd => Transition::Act(Outcome {
+            reply: Reply::Rr73,
+            progress: Progress::Rogers,
+            step: 2,
+            capture: Capture::Report(r),
+            log: LogWhen::OnSend,
+            settle: Settle::StayActive,
+        }),
+        // Any directed sign-off completes the contact (P2).
+        Signoff(k) => Transition::Act(signoff_outcome(role, fd, k)),
+        // Explicit holes — every variant named, no `_`. A repeated / wrong-phase /
+        // contest-mismatched / non-advancing message is ignored.
+        Report(_) | RogerReport(_) | FdBare { .. } | FdRoger { .. } | Grid(_)
+        | Cq { .. } | Other => Transition::Ignore,
+    }
+}
+
+/// The sign-off branch (P2): any directed `RRR`/`RR73`/`73` completes the contact. We
+/// send a courtesy `73` when we hold the courtesy slot (the answering side always, and
+/// the Field Day CQ side on their roger); otherwise we've already logged on RR73-sent
+/// (Standard CQ side) and just resume CQ. Logging-on-receive is gated on `!logged` by
+/// the applier reading the live contact, so it isn't decided here.
+fn signoff_outcome(role: Role, fd: bool, k: Signoff) -> Outcome {
+    let courtesy = role == Role::Answering || (fd && is_roger(k));
+    if courtesy {
+        let finish = if role == Role::CallingCq {
+            Finish::ResumeCq
+        } else {
+            Finish::Idle
+        };
+        Outcome {
+            reply: Reply::Seven3,
+            progress: Progress::Signoff,
+            step: 3,
+            capture: Capture::None,
+            log: LogWhen::OnReceive,
+            settle: Settle::FinishOnSend(finish),
+        }
+    } else {
+        Outcome {
+            reply: Reply::None,
+            progress: Progress::Signoff,
+            step: 3,
+            capture: Capture::None,
+            log: LogWhen::OnReceive,
+            settle: Settle::ResumeCqNow,
+        }
+    }
+}
 
 /// The QSO engine for one radio.
 pub struct Engine {
@@ -358,36 +654,27 @@ impl Engine {
             return;
         };
         let target = target.clone();
-        match msg {
-            // The target called CQ — answer in the opposite slot at our chosen TX
-            // offset (self.outgoing), the engine-owned offset the Digital panel set
-            // via `SetTxOffset` when the operator selected this target. Using the
-            // target's decoded offset here would ignore a locked audio offset and
-            // transmit on the wrong frequency.
-            ParsedMessage::Cq { caller, grid, .. } if Some(caller) == target.call.as_ref() => {
-                tracing::info!(target = ?caller, tx_offset = ?self.outgoing, "qso engine: target called CQ → answering");
-                let opener = self.opener(caller);
-                self.state = State::Active(Box::new(Active {
+        // The armed path waits specifically for the *target's* CQ; a non-match means
+        // "stay armed" (not a dropped step), so this stays a dedicated trigger rather
+        // than a table lookup. We answer in the opposite slot at our chosen TX offset
+        // (self.outgoing) — the engine-owned offset the Digital panel set via
+        // `SetTxOffset` when the operator selected this target; the target's decoded
+        // offset would ignore a locked audio offset and transmit on the wrong frequency.
+        if let ParsedMessage::Cq { caller, grid, .. } = msg
+            && Some(caller) == target.call.as_ref()
+        {
+            tracing::info!(target = ?caller, tx_offset = ?self.outgoing, "qso engine: target called CQ → answering");
+            self.open_at(
+                Seed {
                     role: Role::Answering,
                     partner: caller.clone(),
                     target: Some(target),
                     offset: self.outgoing,
                     tx_parity: parity_after(slot),
-                    next: Some(opener),
-                    finish_after_tx: None,
-                    log_on_tx: false,
-                    logged: false,
-                    step: 1,
-                    partner_grid: grid.clone(),
-                    partner_snr: snr,
-                    rcvd_report: None,
-                    rcvd_fd: None,
-                    overs_since_progress: 0,
-                }));
-            }
-            // The target answered someone else — we lost the race; stay armed and
-            // wait for its next CQ (we never transmitted, so nothing to stop).
-            _ => {}
+                    snr,
+                },
+                answer_opener(grid.clone()),
+            );
         }
     }
 
@@ -399,98 +686,28 @@ impl Engine {
         offset: OffsetHz,
         tx_parity: Option<u8>,
     ) -> Option<CompletedQso> {
-        let parity = tx_parity.unwrap_or(0);
-        match msg {
-            // Standard: a caller answered with their grid (Tx1).
-            ParsedMessage::Exchange {
-                to,
-                from,
-                payload: ExchangePayload::Grid(grid),
-            } if to == &self.me.call && !self.me.is_field_day() => {
-                let reply = message::report(&self.me, from, snr);
-                self.state = State::Active(Box::new(Active {
-                    role: Role::CallingCq,
-                    partner: from.clone(),
-                    target: None,
-                    offset,
-                    tx_parity: parity,
-                    next: Some(reply),
-                    finish_after_tx: None,
-                    log_on_tx: false,
-                    logged: false,
-                    step: 1,
-                    partner_grid: Some(grid.clone()),
-                    partner_snr: snr,
-                    rcvd_report: None,
-                    rcvd_fd: None,
-                    overs_since_progress: 0,
-                }));
-                None
-            }
-            // Standard (P3): a caller skipped the grid and answered with a bare
-            // signal report (the Tx2-style "skip-Tx1" opening, common in pile-ups
-            // and POTA). Roger it and send our report (Tx3) — WSJT-X's jump-ahead.
-            // We complete when they roger us (their `RR73`, via `advance_active`).
-            // Field Day stays exclusive (no report openers — see A3 of the doc).
-            ParsedMessage::Exchange {
-                to,
-                from,
-                payload: ExchangePayload::Report(r),
-            } if to == &self.me.call && !self.me.is_field_day() => {
-                let reply = message::roger_report(&self.me, from, snr);
-                self.state = State::Active(Box::new(Active {
-                    role: Role::CallingCq,
-                    partner: from.clone(),
-                    target: None,
-                    offset,
-                    tx_parity: parity,
-                    next: Some(reply),
-                    finish_after_tx: None,
-                    log_on_tx: false,
-                    logged: false,
-                    step: 2,
-                    partner_grid: None,
-                    partner_snr: snr,
-                    rcvd_report: Some(*r),
-                    rcvd_fd: None,
-                    overs_since_progress: 0,
-                }));
-                None
-            }
-            // Field Day: a caller answered with their bare exchange (Tx2). We
-            // reply with the combined roger+exchange (Tx3).
-            ParsedMessage::Exchange {
-                to,
-                from,
-                payload:
-                    ExchangePayload::FieldDay {
-                        class,
-                        section,
-                        rogered: false,
-                    },
-            } if to == &self.me.call && self.me.is_field_day() => {
-                let reply = message::fd_roger_exchange(&self.me, from);
-                self.state = State::Active(Box::new(Active {
-                    role: Role::CallingCq,
-                    partner: from.clone(),
-                    target: None,
-                    offset,
-                    tx_parity: parity,
-                    next: Some(reply),
-                    finish_after_tx: None,
-                    log_on_tx: false,
-                    logged: false,
-                    step: 1,
-                    partner_grid: None,
-                    partner_snr: snr,
-                    rcvd_report: None,
-                    rcvd_fd: Some((class.clone(), section.clone())),
-                    overs_since_progress: 0,
-                }));
-                None
-            }
-            _ => None,
+        // Only a line addressed to us answers our CQ (lifted from the old per-arm
+        // `to == me` guards); a CQ / free text / a line to someone else opens nothing.
+        let (to, from) = addressed(msg)?;
+        if to != &self.me.call {
+            return None;
         }
+        // The `open` table decides which opener this is (grid / P3 report / FD bare),
+        // or `None` to stay calling CQ — replacing the three arms and their `_ => None`.
+        if let Some((role, o)) = open(self.me.is_field_day(), MsgKind::classify(msg)) {
+            self.open_at(
+                Seed {
+                    role,
+                    partner: from.clone(),
+                    target: None,
+                    offset,
+                    tx_parity: tx_parity.unwrap_or(0),
+                    snr,
+                },
+                o,
+            );
+        }
+        None
     }
 
     /// Pick up a contact mid-stream from a decode the operator clicked, when the
@@ -565,76 +782,61 @@ impl Engine {
 
         tracing::info!(partner = ?from, ?role, "qso engine: resume — picking up mid-contact");
 
-        // A provisional contact; `next`, the logging trigger, and the captured
-        // exchange facts are filled by the same content-driven transitions the live
-        // paths use (the openers inline below, everything else via `advance_active`).
-        // We never saw the earlier overs, so the log can only carry what's on this
+        // An opener (a station answering our CQ — a grid in Standard, the bare
+        // exchange in Field Day) builds the contact directly via the shared `open`
+        // table. Everything else — a report / roger-report / sign-off — seeds a
+        // *provisional* contact and lets the in-QSO `advance` fill it in from this
+        // line, the same content-driven path the live engine uses (and the reason
+        // resume can pick up partway through). We use the inferred `role` either way;
+        // since we never saw the earlier overs, the log can only carry what's on this
         // line plus our own report — partial, but truthful for a late pick-up.
-        self.state = State::Active(Box::new(Active {
-            role,
-            partner: from.clone(),
-            target: Some(target.clone()),
-            offset,
-            tx_parity: parity_after(target.slot),
-            next: None,
-            finish_after_tx: None,
-            log_on_tx: false,
-            logged: false,
-            step: 0,
-            partner_grid: None,
-            partner_snr: snr,
-            rcvd_report: None,
-            rcvd_fd: None,
-            overs_since_progress: 0,
-        }));
-
-        match &msg {
-            // Openers — a station answering our CQ. `advance_active` only handles
-            // mid/late exchanges, so seed the reply (and captured fact) here.
-            ParsedMessage::Exchange {
-                payload: ExchangePayload::Grid(grid),
-                ..
-            } => {
-                let reply = message::report(&self.me, &from, snr);
-                if let State::Active(a) = &mut self.state {
-                    a.partner_grid = Some(grid.clone());
-                    a.next = Some(reply);
-                    a.step = 1;
-                }
-                None
-            }
-            ParsedMessage::Exchange {
-                payload:
-                    ExchangePayload::FieldDay {
-                        class,
-                        section,
-                        rogered: false,
-                    },
-                ..
-            } => {
-                let reply = message::fd_roger_exchange(&self.me, &from);
-                if let State::Active(a) = &mut self.state {
-                    a.rcvd_fd = Some((class.clone(), section.clone()));
-                    a.next = Some(reply);
-                    a.step = 1;
-                }
-                None
-            }
-            // Report / R-report / sign-off: reuse the in-QSO transition, which sets
-            // `next`, the logging trigger, and returns any log (their `RR73`).
-            _ => self.advance_active(&msg, snr),
+        if let Some((_, o)) = open(me_fd, MsgKind::classify(&msg)) {
+            self.open_at(
+                Seed {
+                    role,
+                    partner: from,
+                    target: Some(target.clone()),
+                    offset,
+                    tx_parity: parity_after(target.slot),
+                    snr,
+                },
+                o,
+            );
+            None
+        } else {
+            self.state = State::Active(Box::new(Active {
+                role,
+                partner: from,
+                target: Some(target.clone()),
+                offset,
+                tx_parity: parity_after(target.slot),
+                next: None,
+                finish_after_tx: None,
+                log_on_tx: false,
+                logged: false,
+                step: 0,
+                progress: Progress::Replying,
+                partner_grid: None,
+                partner_snr: snr,
+                rcvd_report: None,
+                rcvd_fd: None,
+                overs_since_progress: 0,
+            }));
+            self.advance_active(&msg, snr)
         }
     }
 
     /// Advance a committed contact from received content.
     fn advance_active(&mut self, msg: &ParsedMessage, _snr: i8) -> Option<CompletedQso> {
-        // Pull what we need without holding a borrow across `&mut self` calls.
-        let (role, partner, partner_snr, logged) = match &self.state {
-            State::Active(a) => (a.role, a.partner.clone(), a.partner_snr, a.logged),
+        // Pull what the addressing check needs without holding a borrow across the
+        // `&mut self` apply.
+        let (role, partner) = match &self.state {
+            State::Active(a) => (a.role, a.partner.clone()),
             _ => return None,
         };
 
-        // Auto-stop / lost-race: the partner is now addressing a different call.
+        // Auto-stop / lost-race: the partner is now addressing a different call. This
+        // routing pre-check is unchanged — only the post-check decision is now tabled.
         match addressed(msg) {
             Some((to, from)) => {
                 if from == &partner && to != &self.me.call {
@@ -647,103 +849,110 @@ impl Engine {
             None => return None, // a CQ or unaddressed line — ignore mid-QSO
         }
 
-        let me_fd = self.me.is_field_day();
-        match (role, me_fd, msg) {
-            // ---------- Standard, answering side: their report → roger+report ----------
-            (
-                Role::Answering,
-                false,
-                ParsedMessage::Exchange {
-                    payload: ExchangePayload::Report(r),
-                    ..
-                },
-            ) => {
-                let reply = message::roger_report(&self.me, &partner, partner_snr);
-                if let State::Active(a) = &mut self.state {
-                    a.rcvd_report = Some(*r);
-                    a.next = Some(reply);
-                    a.step = 2;
-                    a.overs_since_progress = 0;
-                }
-                None
-            }
+        // The decision, consolidated: the `advance` table maps (role, contest, content)
+        // to a transition; `apply_advance` writes it onto the live contact (or leaves it
+        // on `Ignore`). This replaces the four hand-enumerated arms and their silent
+        // `_ => None`.
+        let fd = self.me.is_field_day();
+        self.apply_advance(advance(role, fd, MsgKind::classify(msg)))
+    }
 
-            // ---------- Field Day, answering side: their R+exchange → RR73 ----------
-            (
-                Role::Answering,
-                true,
-                ParsedMessage::Exchange {
-                    payload:
-                        ExchangePayload::FieldDay {
-                            class,
-                            section,
-                            rogered: true,
-                        },
-                    ..
-                },
-            ) => {
-                // Their R+exchange — send RR73 and log when it goes out (RR73 sent).
-                let rr = message::rr73(&self.me, &partner);
-                if let State::Active(a) = &mut self.state {
-                    a.rcvd_fd = Some((class.clone(), section.clone()));
-                    a.next = Some(rr);
-                    a.finish_after_tx = Some(Finish::Idle);
-                    a.log_on_tx = true;
-                    a.step = 2;
-                    a.overs_since_progress = 0;
-                }
-                None
-            }
+    /// Apply a [`Transition`] from the `advance` table to the live contact. `Ignore`
+    /// leaves it untouched (the contact keeps repeating; the give-up counter climbs).
+    /// `Act` materializes the reply and writes the contact's fields — now the single
+    /// place an in-progress contact's `next` / `finish_after_tx` / `log_on_tx` / `step`
+    /// / captured-fact writes happen. Returns a completed-QSO log for the "log on
+    /// receive" (sign-off) case.
+    fn apply_advance(&mut self, t: Transition) -> Option<CompletedQso> {
+        let Transition::Act(o) = t else {
+            return None; // Ignore — no mutation, give-up counter untouched
+        };
 
-            // ---------- Standard, CQ side: their R-report → RR73 (log on send) ----------
-            (
-                Role::CallingCq,
-                false,
-                ParsedMessage::Exchange {
-                    payload: ExchangePayload::RogerReport(r),
-                    ..
-                },
-            ) => {
-                let rr = message::rr73(&self.me, &partner);
-                if let State::Active(a) = &mut self.state {
-                    a.rcvd_report = Some(*r);
-                    a.next = Some(rr);
-                    a.log_on_tx = true;
-                    a.step = 2;
-                    a.overs_since_progress = 0;
-                }
-                None
+        // "Log on receive" (sign-off): build the record from the live contact, gated on
+        // not-yet-logged, before any mutation.
+        let done = if matches!(o.log, LogWhen::OnReceive) {
+            match &self.state {
+                State::Active(a) if !a.logged => Some(self.completed(a)),
+                _ => None,
             }
+        } else {
+            None
+        };
 
-            // ---------- Any directed sign-off (RRR / RR73 / 73) completes it ----------
-            // P2: a partner who sends us *any* sign-off is done. Bare `73` is the most
-            // common ending on the air, and RRR/RR73/73 are interchangeable here —
-            // gating on one specific token is what used to leave us repeating an over
-            // forever. The answering side (and the FD CQ side, on their RR73) sends a
-            // courtesy `73`; the Standard CQ side has already logged on RR73-sent and
-            // just resumes CQ.
-            (_, _, ParsedMessage::Signoff { kind, .. }) => {
-                let done = (!logged).then(|| self.completed());
-                let courtesy = matches!(role, Role::Answering) || (me_fd && is_roger(*kind));
-                if courtesy {
-                    let s73 = message::seven3(&self.me, &partner);
-                    let resume = matches!(role, Role::CallingCq);
-                    if let State::Active(a) = &mut self.state {
-                        a.next = Some(s73);
-                        a.finish_after_tx =
-                            Some(if resume { Finish::ResumeCq } else { Finish::Idle });
-                        a.logged = true;
-                        a.step = 3;
-                        a.overs_since_progress = 0;
-                    }
-                } else {
-                    self.resume_cq();
-                }
-                done
-            }
-
-            _ => None,
+        // Non-courtesy sign-off — nothing left to send: resume CQ now, before the writes.
+        if matches!(o.settle, Settle::ResumeCqNow) {
+            self.resume_cq();
+            return done;
         }
+
+        // Materialize the reply against the live contact — partner call + our stored
+        // report of them (not the inbound decode's snr).
+        let reply = match &self.state {
+            State::Active(a) => self.materialize(o.reply, &a.partner, a.partner_snr),
+            _ => return done,
+        };
+        if let State::Active(a) = &mut self.state {
+            if let Some(m) = reply {
+                a.next = Some(m);
+            }
+            a.step = o.step;
+            a.progress = o.progress;
+            match &o.capture {
+                Capture::None => {}
+                Capture::Grid(g) => a.partner_grid = g.clone(),
+                Capture::Report(r) => a.rcvd_report = Some(*r),
+                Capture::Fd(class, section) => {
+                    a.rcvd_fd = Some((class.clone(), section.clone()))
+                }
+            }
+            match o.log {
+                LogWhen::OnSend => a.log_on_tx = true,
+                LogWhen::OnReceive => a.logged = true,
+                LogWhen::Never => {}
+            }
+            if let Settle::FinishOnSend(f) = o.settle {
+                a.finish_after_tx = Some(f);
+            }
+            a.overs_since_progress = 0;
+        }
+        done
+    }
+
+    /// Build a fresh committed contact from an opener [`Outcome`] + its [`Seed`]
+    /// context — the single place an *entering* contact is constructed, shared by the
+    /// CQ-side commit, the armed trigger, and the resume opener path. Openers queue a
+    /// first reply and then wait; we honor whatever `log`/`settle` the table carries
+    /// (today every opener is `Never` / `StayActive`, so these start cleared).
+    fn open_at(&mut self, seed: Seed, o: Outcome) {
+        let next = self.materialize(o.reply, &seed.partner, seed.snr);
+        let mut a = Active {
+            role: seed.role,
+            partner: seed.partner,
+            target: seed.target,
+            offset: seed.offset,
+            tx_parity: seed.tx_parity,
+            next,
+            finish_after_tx: match o.settle {
+                Settle::FinishOnSend(f) => Some(f),
+                _ => None,
+            },
+            log_on_tx: matches!(o.log, LogWhen::OnSend),
+            logged: false,
+            step: o.step,
+            progress: o.progress,
+            partner_grid: None,
+            partner_snr: seed.snr,
+            rcvd_report: None,
+            rcvd_fd: None,
+            overs_since_progress: 0,
+        };
+        match &o.capture {
+            Capture::None => {}
+            Capture::Grid(g) => a.partner_grid = g.clone(),
+            Capture::Report(r) => a.rcvd_report = Some(*r),
+            Capture::Fd(class, section) => a.rcvd_fd = Some((class.clone(), section.clone())),
+        }
+        self.state = State::Active(Box::new(a));
     }
 
     /// Lost the race mid-QSO: stop, and re-arm (answering) or resume CQ.
@@ -901,15 +1110,19 @@ impl Engine {
                 (None, None)
             }
             Act::Send => {
-                // Snapshot what we need; the borrow ends before the `&mut self` calls.
-                let (offset, message, do_log, finish) = match &self.state {
+                // Snapshot what we need (incl. the log-on-send record, built while we
+                // still hold `&Active`); the borrow ends before the `&mut self` calls.
+                let (offset, message, finish, log) = match &self.state {
                     State::Active(a) => match &a.next {
-                        Some(m) => (
-                            a.offset,
-                            m.clone(),
-                            a.log_on_tx && !a.logged,
-                            a.finish_after_tx,
-                        ),
+                        Some(m) => {
+                            let do_log = a.log_on_tx && !a.logged;
+                            (
+                                a.offset,
+                                m.clone(),
+                                a.finish_after_tx,
+                                do_log.then(|| self.completed(a)),
+                            )
+                        }
                         None => return (None, None),
                     },
                     _ => return (None, None),
@@ -923,14 +1136,13 @@ impl Engine {
                     slot,
                     message,
                 };
-                // "Log on send" trigger (RR73 sent).
-                let mut log = None;
-                if do_log {
-                    log = Some(self.completed());
-                    if let State::Active(a) = &mut self.state {
-                        a.logged = true;
-                        a.log_on_tx = false;
-                    }
+                // "Log on send" trigger (RR73 sent): the record was built above; mark
+                // the contact logged so it fires only once.
+                if log.is_some()
+                    && let State::Active(a) = &mut self.state
+                {
+                    a.logged = true;
+                    a.log_on_tx = false;
                 }
                 // Apply any queued transition now that the message is on the air.
                 if let Some(finish) = finish {
@@ -956,18 +1168,26 @@ impl Engine {
         }
     }
 
-    /// Build the completed-QSO record from the active contact.
-    fn completed(&self) -> CompletedQso {
-        let State::Active(a) = &self.state else {
-            // Only ever called while active.
-            return CompletedQso {
-                call: Callsign(String::new()),
-                grid: None,
-                section: None,
-                exchange_sent: String::new(),
-                exchange_rcvd: String::new(),
-            };
-        };
+    /// Turn an abstract [`Reply`] tag into the message to transmit, using our station
+    /// config, the partner call, and our report of them (`snr`, for the report
+    /// messages). The 1:1 map onto the `message::*` builders the tables lean on.
+    fn materialize(&self, reply: Reply, his: &Callsign, snr: i8) -> Option<OutgoingMessage> {
+        Some(match reply {
+            Reply::None => return None,
+            Reply::Opener => self.opener(his),
+            Reply::Report => message::report(&self.me, his, snr),
+            Reply::RogerReport => message::roger_report(&self.me, his, snr),
+            Reply::FdRogerExchange => message::fd_roger_exchange(&self.me, his),
+            Reply::Rr73 => message::rr73(&self.me, his),
+            Reply::Seven3 => message::seven3(&self.me, his),
+        })
+    }
+
+    /// Build the completed-QSO record from the given active contact. Taking the
+    /// `&Active` the caller already holds (rather than re-reading `self.state`) makes
+    /// "we're active" an invariant the caller proves — so the old empty-callsign
+    /// escape hatch is gone.
+    fn completed(&self, a: &Active) -> CompletedQso {
         let (sent, rcvd) = if self.me.is_field_day() {
             let sent = format!("{} {}", self.me.fd_class, self.me.fd_section.0);
             let rcvd = a
@@ -1778,5 +1998,788 @@ mod tests {
             -5,
         )));
         assert_eq!(s.state.phase, QsoPhase::Idle);
+    }
+
+    // ============================================ characterization: the matrix
+    //
+    // These pin the *currently silent* cells of the (phase, role, contest, kind)
+    // sequencing matrix — the `_ => None` / `_ => {}` drops in `commit_from_cq`,
+    // `commit_from_armed`, `advance_active`, and `resume_from` — plus the exact
+    // published `step` numbers and the known entry-vs-resume role divergence. They
+    // assert *today's* behavior, so the 3a Progress-table refactor (which makes
+    // those drops explicit and exhaustive) is provably behavior-preserving as long
+    // as they stay green. See docs/joel/qsos-and-the-progress-fsm.md.
+
+    // ---- entry drops: a non-opener while calling CQ must not commit (stay Calling)
+
+    #[test]
+    fn calling_cq_ignores_bare_roger_report() {
+        // The CQ side opens only on a grid / report / FD-bare answer. A bare R-report
+        // is not an opener; it's dropped and we keep calling CQ. (If a flat
+        // (role,contest,kind) table ever committed here, this is the regression.)
+        let mut e = engine(ContestProfile::Standard);
+        e.step(Event::Command(QsoCommand::CallCq));
+        assert_eq!(tx_text(&mut e, 2).as_deref(), Some("CQ W9XYZ EM48"));
+        let s = e.step(Event::Decode(decode(
+            exch(ME, HIM, ExchangePayload::RogerReport(-3)),
+            3,
+            -8,
+        )));
+        assert_eq!(
+            s.state.phase,
+            QsoPhase::Calling,
+            "a bare R-report must not open a contact"
+        );
+        assert_eq!(tx_text(&mut e, 4).as_deref(), Some("CQ W9XYZ EM48"), "still calling CQ");
+    }
+
+    #[test]
+    fn calling_cq_ignores_signoff_while_calling() {
+        let mut e = engine(ContestProfile::Standard);
+        e.step(Event::Command(QsoCommand::CallCq));
+        assert_eq!(tx_text(&mut e, 2).as_deref(), Some("CQ W9XYZ EM48"));
+        let s = e.step(Event::Decode(decode(signoff(ME, HIM, Signoff::Rr73), 3, -8)));
+        assert_eq!(
+            s.state.phase,
+            QsoPhase::Calling,
+            "a sign-off opens nothing while calling CQ"
+        );
+    }
+
+    #[test]
+    fn calling_cq_ignores_wrong_contest_openers() {
+        // Standard: an FD bare exchange is not a Standard opener.
+        let mut e = engine(ContestProfile::Standard);
+        e.step(Event::Command(QsoCommand::CallCq));
+        let _ = tx_text(&mut e, 2);
+        let s = e.step(Event::Decode(decode(
+            exch(
+                ME,
+                HIM,
+                ExchangePayload::FieldDay {
+                    class: "2B".into(),
+                    section: Section("IL".into()),
+                    rogered: false,
+                },
+            ),
+            3,
+            -8,
+        )));
+        assert_eq!(s.state.phase, QsoPhase::Calling, "FD opener ignored in Standard");
+
+        // Field Day: a plain grid or bare report is a non-participant — ignored.
+        let mut e = engine(ContestProfile::ArrlFieldDay);
+        e.step(Event::Command(QsoCommand::CallCq));
+        let _ = tx_text(&mut e, 2);
+        let s = e.step(Event::Decode(decode(
+            exch(ME, HIM, ExchangePayload::Grid(GridSquare("FN42".into()))),
+            3,
+            -8,
+        )));
+        assert_eq!(s.state.phase, QsoPhase::Calling, "grid opener ignored in Field Day");
+        let s = e.step(Event::Decode(decode(
+            exch(ME, HIM, ExchangePayload::Report(-3)),
+            5,
+            -8,
+        )));
+        assert_eq!(s.state.phase, QsoPhase::Calling, "report opener ignored in Field Day");
+    }
+
+    #[test]
+    fn calling_cq_ignores_opener_addressed_to_someone_else() {
+        let mut e = engine(ContestProfile::Standard);
+        e.step(Event::Command(QsoCommand::CallCq));
+        let _ = tx_text(&mut e, 2);
+        let s = e.step(Event::Decode(decode(
+            exch("W1AAA", HIM, ExchangePayload::Grid(GridSquare("FN42".into()))),
+            3,
+            -8,
+        )));
+        assert_eq!(
+            s.state.phase,
+            QsoPhase::Calling,
+            "an opener addressed to someone else isn't ours"
+        );
+    }
+
+    #[test]
+    fn calling_cq_ignores_cq_and_free_text() {
+        let mut e = engine(ContestProfile::Standard);
+        e.step(Event::Command(QsoCommand::CallCq));
+        let _ = tx_text(&mut e, 2);
+        let s = e.step(Event::Decode(decode(cq_from("W1AAA", false), 3, -8)));
+        assert_eq!(s.state.phase, QsoPhase::Calling, "another CQ doesn't commit us");
+        let s = e.step(Event::Decode(decode(ParsedMessage::Free("CQ DX".into()), 5, -8)));
+        assert_eq!(s.state.phase, QsoPhase::Calling, "free text doesn't commit us");
+    }
+
+    // ---- advance drops: a non-advancing message mid-contact is ignored (overs climb)
+
+    #[test]
+    fn active_cq_side_ignores_redundant_grid_and_times_out() {
+        // CQ side, having sent our report: the partner re-sends their grid. It's
+        // dropped — no new reply — and the give-up counter is *not* reset, so the
+        // contact still times out on schedule.
+        let mut e = engine(ContestProfile::Standard);
+        e.step(Event::Command(QsoCommand::CallCq));
+        assert_eq!(tx_text(&mut e, 0).as_deref(), Some("CQ W9XYZ EM48"));
+        e.step(Event::Decode(decode(
+            exch(ME, HIM, ExchangePayload::Grid(GridSquare("FN42".into()))),
+            1,
+            -8,
+        )));
+        assert_eq!(tx_text(&mut e, 2).as_deref(), Some("K1ABC W9XYZ -08")); // over 1
+        let s = e.step(Event::Decode(decode(
+            exch(ME, HIM, ExchangePayload::Grid(GridSquare("FN42".into()))),
+            3,
+            -8,
+        )));
+        assert!(
+            matches!(s.state.phase, QsoPhase::InExchange { .. }),
+            "same contact, redundant grid ignored"
+        );
+        assert_eq!(tx_text(&mut e, 4).as_deref(), Some("K1ABC W9XYZ -08")); // over 2 (not reset)
+        assert_eq!(tx_text(&mut e, 6).as_deref(), Some("K1ABC W9XYZ -08")); // over 3
+        let s = e.step(Event::Tick { slot: SlotId(8) });
+        assert_eq!(
+            s.state.phase,
+            QsoPhase::TimedOut,
+            "times out on schedule despite the redundant grid"
+        );
+        assert_eq!(e.state().phase, QsoPhase::Calling);
+    }
+
+    #[test]
+    fn active_answering_ignores_roger_report() {
+        // Answering side, just sent our grid; a roger-report (we expected a plain
+        // report) is not a transition for this role → ignored, opener repeats.
+        let mut e = engine(ContestProfile::Standard);
+        e.step(Event::Command(start_target()));
+        e.step(Event::Decode(decode(cq_from(HIM, false), 4, -5)));
+        assert_eq!(tx_text(&mut e, 5).as_deref(), Some("K1ABC W9XYZ EM48"));
+        let s = e.step(Event::Decode(decode(
+            exch(ME, HIM, ExchangePayload::RogerReport(-3)),
+            6,
+            -5,
+        )));
+        assert!(matches!(s.state.phase, QsoPhase::InExchange { .. }));
+        assert_eq!(
+            tx_text(&mut e, 7).as_deref(),
+            Some("K1ABC W9XYZ EM48"),
+            "still sending our grid"
+        );
+    }
+
+    #[test]
+    fn active_ignores_contest_mismatch() {
+        // A Field Day message in a Standard contact → ignored.
+        let mut e = engine(ContestProfile::Standard);
+        e.step(Event::Command(start_target()));
+        e.step(Event::Decode(decode(cq_from(HIM, false), 4, -5)));
+        assert_eq!(tx_text(&mut e, 5).as_deref(), Some("K1ABC W9XYZ EM48"));
+        let s = e.step(Event::Decode(decode(
+            exch(
+                ME,
+                HIM,
+                ExchangePayload::FieldDay {
+                    class: "2B".into(),
+                    section: Section("IL".into()),
+                    rogered: true,
+                },
+            ),
+            6,
+            -5,
+        )));
+        assert!(matches!(s.state.phase, QsoPhase::InExchange { .. }));
+        assert_eq!(
+            tx_text(&mut e, 7).as_deref(),
+            Some("K1ABC W9XYZ EM48"),
+            "FD message ignored in a Standard contact"
+        );
+
+        // A Standard report in a Field Day contact → ignored.
+        let mut e = engine(ContestProfile::ArrlFieldDay);
+        e.step(Event::Command(start_target()));
+        e.step(Event::Decode(decode(cq_from(HIM, true), 4, -5)));
+        assert_eq!(tx_text(&mut e, 5).as_deref(), Some("K1ABC W9XYZ 3A WI"));
+        let s = e.step(Event::Decode(decode(
+            exch(ME, HIM, ExchangePayload::Report(-12)),
+            6,
+            -5,
+        )));
+        assert!(matches!(s.state.phase, QsoPhase::InExchange { .. }));
+        assert_eq!(
+            tx_text(&mut e, 7).as_deref(),
+            Some("K1ABC W9XYZ 3A WI"),
+            "Standard report ignored in an FD contact"
+        );
+    }
+
+    #[test]
+    fn active_fd_answering_ignores_bare_exchange() {
+        // FD answering side waits for the partner's *rogered* exchange; a bare one
+        // (no roger) doesn't advance us.
+        let mut e = engine(ContestProfile::ArrlFieldDay);
+        e.step(Event::Command(start_target()));
+        e.step(Event::Decode(decode(cq_from(HIM, true), 4, -5)));
+        assert_eq!(tx_text(&mut e, 5).as_deref(), Some("K1ABC W9XYZ 3A WI"));
+        let s = e.step(Event::Decode(decode(
+            exch(
+                ME,
+                HIM,
+                ExchangePayload::FieldDay {
+                    class: "2B".into(),
+                    section: Section("IL".into()),
+                    rogered: false,
+                },
+            ),
+            6,
+            -5,
+        )));
+        assert!(matches!(s.state.phase, QsoPhase::InExchange { .. }));
+        assert_eq!(
+            tx_text(&mut e, 7).as_deref(),
+            Some("K1ABC W9XYZ 3A WI"),
+            "bare exchange doesn't advance the FD answering side"
+        );
+    }
+
+    #[test]
+    fn active_fd_cq_side_ignores_further_exchange() {
+        // FD CQ side, having sent the combined R+exchange, waits for the partner's
+        // RR73; another exchange message doesn't advance us.
+        let mut e = engine(ContestProfile::ArrlFieldDay);
+        e.step(Event::Command(QsoCommand::CallCq));
+        assert_eq!(tx_text(&mut e, 0).as_deref(), Some("CQ FD W9XYZ EM48"));
+        e.step(Event::Decode(decode(
+            exch(
+                ME,
+                HIM,
+                ExchangePayload::FieldDay {
+                    class: "2B".into(),
+                    section: Section("IL".into()),
+                    rogered: false,
+                },
+            ),
+            1,
+            -8,
+        )));
+        assert_eq!(tx_text(&mut e, 2).as_deref(), Some("K1ABC W9XYZ R 3A WI"));
+        let s = e.step(Event::Decode(decode(
+            exch(
+                ME,
+                HIM,
+                ExchangePayload::FieldDay {
+                    class: "2B".into(),
+                    section: Section("IL".into()),
+                    rogered: true,
+                },
+            ),
+            3,
+            -8,
+        )));
+        assert!(matches!(s.state.phase, QsoPhase::InExchange { .. }));
+        assert_eq!(
+            tx_text(&mut e, 4).as_deref(),
+            Some("K1ABC W9XYZ R 3A WI"),
+            "further exchange ignored; still waiting for RR73"
+        );
+    }
+
+    #[test]
+    fn active_ignores_non_partner_and_cq() {
+        // Mid-contact, a directed line from a *different* station, and a CQ, are both
+        // ignored — neither is our partner advancing the exchange.
+        let mut e = engine(ContestProfile::Standard);
+        e.step(Event::Command(start_target()));
+        e.step(Event::Decode(decode(cq_from(HIM, false), 4, -5)));
+        assert_eq!(tx_text(&mut e, 5).as_deref(), Some("K1ABC W9XYZ EM48"));
+        let s = e.step(Event::Decode(decode(
+            exch(ME, "N0ONE", ExchangePayload::Report(-3)),
+            6,
+            -5,
+        )));
+        assert!(matches!(s.state.phase, QsoPhase::InExchange { .. }));
+        assert_eq!(
+            s.state.partner,
+            Some(call(HIM)),
+            "partner unchanged by a non-partner line"
+        );
+        let s = e.step(Event::Decode(decode(cq_from("W1AAA", false), 8, -5)));
+        assert!(matches!(s.state.phase, QsoPhase::InExchange { .. }));
+        assert_eq!(
+            tx_text(&mut e, 9).as_deref(),
+            Some("K1ABC W9XYZ EM48"),
+            "still working our partner"
+        );
+    }
+
+    // ---- the abandon (lost-race) branch on the CQ side
+
+    #[test]
+    fn abandon_on_cq_side_resumes_cq() {
+        // The answering-side lost-race is covered by `lost_race_mid_qso_rearms`; this
+        // pins the CQ side: our caller starts addressing someone else → we abandon and
+        // resume calling CQ (there's no target to re-arm to).
+        let mut e = engine(ContestProfile::Standard);
+        e.step(Event::Command(QsoCommand::CallCq));
+        assert_eq!(tx_text(&mut e, 0).as_deref(), Some("CQ W9XYZ EM48"));
+        e.step(Event::Decode(decode(
+            exch(ME, HIM, ExchangePayload::Grid(GridSquare("FN42".into()))),
+            1,
+            -8,
+        )));
+        assert_eq!(tx_text(&mut e, 2).as_deref(), Some("K1ABC W9XYZ -08"));
+        let s = e.step(Event::Decode(decode(
+            exch("W1AAA", HIM, ExchangePayload::Report(-3)),
+            3,
+            -8,
+        )));
+        assert_eq!(
+            s.state.phase,
+            QsoPhase::Calling,
+            "CQ side abandons to CQ, not Armed"
+        );
+    }
+
+    // ---- the published `step` numbers (display-only, but must stay byte-identical)
+
+    #[test]
+    fn step_published_at_each_phase() {
+        // `InExchange { step }` is display-only but published on QsoState; pin the
+        // exact numbers (irregular by design — note FD-CQ-opener == 1 vs Std-P3 == 2)
+        // so the refactor keeps the snapshot byte-identical.
+        let step_of = |p: &QsoPhase| match p {
+            QsoPhase::InExchange { step } => Some(*step),
+            _ => None,
+        };
+
+        // Standard, answering: grid(1) → roger-report(2) → sign-off(3).
+        let mut e = engine(ContestProfile::Standard);
+        e.step(Event::Command(start_target()));
+        let s = e.step(Event::Decode(decode(cq_from(HIM, false), 4, -5)));
+        assert_eq!(step_of(&s.state.phase), Some(1), "answer grid → step 1");
+        let _ = tx_text(&mut e, 5);
+        let s = e.step(Event::Decode(decode(
+            exch(ME, HIM, ExchangePayload::Report(-12)),
+            6,
+            -5,
+        )));
+        assert_eq!(step_of(&s.state.phase), Some(2), "their report → step 2");
+        let _ = tx_text(&mut e, 7);
+        let s = e.step(Event::Decode(decode(signoff(ME, HIM, Signoff::Rr73), 8, -5)));
+        assert_eq!(step_of(&s.state.phase), Some(3), "their RR73 → step 3");
+
+        // Standard, CQ side: report sent(1) → RR73(2).
+        let mut e = engine(ContestProfile::Standard);
+        e.step(Event::Command(QsoCommand::CallCq));
+        let _ = tx_text(&mut e, 0);
+        let s = e.step(Event::Decode(decode(
+            exch(ME, HIM, ExchangePayload::Grid(GridSquare("FN42".into()))),
+            1,
+            -8,
+        )));
+        assert_eq!(step_of(&s.state.phase), Some(1), "CQ side report → step 1");
+        let s = e.step(Event::Decode(decode(
+            exch(ME, HIM, ExchangePayload::RogerReport(-3)),
+            3,
+            -8,
+        )));
+        assert_eq!(step_of(&s.state.phase), Some(2), "CQ side RR73 → step 2");
+
+        // Standard P3 opener (report instead of grid): step 2 immediately.
+        let mut e = engine(ContestProfile::Standard);
+        e.step(Event::Command(QsoCommand::CallCq));
+        let _ = tx_text(&mut e, 0);
+        let s = e.step(Event::Decode(decode(
+            exch(ME, HIM, ExchangePayload::Report(-3)),
+            1,
+            -8,
+        )));
+        assert_eq!(step_of(&s.state.phase), Some(2), "P3 report-opener → step 2");
+
+        // Field Day CQ side opener (bare exchange): step 1.
+        let mut e = engine(ContestProfile::ArrlFieldDay);
+        e.step(Event::Command(QsoCommand::CallCq));
+        let _ = tx_text(&mut e, 0);
+        let s = e.step(Event::Decode(decode(
+            exch(
+                ME,
+                HIM,
+                ExchangePayload::FieldDay {
+                    class: "2B".into(),
+                    section: Section("IL".into()),
+                    rogered: false,
+                },
+            ),
+            1,
+            -8,
+        )));
+        assert_eq!(step_of(&s.state.phase), Some(1), "FD CQ opener → step 1");
+    }
+
+    // ---- the known entry-vs-resume role divergence (preserved, not fixed here)
+
+    #[test]
+    fn report_to_us_diverges_entry_vs_resume() {
+        // KNOWN ASYMMETRY, preserved deliberately: a bare report addressed to us is
+        // read as role CallingCq when it arrives while we're calling CQ (the P3
+        // opener), but as role Answering when the operator *resumes* from it. The
+        // endings differ — CQ side resumes CQ with no final 73; answering side sends
+        // 73 and goes idle. Pinned so the table refactor can't silently unify them.
+        // (Candidate follow-up; out of scope for the behavior-preserving 3a slice.)
+
+        // Entry while calling CQ → CallingCq → resumes CQ, no 73.
+        let mut e = engine(ContestProfile::Standard);
+        e.step(Event::Command(QsoCommand::CallCq));
+        let _ = tx_text(&mut e, 0);
+        e.step(Event::Decode(decode(
+            exch(ME, HIM, ExchangePayload::Report(-3)),
+            1,
+            -8,
+        )));
+        assert_eq!(tx_text(&mut e, 2).as_deref(), Some("K1ABC W9XYZ R-08"));
+        e.step(Event::Decode(decode(signoff(ME, HIM, Signoff::Rr73), 3, -8)));
+        assert_eq!(
+            e.state().phase,
+            QsoPhase::Calling,
+            "entry path is the CQ side → resumes CQ"
+        );
+
+        // Resume from the same kind of line → Answering → sends 73, goes idle.
+        let mut e = engine(ContestProfile::Standard);
+        e.step(Event::Command(resume_cmd(
+            exch(ME, HIM, ExchangePayload::Report(-12)),
+            6,
+            -5,
+        )));
+        assert_eq!(tx_text(&mut e, 7).as_deref(), Some("K1ABC W9XYZ R-05"));
+        e.step(Event::Decode(decode(signoff(ME, HIM, Signoff::Rr73), 8, -5)));
+        assert_eq!(
+            tx_text(&mut e, 9).as_deref(),
+            Some("K1ABC W9XYZ 73"),
+            "resume path is the answering side → sends 73"
+        );
+        assert_eq!(e.state().phase, QsoPhase::Idle, "answering side goes idle");
+    }
+
+    // ---- resume role-inference drops (lines that carry no resumable contact)
+
+    #[test]
+    fn resume_ignores_non_resumable_lines() {
+        // A bare 73 (non-roger sign-off): nothing left to send → not resumable.
+        let mut e = engine(ContestProfile::Standard);
+        let s = e.step(Event::Command(resume_cmd(signoff(ME, HIM, Signoff::Seven3), 6, -5)));
+        assert_eq!(s.state.phase, QsoPhase::Idle, "bare 73 is not resumable");
+
+        // A contest-mismatched opener is not resumable.
+        let mut e = engine(ContestProfile::Standard);
+        let s = e.step(Event::Command(resume_cmd(
+            exch(
+                ME,
+                HIM,
+                ExchangePayload::FieldDay {
+                    class: "2B".into(),
+                    section: Section("IL".into()),
+                    rogered: false,
+                },
+            ),
+            6,
+            -5,
+        )));
+        assert_eq!(s.state.phase, QsoPhase::Idle, "FD opener not resumable in Standard");
+
+        let mut e = engine(ContestProfile::ArrlFieldDay);
+        let s = e.step(Event::Command(resume_cmd(
+            exch(ME, HIM, ExchangePayload::Grid(GridSquare("FN42".into()))),
+            3,
+            -8,
+        )));
+        assert_eq!(s.state.phase, QsoPhase::Idle, "grid opener not resumable in Field Day");
+    }
+
+    // ---- sequencer vocabulary: classify + materialize
+
+    #[test]
+    fn classify_maps_each_message_kind() {
+        let g = GridSquare("FN42".into());
+        assert_eq!(
+            MsgKind::classify(&cq_from(HIM, false)),
+            MsgKind::Cq {
+                grid: Some(GridSquare("FN42".into())),
+            }
+        );
+        assert_eq!(
+            MsgKind::classify(&exch(ME, HIM, ExchangePayload::Grid(g.clone()))),
+            MsgKind::Grid(g)
+        );
+        assert_eq!(
+            MsgKind::classify(&exch(ME, HIM, ExchangePayload::Report(-12))),
+            MsgKind::Report(-12)
+        );
+        assert_eq!(
+            MsgKind::classify(&exch(ME, HIM, ExchangePayload::RogerReport(-3))),
+            MsgKind::RogerReport(-3)
+        );
+        assert_eq!(
+            MsgKind::classify(&exch(
+                ME,
+                HIM,
+                ExchangePayload::FieldDay {
+                    class: "2B".into(),
+                    section: Section("IL".into()),
+                    rogered: false,
+                },
+            )),
+            MsgKind::FdBare {
+                class: "2B".into(),
+                section: Section("IL".into()),
+            }
+        );
+        assert_eq!(
+            MsgKind::classify(&exch(
+                ME,
+                HIM,
+                ExchangePayload::FieldDay {
+                    class: "2B".into(),
+                    section: Section("IL".into()),
+                    rogered: true,
+                },
+            )),
+            MsgKind::FdRoger {
+                class: "2B".into(),
+                section: Section("IL".into()),
+            }
+        );
+        assert_eq!(
+            MsgKind::classify(&signoff(ME, HIM, Signoff::Rr73)),
+            MsgKind::Signoff(Signoff::Rr73)
+        );
+        assert!(matches!(
+            MsgKind::classify(&ParsedMessage::Free("x".into())),
+            MsgKind::Other
+        ));
+        assert!(matches!(
+            MsgKind::classify(&ParsedMessage::Raw("y".into())),
+            MsgKind::Other
+        ));
+    }
+
+    #[test]
+    fn materialize_maps_reply_tags_to_messages() {
+        let him = call(HIM);
+        let std = engine(ContestProfile::Standard);
+        assert!(std.materialize(Reply::None, &him, -8).is_none());
+        // Standard opener is our grid (Tx1).
+        assert_eq!(
+            std.materialize(Reply::Opener, &him, -8).unwrap().text,
+            "K1ABC W9XYZ EM48"
+        );
+        assert_eq!(
+            std.materialize(Reply::Report, &him, -8).unwrap().text,
+            "K1ABC W9XYZ -08"
+        );
+        assert_eq!(
+            std.materialize(Reply::RogerReport, &him, -8).unwrap().text,
+            "K1ABC W9XYZ R-08"
+        );
+        assert_eq!(
+            std.materialize(Reply::Rr73, &him, -8).unwrap().text,
+            "K1ABC W9XYZ RR73"
+        );
+        assert_eq!(
+            std.materialize(Reply::Seven3, &him, -8).unwrap().text,
+            "K1ABC W9XYZ 73"
+        );
+
+        // Field Day opener is the bare exchange (Tx2), and its roger+exchange (Tx3).
+        let fd = engine(ContestProfile::ArrlFieldDay);
+        assert_eq!(
+            fd.materialize(Reply::Opener, &him, -8).unwrap().text,
+            "K1ABC W9XYZ 3A WI"
+        );
+        assert_eq!(
+            fd.materialize(Reply::FdRogerExchange, &him, -8).unwrap().text,
+            "K1ABC W9XYZ R 3A WI"
+        );
+    }
+
+    // ---- the pure transition tables (open / advance / signoff / answer)
+
+    fn fd_bare() -> MsgKind {
+        MsgKind::FdBare {
+            class: "2B".into(),
+            section: Section("IL".into()),
+        }
+    }
+    fn fd_roger() -> MsgKind {
+        MsgKind::FdRoger {
+            class: "2B".into(),
+            section: Section("IL".into()),
+        }
+    }
+
+    #[test]
+    fn open_table_every_cell() {
+        let g = GridSquare("FN42".into());
+        // The three openers, full Outcome.
+        assert_eq!(
+            open(false, MsgKind::Grid(g.clone())),
+            Some((
+                Role::CallingCq,
+                Outcome {
+                    reply: Reply::Report,
+                    progress: Progress::Report,
+                    step: 1,
+                    capture: Capture::Grid(Some(g.clone())),
+                    log: LogWhen::Never,
+                    settle: Settle::StayActive,
+                }
+            ))
+        );
+        assert_eq!(
+            open(false, MsgKind::Report(-7)),
+            Some((
+                Role::CallingCq,
+                Outcome {
+                    reply: Reply::RogerReport,
+                    progress: Progress::RogerReport,
+                    step: 2,
+                    capture: Capture::Report(-7),
+                    log: LogWhen::Never,
+                    settle: Settle::StayActive,
+                }
+            ))
+        );
+        assert_eq!(
+            open(true, fd_bare()),
+            Some((
+                Role::CallingCq,
+                Outcome {
+                    reply: Reply::FdRogerExchange,
+                    progress: Progress::RogerReport,
+                    step: 1,
+                    capture: Capture::Fd("2B".into(), Section("IL".into())),
+                    log: LogWhen::Never,
+                    settle: Settle::StayActive,
+                }
+            ))
+        );
+        // Wrong contest → no opener.
+        assert_eq!(open(true, MsgKind::Grid(g.clone())), None);
+        assert_eq!(open(true, MsgKind::Report(-7)), None);
+        assert_eq!(open(false, fd_bare()), None);
+        // Non-opener kinds → no opener, in both contests.
+        for fd in [false, true] {
+            assert_eq!(open(fd, MsgKind::RogerReport(-3)), None);
+            assert_eq!(open(fd, fd_roger()), None);
+            assert_eq!(open(fd, MsgKind::Signoff(Signoff::Rr73)), None);
+            assert_eq!(open(fd, MsgKind::Cq { grid: None }), None);
+            assert_eq!(open(fd, MsgKind::Other), None);
+        }
+    }
+
+    #[test]
+    fn advance_table_every_cell() {
+        use Role::*;
+        // The three advancing transitions, full Outcome.
+        assert_eq!(
+            advance(Answering, false, MsgKind::Report(-9)),
+            Transition::Act(Outcome {
+                reply: Reply::RogerReport,
+                progress: Progress::RogerReport,
+                step: 2,
+                capture: Capture::Report(-9),
+                log: LogWhen::Never,
+                settle: Settle::StayActive,
+            })
+        );
+        assert_eq!(
+            advance(Answering, true, fd_roger()),
+            Transition::Act(Outcome {
+                reply: Reply::Rr73,
+                progress: Progress::Rogers,
+                step: 2,
+                capture: Capture::Fd("2B".into(), Section("IL".into())),
+                log: LogWhen::OnSend,
+                settle: Settle::FinishOnSend(Finish::Idle),
+            })
+        );
+        assert_eq!(
+            advance(CallingCq, false, MsgKind::RogerReport(-4)),
+            Transition::Act(Outcome {
+                reply: Reply::Rr73,
+                progress: Progress::Rogers,
+                step: 2,
+                capture: Capture::Report(-4),
+                log: LogWhen::OnSend,
+                settle: Settle::StayActive,
+            })
+        );
+        // Any sign-off acts (details in signoff_outcome's test).
+        assert!(matches!(
+            advance(Answering, false, MsgKind::Signoff(Signoff::Seven3)),
+            Transition::Act(_)
+        ));
+        assert!(matches!(
+            advance(CallingCq, true, MsgKind::Signoff(Signoff::Rr73)),
+            Transition::Act(_)
+        ));
+        // The cells that used to fall through `_ => None` are now explicit Ignores:
+        // wrong role, wrong contest, repeated/early kinds, CQ, free text.
+        assert_eq!(advance(CallingCq, false, MsgKind::Report(-9)), Transition::Ignore);
+        assert_eq!(advance(Answering, false, MsgKind::RogerReport(-4)), Transition::Ignore);
+        assert_eq!(
+            advance(Answering, false, MsgKind::Grid(GridSquare("FN42".into()))),
+            Transition::Ignore
+        );
+        assert_eq!(advance(Answering, true, fd_bare()), Transition::Ignore);
+        assert_eq!(advance(CallingCq, true, fd_roger()), Transition::Ignore);
+        assert_eq!(advance(Answering, true, MsgKind::Report(-9)), Transition::Ignore);
+        assert_eq!(advance(CallingCq, false, MsgKind::Cq { grid: None }), Transition::Ignore);
+        assert_eq!(advance(CallingCq, false, MsgKind::Other), Transition::Ignore);
+    }
+
+    #[test]
+    fn signoff_outcome_courtesy_and_fallback() {
+        use Role::*;
+        // Answering side (either contest, any token): courtesy 73, finish idle, log rx.
+        for fd in [false, true] {
+            for k in [Signoff::Rrr, Signoff::Rr73, Signoff::Seven3] {
+                let o = signoff_outcome(Answering, fd, k);
+                assert_eq!(o.reply, Reply::Seven3);
+                assert_eq!(o.settle, Settle::FinishOnSend(Finish::Idle));
+                assert_eq!(o.log, LogWhen::OnReceive);
+                assert_eq!(o.step, 3);
+                assert_eq!(o.progress, Progress::Signoff);
+            }
+        }
+        // FD CQ side on a roger: courtesy 73, then resume CQ.
+        for k in [Signoff::Rrr, Signoff::Rr73] {
+            let o = signoff_outcome(CallingCq, true, k);
+            assert_eq!(o.reply, Reply::Seven3);
+            assert_eq!(o.settle, Settle::FinishOnSend(Finish::ResumeCq));
+        }
+        // FD CQ side on a bare 73: no courtesy, resume CQ now.
+        let o = signoff_outcome(CallingCq, true, Signoff::Seven3);
+        assert_eq!(o.reply, Reply::None);
+        assert_eq!(o.settle, Settle::ResumeCqNow);
+        // Standard CQ side (already logged on send): no courtesy, resume CQ now.
+        for k in [Signoff::Rrr, Signoff::Rr73, Signoff::Seven3] {
+            let o = signoff_outcome(CallingCq, false, k);
+            assert_eq!(o.reply, Reply::None);
+            assert_eq!(o.settle, Settle::ResumeCqNow);
+        }
+    }
+
+    #[test]
+    fn answer_opener_is_the_fixed_armed_reply() {
+        let o = answer_opener(Some(GridSquare("FN42".into())));
+        assert_eq!(o.reply, Reply::Opener);
+        assert_eq!(o.progress, Progress::Replying);
+        assert_eq!(o.step, 1);
+        assert_eq!(o.capture, Capture::Grid(Some(GridSquare("FN42".into()))));
+        assert_eq!(o.log, LogWhen::Never);
+        assert_eq!(o.settle, Settle::StayActive);
     }
 }

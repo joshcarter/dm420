@@ -89,8 +89,10 @@ interop checklist #4). Two implications for the catalog's `QsoPhase`:
 - It needs an **`Armed { target }`** phase for the wait-for-CQ state in §4 —
   the catalog enum (`Idle, Calling, InExchange{step}, Complete, TimedOut`) has
   no equivalent today. *(open: §7)*
-- `InExchange { step }` becomes **display-only** — the authoritative state is the
-  WSJT-X-style progress enum the engine derives from content. *(flag to Joel)*
+- `InExchange { step }` is **display-only** — the authoritative *internal* state is
+  now the WSJT-X-style `Progress` enum the engine derives from content and carries on
+  `Active.progress` (landed, item 3a). The **published** phase is still `step`;
+  surfacing `progress` on the bus is a follow-up. *(was: flag to Joel)*
 
 ---
 
