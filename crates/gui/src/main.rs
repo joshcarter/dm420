@@ -41,7 +41,7 @@ use app::App;
 use bus_view::BusView;
 use chrome::{lcd_panel, make_brushed, make_relief, measure, paint_chassis, shadow};
 use panel_data as pd;
-use panels::{BandScan, CallSign, Contacts, LogBook, MapPick, Panel, PanelCtx, Waterfall};
+use panels::{BandScan, CallSign, Contacts, LogBook, Panel, PanelCtx, Waterfall};
 use theme::*;
 
 fn main() -> eframe::Result<()> {
@@ -168,15 +168,11 @@ struct Tactical<'a> {
     /// Set to a pane id when that pane is clicked this frame, so the app can move
     /// focus after the tree finishes laying out.
     clicked: &'a mut Option<TileId>,
-    /// Shared selected-station cell: the Waterfall panel writes the callsign it has
-    /// selected; the Contacts map reads it to crosshair that station. The Waterfall
-    /// pane renders before Contacts, so the write is visible the same frame; held on
-    /// the `App` so it also survives across frames regardless of pane order.
+    /// Shared selected-station highlight string. Both the Digital and Contacts panels
+    /// select via the `selection/{id}/active` bus topic (the single owner); this is
+    /// the callsign read back from it each frame, threaded to every panel so they
+    /// highlight/crosshair the same station. Held on the `App` so it survives frames.
     selected_station: &'a mut Option<String>,
-    /// Reverse selection channel: the Contacts map writes the station it was clicked
-    /// on; the Waterfall pane (which renders first) consumes it the next frame to
-    /// mirror the pick into its own selection. Held on the `App` to survive frames.
-    map_pick: &'a mut Option<MapPick>,
 }
 
 impl<'a> Behavior<Box<dyn Panel>> for Tactical<'a> {
@@ -213,7 +209,6 @@ impl<'a> Behavior<Box<dyn Panel>> for Tactical<'a> {
             unlocked: self.unlocked,
             active: id == self.focused,
             selected_station: &mut *self.selected_station,
-            map_pick: &mut *self.map_pick,
         };
         pane.ui(&mut ctx, block);
         UiResponse::None
@@ -631,7 +626,6 @@ impl eframe::App for App {
                     focused: self.focused,
                     clicked: &mut clicked,
                     selected_station: &mut self.selected_station,
-                    map_pick: &mut self.map_pick,
                 };
                 enforce_min_width(
                     &mut self.tree,

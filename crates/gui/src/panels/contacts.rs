@@ -16,9 +16,9 @@ use egui::{
     Align2, Color32, CornerRadius, Mesh, Pos2, Rect, Shape, Stroke, StrokeKind, TextureHandle, Vec2,
 };
 
-use types::{Band, SlotId};
+use types::{Band, Callsign, DecodeRef, SelectionContext, SlotId};
 
-use super::{MapPick, Panel, PanelCtx};
+use super::{Panel, PanelCtx};
 use crate::bus_view::MapSpot;
 use crate::chrome::{key_cell_accent, lcd_panel, measure, panel_header, segmented_select};
 use crate::geo_data;
@@ -184,36 +184,22 @@ fn clamp_center(mut v: MapView) -> MapView {
 /// offset onto the station when it sits in the usable passband, otherwise retune the
 /// dial to centre it at 1500 Hz; either way prime the selection so Enter answers it.
 fn pick_station(ctx: &mut PanelCtx, spot: &MapSpot) {
-    let slot = spot.slot.unwrap_or(SlotId(0));
-    let cur_vfo = ctx.bus.rig_state().map(|r| r.vfo.0);
-    // Audio-offset window we'll snap onto rather than retune. Conservative: keep the
-    // station comfortably mid-passband (away from the filter edges) for best decode.
-    const SNAP_LO: i64 = 300;
-    const SNAP_HI: i64 = 2500;
-    let offset = match (spot.abs, cur_vfo) {
-        (Some(abs), Some(vfo)) => {
-            let candidate = abs.0 as i64 - vfo as i64;
-            if (SNAP_LO..=SNAP_HI).contains(&candidate) {
-                Some(candidate as f32)
-            } else {
-                // Too far from our dial to reach in the passband — retune so the
-                // station lands at 1500 Hz audio and transmit there.
-                let new_dial = (abs.0 as i64 - 1500).max(0) as u64;
-                ctx.bus.set_freq(new_dial);
-                Some(1500.0)
-            }
-        }
-        // No known frequency (worked-only spot) — select by call without moving the
-        // offset; Enter still arms to it (the engine matches on call).
-        _ => None,
+    // The map is a pure select-input. A click emits one selection — *who* (the call +
+    // the slot its last sighting landed in, for the `DecodeRef`) and *where* (its
+    // absolute frequency, when known) — and does nothing else: no offset move, no
+    // retune, no lock awareness. The Digital panel (the single operating authority)
+    // reads this selection and decides the TX offset / passband retune. A worked-only
+    // spot has no known frequency, so it carries no context: select by call, move
+    // nothing (Enter still arms — the engine matches on call).
+    let target = DecodeRef {
+        radio: app_core::radio_id(),
+        slot: spot.slot.unwrap_or(SlotId(0)),
+        call: Some(Callsign(spot.call.clone())),
     };
-    *ctx.map_pick = Some(MapPick {
-        call: spot.call.clone(),
-        slot,
-        offset,
-    });
-    // Crosshair it this frame; the Waterfall mirrors the pick into its own selection
-    // next frame (and re-publishes the same callsign here).
+    let context = spot.abs.map(SelectionContext::AbsFreq);
+    ctx.bus.select(Some(target), context);
+    // Crosshair it this frame; the single-owner highlight reader is wired centrally in
+    // the Digital-panel commit.
     *ctx.selected_station = Some(spot.call.clone());
 }
 

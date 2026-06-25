@@ -8,7 +8,7 @@ use egui::TextureHandle;
 use egui_tiles::Tree;
 
 use crate::bus_view::BusView;
-use crate::panels::{MapPick, Panel};
+use crate::panels::Panel;
 use crate::settings::Station;
 use crate::theme::{GRAPHITE, Palette, SILVER};
 use crate::{TreeIds, build_tree};
@@ -41,15 +41,11 @@ pub struct App {
     pub frame: u64,
     /// Live bus state the panels render from (mock-fed for now).
     pub view: BusView,
-    /// The callsign selected in the waterslide, shared between panels each frame.
-    /// The Waterfall panel publishes its current selection here; the Contacts map
-    /// reads it to crosshair that station's location. `None` when nothing is selected.
+    /// The callsign selected, shared between panels each frame. Both the Digital and
+    /// Contacts panels select by writing the `selection/{id}/active` bus topic (the
+    /// single owner); this caches the callsign read back from it, threaded to every
+    /// panel for the frame. `None` when nothing is selected.
     pub selected_station: Option<String>,
-    /// Reverse selection channel: a station clicked on the Contacts map this frame,
-    /// consumed by the Waterfall panel next frame to mirror the pick. `None` most
-    /// frames. Held here (not a frame local) so the cross-pane handoff survives the
-    /// gap between Contacts writing it and Waterfall reading it.
-    pub map_pick: Option<MapPick>,
     /// The most recent *windowed* geometry (size + position), refreshed each frame
     /// the window isn't fullscreen. Persisted on a fullscreen close so the saved
     /// fallback size is the real window, not the whole screen. `None` until the
@@ -110,7 +106,6 @@ impl App {
             frame: 0,
             view,
             selected_station: None,
-            map_pick: None,
             last_windowed: None,
             deterministic,
             // Seed from the file so we don't re-write an unchanged geometry on boot;
