@@ -35,6 +35,19 @@ struct Seen {
     last_seen: Instant,
 }
 
+/// What [`Peers::observe`] reports about an incoming snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Observed {
+    /// `seq` is newer than anything seen from this station — the caller should act
+    /// on this snapshot (republish it). `false` for a stale/duplicate beacon.
+    pub fresh: bool,
+    /// This is the **first** snapshot from this station this session (or the first
+    /// since it aged out of the live set). Triggers the one-shot bulk-log catch-up
+    /// push so a freshly-discovered peer gets our backlog without waiting for the
+    /// anti-entropy loop. Always implies `fresh`.
+    pub new_station: bool,
+}
+
 impl Peers {
     /// Add a beacon target (a manual `DM420_PEERS` entry or an mDNS-resolved
     /// address). Idempotent.
@@ -44,20 +57,29 @@ impl Peers {
 
     /// Record a snapshot from `station` at `addr`. Adds `addr` as a target (we
     /// reply to whoever we hear) and updates the station's high-water `seq`.
-    /// Returns `true` if `seq` is newer than anything seen from this station
-    /// (i.e. the caller should act on it), `false` if it's stale/duplicate.
-    pub fn observe(&self, station: &StationId, addr: SocketAddr, seq: u64, now: Instant) -> bool {
+    /// See [`Observed`] for the two booleans it reports — `fresh` (act on this
+    /// snapshot) and `new_station` (first contact this session → send catch-up).
+    pub fn observe(
+        &self,
+        station: &StationId,
+        addr: SocketAddr,
+        seq: u64,
+        now: Instant,
+    ) -> Observed {
         let mut inner = self.inner.lock().unwrap();
         inner.targets.insert(addr);
         match inner.by_station.get_mut(station) {
             Some(seen) => {
                 seen.addr = addr;
                 seen.last_seen = now;
-                if seq > seen.last_seq {
+                let fresh = seq > seen.last_seq;
+                if fresh {
                     seen.last_seq = seq;
-                    true
-                } else {
-                    false // stale beacon — a reordered/duplicate datagram
+                }
+                // A known station — never new, even on a stale/duplicate beacon.
+                Observed {
+                    fresh,
+                    new_station: false,
                 }
             }
             None => {
@@ -69,7 +91,13 @@ impl Peers {
                         last_seen: now,
                     },
                 );
-                true
+                // First time we've heard this station (or the first since it aged
+                // out via `expire`): always fresh, and flagged for the one-shot
+                // bulk-log catch-up.
+                Observed {
+                    fresh: true,
+                    new_station: true,
+                }
             }
         }
     }
@@ -115,12 +143,41 @@ mod tests {
         let peers = Peers::default();
         let s = StationId("w4ll".into());
         let t0 = Instant::now();
-        assert!(peers.observe(&s, addr(9000), 1, t0), "first seq is new");
-        assert!(peers.observe(&s, addr(9000), 2, t0), "higher seq is new");
-        assert!(!peers.observe(&s, addr(9000), 2, t0), "same seq is stale");
-        assert!(!peers.observe(&s, addr(9000), 1, t0), "lower seq is stale");
+        let first = peers.observe(&s, addr(9000), 1, t0);
+        assert!(first.fresh, "first seq is new");
+        assert!(first.new_station, "first contact flags new_station");
+        assert!(
+            peers.observe(&s, addr(9000), 2, t0).fresh,
+            "higher seq is new"
+        );
+        let dup = peers.observe(&s, addr(9000), 2, t0);
+        assert!(!dup.fresh, "same seq is stale");
+        assert!(!dup.new_station, "a known station is never new again");
+        assert!(
+            !peers.observe(&s, addr(9000), 1, t0).fresh,
+            "lower seq is stale"
+        );
         assert_eq!(peers.targets(), vec![addr(9000)]);
         assert_eq!(peers.live_count(), 1);
+    }
+
+    #[test]
+    fn observe_flags_new_station_again_after_expiry() {
+        let peers = Peers::default();
+        let s = StationId("w4ll".into());
+        let t0 = Instant::now();
+        assert!(peers.observe(&s, addr(9000), 1, t0).new_station);
+        let later = t0 + Duration::from_secs(60);
+        assert_eq!(
+            peers.expire(Duration::from_secs(30), later),
+            vec![s.clone()]
+        );
+        // After aging out, the next snapshot is a fresh "first contact" again, so
+        // the peer re-receives our catch-up.
+        assert!(
+            peers.observe(&s, addr(9000), 5, later).new_station,
+            "re-discovered after expiry counts as new"
+        );
     }
 
     #[test]
