@@ -53,20 +53,19 @@ pub struct NetConfig {
 }
 
 impl NetConfig {
-    /// Build from env (interim, like the rest of the app's config — see CLAUDE.md;
-    /// this should move into `CoreConfig`/`Settings` with the settings UI). Returns
+    /// Build from env, with the operator's identity supplied by the caller.
+    /// `station` is single-sourced from `CoreConfig.station_id` (the configured
+    /// `[station] station_id`) — there is no second, per-process identity here.
+    /// The rest of the gossip config (listen port, manual peers, opt-out) is still
+    /// read from env, interim like the rest of the app (see CLAUDE.md). Returns
     /// `None` when gossip is disabled (`DM420_NET=0`).
-    pub fn from_env() -> Option<Self> {
+    pub fn from_env(station: StationId) -> Option<Self> {
         let enabled = std::env::var("DM420_NET")
             .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
             .unwrap_or(true);
         if !enabled {
             return None;
         }
-        let station = std::env::var("DM420_STATION_ID")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(default_station_id);
         let port = std::env::var("DM420_NET_PORT")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -76,24 +75,12 @@ impl NetConfig {
             .map(|v| parse_peers(&v))
             .unwrap_or_default();
         Some(NetConfig {
-            station: StationId(station),
+            station,
             port,
             manual_peers,
             enable_mdns: true,
         })
     }
-}
-
-/// A per-operator id that's distinct out of the box (so two un-configured
-/// instances don't filter each other as "self"): the host name if the shell
-/// exported one, else `dm420-<pid>`. Operators set `DM420_STATION_ID` for a stable
-/// id across restarts.
-fn default_station_id() -> String {
-    std::env::var("HOSTNAME")
-        .ok()
-        .or_else(|| std::env::var("HOST").ok())
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| format!("dm420-{}", std::process::id()))
 }
 
 fn parse_peers(s: &str) -> Vec<SocketAddr> {

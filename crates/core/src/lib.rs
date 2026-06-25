@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use bus::BusHandle;
-use bus::types::RadioId;
+use bus::types::{RadioId, StationId};
 
 mod clock;
 mod control;
@@ -154,6 +154,14 @@ pub const DEFAULT_TX_GAIN: f32 = 0.5;
 /// Configuration for [`spawn`].
 pub struct CoreConfig {
     pub radio: RadioId,
+    /// This operator's stable multi-op identity — the `origin` stamped on logged
+    /// QSOs and the gossip key `net` advertises to peers. **Distinct from the
+    /// callsign:** contest/Field-Day stations share one club call, so the call
+    /// can't tell operators apart; each instance in a shared-call session must set
+    /// a distinct `station_id`. Single-sourced from `[station] station_id` in
+    /// `config.toml` (the GUI derives a per-machine default from the host name when
+    /// it's unset) and threaded to everyone who tags "who."
+    pub station_id: StationId,
     /// Forwarded to Joel's rig actor; `false` hard-blocks TX (the default).
     pub allow_transmit: bool,
     pub decode: DecodeSource,
@@ -180,6 +188,10 @@ impl Default for CoreConfig {
     fn default() -> Self {
         Self {
             radio: radio_id(),
+            // A fixed placeholder for non-GUI callers (tests/headless); the GUI's
+            // settings layer computes the real per-machine default from the host
+            // name (see `gui::settings::default_station_id`).
+            station_id: StationId("dm420".into()),
             allow_transmit: false,
             decode: DecodeSource::None,
             serial: None,
@@ -202,6 +214,7 @@ impl Default for CoreConfig {
 pub fn spawn(bus: &BusHandle, cfg: CoreConfig) -> CoreControl {
     let CoreConfig {
         radio,
+        station_id,
         allow_transmit,
         decode,
         serial,
@@ -213,6 +226,7 @@ pub fn spawn(bus: &BusHandle, cfg: CoreConfig) -> CoreControl {
 
     tracing::info!(
         radio = ?radio,
+        station_id = ?station_id,
         allow_transmit,
         tx_output = ?tx_output,
         has_serial = serial.is_some(),
@@ -308,11 +322,12 @@ pub fn spawn(bus: &BusHandle, cfg: CoreConfig) -> CoreControl {
     worked::spawn(bus, types::ContestProfile::ArrlFieldDay);
 
     // LAN gossip: discover other operators on the network and exchange station
-    // snapshots (shared logbook + working-intent ride this in later steps). Config
-    // is read from env for now (interim, like the rest); `DM420_NET=0` opts out.
+    // snapshots (shared logbook + working-intent ride this in later steps). The
+    // station identity is the single configured `station_id` (no per-process
+    // placeholder); the rest (port, peers, opt-out via `DM420_NET=0`) is still env.
     // Best-effort — `net::spawn` degrades to a logged warning if the socket or
     // mDNS can't come up, so a missing network never blocks the rest of the app.
-    if let Some(net_cfg) = net::NetConfig::from_env() {
+    if let Some(net_cfg) = net::NetConfig::from_env(station_id) {
         net::spawn(bus, net_cfg);
     }
 

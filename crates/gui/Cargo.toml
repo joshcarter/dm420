@@ -34,6 +34,9 @@ qso.workspace = true
 # Offline call-sign → country/flag resolver (Tier-1 of the Call Sign panel).
 callbook.workspace = true
 
+# Host name for the per-machine default station_id, when none is configured.
+gethostname.workspace = true
+
 # The real rig/decode producers (vendored Joel + bus adapters). Renamed to avoid
 # shadowing the std `core` crate.
 app_core = { package = "core", path = "../core" }

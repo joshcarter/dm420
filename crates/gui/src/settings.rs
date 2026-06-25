@@ -29,6 +29,7 @@
 use std::path::{Path, PathBuf};
 
 use app_core::{CoreConfig, DecodeSource, LineProfile, Protocol, SerialConfig, DEFAULT_TX_GAIN};
+use types::StationId;
 
 use crate::config_toml::{
     bool_str, config_path, format_f32, parse_float, parse_table_value, parse_u16, update_toml_table,
@@ -148,6 +149,12 @@ pub struct Settings {
     /// The synth emits at 0 dBFS, so this backs the drive off before the rig —
     /// see [`DEFAULT_TX_GAIN`]. Clamped to `[0.0, 1.0]` by `core`.
     pub tx_gain: f32,
+    /// This operator's stable multi-op identity: the `origin` stamped on logged
+    /// QSOs and the gossip key `net` advertises. From `[station] station_id` (or
+    /// `DM420_STATION_ID`), defaulting to a per-machine host-name slug when unset —
+    /// see [`read_station_id`]. **Distinct from the callsign:** a shared club call
+    /// can't tell operators apart, so each multi-op instance must set its own.
+    pub station_id: StationId,
 }
 
 impl Settings {
@@ -164,6 +171,7 @@ impl Settings {
             wav: wav_from_env(),
             audio_output: toml_out,
             tx_gain: read_tx_gain(&config_path()),
+            station_id: read_station_id(&config_path()),
         }
     }
 
@@ -202,6 +210,7 @@ impl Settings {
             decode_archive: read_archive_config(&config_path()),
             tx_output: self.audio_output.clone(),
             tx_gain: self.tx_gain,
+            station_id: self.station_id.clone(),
         }
     }
 }
@@ -240,6 +249,63 @@ fn read_station_config(path: &Path) -> (Option<String>, Option<String>) {
         Ok(text) => parse_station_config(&text),
         Err(_) => (None, None),
     }
+}
+
+/// Resolve the operator's [`StationId`], in precedence order: the
+/// `DM420_STATION_ID` env var (quick per-launch override) → `[station] station_id`
+/// in the config file → a per-machine default ([`default_station_id`]).
+///
+/// `station_id` is the operator's identity in a multi-op session and is
+/// **deliberately distinct from the callsign**: contest / Field Day stations share
+/// one club call, so the call can't tell two operators apart. Every instance in a
+/// shared-call session must therefore set a *distinct* `station_id`. The host-name
+/// default keeps two un-configured instances on different machines from colliding,
+/// but operators sharing a machine (or who want a memorable id) should set it.
+fn read_station_id(path: &Path) -> StationId {
+    let from_file = || parse_station_id(&std::fs::read_to_string(path).ok()?);
+    env_nonempty("DM420_STATION_ID")
+        .or_else(from_file)
+        .map(StationId)
+        .unwrap_or_else(default_station_id)
+}
+
+/// Pull `station_id` from the `[station]` table. An empty value counts as unset
+/// (the same convention as the other optional keys), so the default applies.
+fn parse_station_id(text: &str) -> Option<String> {
+    parse_table_value(text, "station", "station_id")
+}
+
+/// A stable, per-machine default [`StationId`] for when none is configured: a slug
+/// of the host name (via `gethostname` — the syscall, reliable unlike the
+/// `HOSTNAME` env var). Distinct per machine and stable across restarts, so two
+/// un-configured instances on different machines don't tag each other as "self".
+/// Falls back to `"dm420"` only if the host name is empty/unreadable.
+fn default_station_id() -> StationId {
+    let host = gethostname::gethostname().to_string_lossy().into_owned();
+    let slug = slug_ascii(&host);
+    StationId(if slug.is_empty() {
+        "dm420".to_string()
+    } else {
+        slug
+    })
+}
+
+/// Lowercase a host name into a compact id: ASCII alphanumerics are kept, every
+/// other run of characters collapses to a single `-`, with leading/trailing `-`
+/// trimmed (`"Josh's-MBP.local"` → `"josh-s-mbp-local"`).
+fn slug_ascii(s: &str) -> String {
+    let mut out = String::new();
+    let mut prev_dash = false;
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+            prev_dash = false;
+        } else if !prev_dash {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    out.trim_matches('-').to_string()
 }
 
 /// Read the persisted `(input, output)` audio device names from the config file.
@@ -542,7 +608,11 @@ fn default_station_toml(call: &str, grid: &str) -> String {
          # No built-in default: DM420 won't call CQ or answer until a callsign is set.\n\n\
          [station]\n\
          callsign = \"{call}\"\n\
-         grid = \"{grid}\"\n\n\
+         grid = \"{grid}\"\n\
+         # Multi-op identity: who logged/heard a contact, distinct from the (shared)\n\
+         # callsign. Blank = auto-derived from this machine's host name. Operators\n\
+         # sharing a club call (Field Day) MUST each set a distinct station_id.\n\
+         station_id = \"\"\n\n\
          # Raw decode/transmit archive (diagnostics): set `decodes` to a file path to\n\
          # append every heard + sent FT8/FT4 message as JSONL. Blank = disabled (default).\n\
          [archive]\n\
@@ -639,6 +709,50 @@ mod tests {
     #[test]
     fn empty_config_is_unset() {
         assert_eq!(parse_station_config(""), (None, None));
+    }
+
+    #[test]
+    fn parses_station_id_from_station_table() {
+        let cfg = "[station]\ncallsign = \"W1AW\"\nstation_id = \"op-left\"\n";
+        assert_eq!(parse_station_id(cfg).as_deref(), Some("op-left"));
+    }
+
+    #[test]
+    fn blank_or_missing_station_id_is_unset_then_defaults_non_empty() {
+        // Blank (the template's `station_id = ""`) and a missing key both read as
+        // unset, so the resolver falls through to the per-machine default…
+        assert_eq!(parse_station_id("[station]\nstation_id = \"\"\n"), None);
+        assert_eq!(parse_station_id("[station]\ncallsign = \"W1AW\"\n"), None);
+        // …which is never empty (host-name slug, or the "dm420" fallback).
+        assert!(
+            !default_station_id().0.is_empty(),
+            "the default station_id is always a non-empty, stable id"
+        );
+    }
+
+    #[test]
+    fn station_id_round_trips_through_the_toml_writer() {
+        // Writing the key into [station] preserves comments and the callsign, and
+        // reads back — i.e. it persists "like the other config fields".
+        let text = update_toml_table(
+            "# top\n[station]\ncallsign = \"W4LL\"\n",
+            "station",
+            &[("station_id", "op-2")],
+        );
+        assert!(text.contains("# top"), "header comment kept: {text}");
+        assert_eq!(parse_station_id(&text).as_deref(), Some("op-2"));
+        assert_eq!(
+            parse_station_config(&text).0.as_deref(),
+            Some("W4LL"),
+            "callsign survives the station_id write: {text}"
+        );
+    }
+
+    #[test]
+    fn slug_ascii_compacts_a_hostname() {
+        assert_eq!(slug_ascii("Josh's-MBP.local"), "josh-s-mbp-local");
+        assert_eq!(slug_ascii("HOST42"), "host42");
+        assert_eq!(slug_ascii("  ...  "), "", "no alphanumerics ⇒ empty slug");
     }
 
     #[test]

@@ -1638,6 +1638,7 @@ dependencies = [
  "eframe",
  "egui",
  "egui_tiles",
+ "gethostname",
  "image",
  "objc2 0.6.4",
  "objc2-foundation 0.3.2",

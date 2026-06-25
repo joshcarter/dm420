@@ -70,6 +70,10 @@ tracing-appender = "0.2"  # non-blocking file writer for dm420.log
 # --- misc ---
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 thiserror = "1"
+# Host name for the per-machine default station_id (multi-op identity). The
+# syscall, not the unreliable HOSTNAME env var. Already in the lock via mdns-sd,
+# so this adds no new build.
+gethostname = "1"
 
 [profile.release]
 opt-level = 3
