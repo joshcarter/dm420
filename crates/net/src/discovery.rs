@@ -34,6 +34,14 @@ pub fn spawn(station: StationId, udp_port: u16, peers: Peers) -> Result<(), mdns
                 let port = info.get_port();
                 for ip in info.get_addresses() {
                     let addr = SocketAddr::new(*ip, port);
+                    // The gossip socket is IPv4 (`NetConfig.bind` is
+                    // `Ipv4Addr::UNSPECIFIED`), so non-IPv4 resolved addresses — mDNS
+                    // hands back IPv6 link-local `fe80::…` too — can't be sent to and
+                    // would fail every beacon with EINVAL. Skip them at the source.
+                    if !crate::is_sendable(&addr) {
+                        tracing::debug!(%addr, service = info.get_fullname(), "net: skipping non-IPv4 mDNS address");
+                        continue;
+                    }
                     tracing::info!(%addr, service = info.get_fullname(), "net: mDNS resolved peer");
                     peers.add_target(addr);
                 }

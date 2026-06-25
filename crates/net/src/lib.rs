@@ -100,6 +100,18 @@ impl NetConfig {
     }
 }
 
+/// Whether a beacon target is reachable from our IPv4-only gossip socket.
+///
+/// `NetConfig.bind` is `Ipv4Addr::UNSPECIFIED`, so [`Service::bind`] creates an IPv4
+/// `UdpSocket`. Sending to a non-IPv4 address — typically an IPv6 link-local
+/// `fe80::…` that mDNS resolves alongside a host's IPv4 address — fails with
+/// `Invalid argument` (EINVAL) and, on a 5 s beacon, floods the log. Both the mDNS
+/// discovery filter (`discovery.rs`) and the beacon send loop gate on this single
+/// predicate so an unusable address never reaches `send_to`.
+pub(crate) fn is_sendable(addr: &SocketAddr) -> bool {
+    addr.is_ipv4()
+}
+
 fn parse_peers(s: &str) -> Vec<SocketAddr> {
     s.split(',')
         .filter_map(|p| {
@@ -259,6 +271,15 @@ async fn beacon_loop(
                 match wire::encode(&frame) {
                     Ok(bytes) => {
                         for addr in peers.targets() {
+                            // Belt-and-suspenders: our gossip socket is IPv4-only, so
+                            // never hand a non-IPv4 target to `send_to` — it would fail
+                            // with EINVAL on every tick and flood the log. A non-IPv4
+                            // target shouldn't reach here (discovery filters them), but a
+                            // manual `DM420_PEERS` entry or future code could; drop it
+                            // silently rather than spam per-iteration.
+                            if !is_sendable(&addr) {
+                                continue;
+                            }
                             if let Err(e) = socket.send_to(&bytes, addr).await {
                                 tracing::debug!(%addr, error = %e, "net: beacon send failed");
                             }
@@ -370,7 +391,45 @@ async fn recv_loop(socket: Arc<UdpSocket>, bus: BusHandle, peers: Peers, me: Sta
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{IpAddr, Ipv6Addr};
     use types::{AbsHz, Callsign, Meters, OffsetHz, QsoPhase, RigMode};
+
+    // The IPv4 / IPv6 filter that keeps IPv6 link-local mDNS addresses off our
+    // IPv4-only socket: IPv4 is sendable, anything else (here a `fe80::…`) is not.
+    #[test]
+    fn is_sendable_accepts_ipv4_rejects_ipv6() {
+        let v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)), 4040);
+        let v6_link_local = SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)), 4040);
+        assert!(is_sendable(&v4), "IPv4 target is sendable from the IPv4 socket");
+        assert!(
+            !is_sendable(&v6_link_local),
+            "IPv6 link-local target must be filtered out"
+        );
+    }
+
+    // Reproduce the discovery resolver's per-address loop: given a host resolved to
+    // both an IPv4 and an IPv6 link-local address, only the IPv4 one is registered as
+    // a beacon target (the IPv6 one would have failed `send_to` with EINVAL).
+    #[test]
+    fn only_ipv4_resolved_addresses_become_targets() {
+        let peers = crate::peers::Peers::default();
+        let port = 4040;
+        let resolved = [
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)),
+            IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)),
+        ];
+        for ip in resolved {
+            let addr = SocketAddr::new(ip, port);
+            if is_sendable(&addr) {
+                peers.add_target(addr);
+            }
+        }
+        assert_eq!(
+            peers.targets(),
+            vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)), port)],
+            "only the IPv4 address becomes a beacon target",
+        );
+    }
 
     fn qso(partner: Option<&str>, offset: Option<f32>) -> QsoState {
         QsoState {
