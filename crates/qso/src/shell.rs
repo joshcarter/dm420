@@ -400,10 +400,9 @@ fn build_log(
     let band = Band::from_hz(freq).unwrap_or(Band::B20m);
     LogEntry {
         id: QsoId {
-            origin: origin.clone(),
+            origin,
             seq,
         },
-        origin,
         radio: Some(radio),
         call: done.call,
         mode,
@@ -463,7 +462,6 @@ mod tests {
             OverAirMode::Ft8,
             Some(AbsHz(14_074_000)),
         );
-        assert_eq!(e.origin, id, "LogEntry.origin carries the configured station_id");
         assert_eq!(e.id.origin, id, "QsoId merge key carries it too");
         assert_eq!(e.id.seq, 7);
     }

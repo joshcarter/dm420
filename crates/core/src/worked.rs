@@ -123,7 +123,6 @@ mod tests {
                 origin: StationId("station-a".into()),
                 seq: 1,
             },
-            origin: StationId("station-a".into()),
             radio: Some(RadioId("rig0".into())),
             call: Callsign(call.into()),
             mode,

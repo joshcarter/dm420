@@ -630,7 +630,6 @@ pub struct TxLogEntry {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct LogEntry {
     pub id: QsoId,
-    pub origin: StationId,
     pub radio: Option<RadioId>,
     pub call: Callsign,
     pub mode: OverAirMode,
@@ -1338,7 +1337,6 @@ mod tests {
                 origin: StationId("station-a".into()),
                 seq: 17,
             },
-            origin: StationId("station-a".into()),
             radio: Some(RadioId("k1".into())),
             call: Callsign("W4LL".into()),
             mode: OverAirMode::Ft8,
@@ -1429,7 +1427,6 @@ mod tests {
                 origin: StationId("station-a".into()),
                 seq: 1,
             },
-            origin: StationId("station-a".into()),
             radio: Some(RadioId("k1".into())),
             call: Callsign(call.into()),
             mode,

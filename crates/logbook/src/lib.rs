@@ -135,7 +135,6 @@ mod tests {
                 origin: StationId("me".into()),
                 seq,
             },
-            origin: StationId("me".into()),
             radio: None,
             call: Callsign(format!("K{seq}ABC")),
             mode: OverAirMode::Ft8,
