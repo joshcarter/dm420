@@ -22,10 +22,14 @@
 //!   `logbook/entries`, where the logbook service persists them (curated boundary:
 //!   peer data only ever lands on `logbook/entries`, never a local-authority topic).
 //! - **Catch-up:** the first snapshot from a new peer triggers a one-shot
-//!   MTU-chunked bulk `LogPush` of our own backlog.
+//!   MTU-chunked bulk `LogPush` of our own backlog, and a periodic ~15 s
+//!   [`repush_loop`] re-pushes our authored entries to every peer as a
+//!   convergence backstop — it closes the new-peer catch-up race (an empty
+//!   catch-up when nothing is logged yet) and is independent of join order.
 //!
 //! The full anti-entropy loop (`LogDigest`/`LogRequest` range diffing) is step 2b;
-//! those `Wire` variants stay declared-but-inert.
+//! the periodic re-push is a brute-force stand-in until it lands. Those `Wire`
+//! variants stay declared-but-inert.
 
 #![forbid(unsafe_code)]
 
@@ -65,6 +69,12 @@ const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(5);
 /// A peer not heard within this window drops from the live set (several missed
 /// beacons). Its beacon target is kept — a quiet peer is still worth pinging.
 const PEER_TTL: Duration = Duration::from_secs(30);
+/// How often we re-push our own log G-set to every peer ([`repush_loop`]). A
+/// brute-force convergence backstop standing in for the deferred anti-entropy
+/// pull (step 2b): bounded traffic at Field-Day log sizes, idempotent on the
+/// receiver (dedup by `QsoId`), and immune to join order / the new-peer
+/// catch-up race.
+const REPUSH_INTERVAL: Duration = Duration::from_secs(15);
 /// Receive buffer — one UDP datagram's hard maximum.
 const RECV_BUF: usize = 64 * 1024;
 
@@ -243,6 +253,14 @@ impl Service {
         tokio::spawn(outbound_log_loop(
             self.socket.clone(),
             self.bus.clone(),
+            self.peers.clone(),
+            self.station.clone(),
+            gset.clone(),
+        ));
+        // Convergence backstop: periodically re-push our own backlog to every
+        // peer, independent of join order and the one-shot new-peer catch-up.
+        tokio::spawn(repush_loop(
+            self.socket.clone(),
             self.peers.clone(),
             self.station.clone(),
             gset,
@@ -439,15 +457,17 @@ async fn recv_loop(
                     // chunked so no datagram IP-fragments. Cheap stand-in for the
                     // full anti-entropy pull (step 2b).
                     let mine = gset.mine(&me);
+                    // Logged unconditionally — an empty catch-up (the race where
+                    // this fires before our backlog is in the G-set, or before any
+                    // contact is logged) is now visible, not silent. The periodic
+                    // `repush_loop` is what eventually closes that gap.
+                    tracing::info!(
+                        peer = %from,
+                        entries = mine.len(),
+                        "net: catch-up OUT to new peer",
+                    );
                     if !mine.is_empty() {
-                        let n = mine.len();
                         let datagrams = pack_log_push(&mine, &me);
-                        tracing::info!(
-                            peer = %from,
-                            entries = n,
-                            datagrams = datagrams.len(),
-                            "net: bulk log catch-up to new peer",
-                        );
                         for dgram in datagrams {
                             if let Err(e) = socket.send_to(&dgram, from).await {
                                 tracing::debug!(%from, error = %e, "net: catch-up send failed");
@@ -465,12 +485,16 @@ async fn recv_loop(
             // The logbook service is subscribed there and persists each new entry;
             // the GUI / worked-status update for free.
             Wire::LogPush(entries) | Wire::LogReply(entries) => {
+                let received = entries.len();
+                let mut new = 0usize;
                 for entry in entries {
                     if gset.insert(entry.clone()) {
+                        new += 1;
                         let _ = bus.publish(&Topic::LogbookEntries, entry);
                     }
                     // Already held → idempotent drop (no re-publish, no echo).
                 }
+                tracing::info!(from = %from, received, new, "net: log-sync IN");
             }
             // Anti-entropy (`LogDigest` digest exchange / `LogRequest` range serve)
             // is step 2b — deliberately inert in the MVP. We never advertise a
@@ -518,6 +542,16 @@ async fn outbound_log_loop(
                 // Insert *before* the guard so peer entries still join the G-set.
                 let is_new = gset.insert(entry.clone());
                 if mine && is_new {
+                    // Snapshot the sendable targets once: it's both the send list
+                    // and the `peers` count we log.
+                    let targets: Vec<SocketAddr> =
+                        peers.targets().into_iter().filter(is_sendable).collect();
+                    tracing::info!(
+                        origin = %entry.id.origin.0,
+                        seq = entry.id.seq,
+                        peers = targets.len(),
+                        "net: log-push OUT (live)",
+                    );
                     let frame = Frame {
                         version: PROTO_VERSION,
                         from: me.clone(),
@@ -525,10 +559,7 @@ async fn outbound_log_loop(
                     };
                     match wire::encode(&frame) {
                         Ok(bytes) => {
-                            for addr in peers.targets() {
-                                if !is_sendable(&addr) {
-                                    continue;
-                                }
+                            for addr in targets {
                                 if let Err(e) = socket.send_to(&bytes, addr).await {
                                     tracing::debug!(%addr, error = %e, "net: log-push send failed");
                                 }
@@ -593,6 +624,60 @@ fn pack_log_push(entries: &[LogEntry], from: &StationId) -> Vec<Vec<u8>> {
         out.push(bytes);
     }
     out
+}
+
+/// Periodically re-push our own log G-set to every peer — a brute-force
+/// convergence backstop standing in for the deferred anti-entropy pull (step 2b).
+///
+/// **Why it's needed.** The only other backlog mechanism is the one-shot new-peer
+/// catch-up in [`recv_loop`], which silently delivers nothing if it fires before
+/// our backlog is in the G-set or before any contact is logged. This loop re-pushes
+/// regardless of join order, so a peer eventually receives our log no matter how the
+/// catch-up race resolves. Bounded at Field-Day log sizes, and the receiver dedups by
+/// `QsoId`, so each round is idempotent.
+///
+/// **Mine-only**, the same guard as the live push and catch-up: we re-push only
+/// entries we *authored* (`origin == me`), never peer-authored ones — that's the
+/// echo-storm guard. The inbound merge/inject path and the curated boundary are
+/// untouched; peer entries still only ever republish onto `Topic::LogbookEntries`.
+async fn repush_loop(socket: Arc<UdpSocket>, peers: Peers, me: StationId, gset: Gset) {
+    let mut tick = tokio::time::interval(REPUSH_INTERVAL);
+    // `interval` fires the first tick immediately; skip it so the first re-push
+    // waits a full interval (t=0 is already covered by the live push + catch-up).
+    tick.tick().await;
+    loop {
+        tick.tick().await;
+        repush_once(&socket, &peers, &me, &gset).await;
+    }
+}
+
+/// One re-push pass: send our authored backlog to every sendable peer. Factored out
+/// of [`repush_loop`] so it's directly testable without waiting on the timer. A
+/// no-op (no datagram, no log) when we've authored nothing yet or no peer is
+/// reachable. Returns the number of peers it sent to.
+async fn repush_once(socket: &UdpSocket, peers: &Peers, me: &StationId, gset: &Gset) -> usize {
+    let mine = gset.mine(me);
+    if mine.is_empty() {
+        return 0;
+    }
+    let targets: Vec<SocketAddr> = peers.targets().into_iter().filter(is_sendable).collect();
+    if targets.is_empty() {
+        return 0;
+    }
+    let datagrams = pack_log_push(&mine, me);
+    tracing::info!(
+        entries = mine.len(),
+        peers = targets.len(),
+        "net: periodic log re-push",
+    );
+    for addr in &targets {
+        for dgram in &datagrams {
+            if let Err(e) = socket.send_to(dgram, addr).await {
+                tracing::debug!(%addr, error = %e, "net: re-push send failed");
+            }
+        }
+    }
+    targets.len()
 }
 
 #[cfg(test)]
@@ -739,6 +824,14 @@ mod tests {
         }
     }
 
+    // Same shape as `log_entry` but authored by a peer (a different `origin`) —
+    // the kind of entry the re-push guard must never put back on the wire.
+    fn peer_entry(origin: &str, seq: u64) -> LogEntry {
+        let mut e = log_entry(seq);
+        e.id.origin = StationId(origin.into());
+        e
+    }
+
     // Decode a produced datagram back to the entries it carries.
     fn unpack(bytes: &[u8]) -> Vec<LogEntry> {
         match wire::decode(bytes).unwrap().msg {
@@ -798,5 +891,54 @@ mod tests {
     fn pack_log_push_empty_is_empty() {
         let from = StationId("me".into());
         assert!(pack_log_push(&[], &from).is_empty());
+    }
+
+    // The periodic re-push delivers our authored backlog to a peer, and ONLY our
+    // own entries — a peer-authored entry held in the G-set is never re-pushed
+    // (the echo-storm guard). Drives `repush_once` directly so there's no wait on
+    // the 15 s timer.
+    #[tokio::test]
+    async fn repush_once_delivers_mine_only_to_peer() {
+        let me = StationId("me".into());
+
+        // A receiver socket stands in for the peer; `sender` is our gossip socket.
+        let peer_sock = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let peer_addr = peer_sock.local_addr().unwrap();
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+
+        // Two of our own contacts plus one peer-authored contact in the G-set.
+        let gset = Gset::default();
+        assert!(gset.insert(log_entry(1)));
+        assert!(gset.insert(log_entry(2)));
+        assert!(gset.insert(peer_entry("w4ll", 9)));
+
+        let peers = crate::peers::Peers::default();
+        peers.add_target(peer_addr);
+
+        let sent_to = repush_once(&sender, &peers, &me, &gset).await;
+        assert_eq!(sent_to, 1, "the re-push reaches the single peer");
+
+        // Drain datagrams until both of our entries are accounted for (mine fit
+        // one datagram, but stay robust to MTU chunking); assert the peer's entry
+        // never appears.
+        let mut got: Vec<u64> = Vec::new();
+        let mut buf = vec![0u8; RECV_BUF];
+        while got.len() < 2 {
+            let (n, _) =
+                tokio::time::timeout(Duration::from_secs(5), peer_sock.recv_from(&mut buf))
+                    .await
+                    .expect("peer never received the re-push")
+                    .unwrap();
+            for e in unpack(&buf[..n]) {
+                assert_eq!(e.id.origin, me, "only our own entries are re-pushed");
+                got.push(e.id.seq);
+            }
+        }
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec![1, 2],
+            "both authored entries delivered, the peer's entry excluded",
+        );
     }
 }
