@@ -162,6 +162,96 @@ const TX_CAP_DEFAULT: u8 = 3;
 /// couple for insurance, then resume CQ.
 const TX_CAP_AFTER_LOG: u8 = 2;
 
+// --------------------------------------------- sequencer vocabulary (3a, inert)
+//
+// The typed words the `Progress` transition tables (ARCHITECTURE_REVIEW.md item
+// 3a) are built from, added ahead of the tables + routing so they can be
+// unit-tested in isolation. Nothing in the decision path uses them yet — hence
+// `#[allow(dead_code)]`, removed piecewise as later steps wire each one in. See
+// docs/joel/qsos-and-the-progress-fsm.md.
+
+/// Where we are in the exchange — WSJT-X's `m_QSOProgress`, mirrored. Will become
+/// the legible phase a contact carries once the tables produce it; the published
+/// `step` stays the display value. **[Joel owns the final taxonomy.]**
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Progress {
+    Calling,
+    Replying,
+    Report,
+    RogerReport,
+    Rogers,
+    Signoff,
+}
+
+/// The received content the sequencer reacts to — a flattened projection of
+/// [`ParsedMessage`] + [`ExchangePayload`], with the Field Day exchange split by
+/// its `rogered` bit (the two cases the engine treats differently). Addressing
+/// (`to`/`from`/`caller`) is intentionally dropped: the routing sites check it
+/// before consulting the tables.
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq)]
+enum MsgKind {
+    Cq { grid: Option<GridSquare> },
+    Grid(GridSquare),
+    Report(i8),
+    RogerReport(i8),
+    FdBare { class: String, section: Section },
+    FdRoger { class: String, section: Section },
+    Signoff(Signoff),
+    /// Free / Raw / anything the decoder couldn't classify — never sequenced.
+    Other,
+}
+
+impl MsgKind {
+    /// Classify an inbound message into the closed set the tables key on. Pure, and
+    /// it drops addressing (the routing pre-checks own that).
+    #[allow(dead_code)]
+    fn classify(m: &ParsedMessage) -> MsgKind {
+        match m {
+            ParsedMessage::Cq { grid, .. } => MsgKind::Cq { grid: grid.clone() },
+            ParsedMessage::Exchange { payload, .. } => match payload {
+                ExchangePayload::Grid(g) => MsgKind::Grid(g.clone()),
+                ExchangePayload::Report(r) => MsgKind::Report(*r),
+                ExchangePayload::RogerReport(r) => MsgKind::RogerReport(*r),
+                ExchangePayload::FieldDay {
+                    class,
+                    section,
+                    rogered: false,
+                } => MsgKind::FdBare {
+                    class: class.clone(),
+                    section: section.clone(),
+                },
+                ExchangePayload::FieldDay {
+                    class,
+                    section,
+                    rogered: true,
+                } => MsgKind::FdRoger {
+                    class: class.clone(),
+                    section: section.clone(),
+                },
+            },
+            ParsedMessage::Signoff { kind, .. } => MsgKind::Signoff(*kind),
+            ParsedMessage::Free(_) | ParsedMessage::Raw(_) => MsgKind::Other,
+        }
+    }
+}
+
+/// The abstract reply a transition asks for; [`Engine::materialize`] turns it into a
+/// real [`OutgoingMessage`]. Keeps the tables pure data — they can't build messages,
+/// which need `&self.me`.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reply {
+    None,
+    Opener,
+    Report,
+    RogerReport,
+    FdRogerExchange,
+    Rr73,
+    Seven3,
+}
+
 /// The QSO engine for one radio.
 pub struct Engine {
     radio: RadioId,
@@ -961,6 +1051,22 @@ impl Engine {
         } else {
             message::answer_grid(&self.me, his)
         }
+    }
+
+    /// Turn an abstract [`Reply`] tag into the message to transmit, using our station
+    /// config, the partner call, and our report of them (`snr`, for the report
+    /// messages). The 1:1 map onto the `message::*` builders the tables will lean on.
+    #[allow(dead_code)]
+    fn materialize(&self, reply: Reply, his: &Callsign, snr: i8) -> Option<OutgoingMessage> {
+        Some(match reply {
+            Reply::None => return None,
+            Reply::Opener => self.opener(his),
+            Reply::Report => message::report(&self.me, his, snr),
+            Reply::RogerReport => message::roger_report(&self.me, his, snr),
+            Reply::FdRogerExchange => message::fd_roger_exchange(&self.me, his),
+            Reply::Rr73 => message::rr73(&self.me, his),
+            Reply::Seven3 => message::seven3(&self.me, his),
+        })
     }
 
     /// Build the completed-QSO record from the given active contact. Taking the
@@ -2276,5 +2382,111 @@ mod tests {
             -8,
         )));
         assert_eq!(s.state.phase, QsoPhase::Idle, "grid opener not resumable in Field Day");
+    }
+
+    // ---- step 3: inert sequencer vocabulary (classify + materialize)
+
+    #[test]
+    fn classify_maps_each_message_kind() {
+        let g = GridSquare("FN42".into());
+        assert_eq!(
+            MsgKind::classify(&cq_from(HIM, false)),
+            MsgKind::Cq {
+                grid: Some(GridSquare("FN42".into())),
+            }
+        );
+        assert_eq!(
+            MsgKind::classify(&exch(ME, HIM, ExchangePayload::Grid(g.clone()))),
+            MsgKind::Grid(g)
+        );
+        assert_eq!(
+            MsgKind::classify(&exch(ME, HIM, ExchangePayload::Report(-12))),
+            MsgKind::Report(-12)
+        );
+        assert_eq!(
+            MsgKind::classify(&exch(ME, HIM, ExchangePayload::RogerReport(-3))),
+            MsgKind::RogerReport(-3)
+        );
+        assert_eq!(
+            MsgKind::classify(&exch(
+                ME,
+                HIM,
+                ExchangePayload::FieldDay {
+                    class: "2B".into(),
+                    section: Section("IL".into()),
+                    rogered: false,
+                },
+            )),
+            MsgKind::FdBare {
+                class: "2B".into(),
+                section: Section("IL".into()),
+            }
+        );
+        assert_eq!(
+            MsgKind::classify(&exch(
+                ME,
+                HIM,
+                ExchangePayload::FieldDay {
+                    class: "2B".into(),
+                    section: Section("IL".into()),
+                    rogered: true,
+                },
+            )),
+            MsgKind::FdRoger {
+                class: "2B".into(),
+                section: Section("IL".into()),
+            }
+        );
+        assert_eq!(
+            MsgKind::classify(&signoff(ME, HIM, Signoff::Rr73)),
+            MsgKind::Signoff(Signoff::Rr73)
+        );
+        assert!(matches!(
+            MsgKind::classify(&ParsedMessage::Free("x".into())),
+            MsgKind::Other
+        ));
+        assert!(matches!(
+            MsgKind::classify(&ParsedMessage::Raw("y".into())),
+            MsgKind::Other
+        ));
+    }
+
+    #[test]
+    fn materialize_maps_reply_tags_to_messages() {
+        let him = call(HIM);
+        let std = engine(ContestProfile::Standard);
+        assert!(std.materialize(Reply::None, &him, -8).is_none());
+        // Standard opener is our grid (Tx1).
+        assert_eq!(
+            std.materialize(Reply::Opener, &him, -8).unwrap().text,
+            "K1ABC W9XYZ EM48"
+        );
+        assert_eq!(
+            std.materialize(Reply::Report, &him, -8).unwrap().text,
+            "K1ABC W9XYZ -08"
+        );
+        assert_eq!(
+            std.materialize(Reply::RogerReport, &him, -8).unwrap().text,
+            "K1ABC W9XYZ R-08"
+        );
+        assert_eq!(
+            std.materialize(Reply::Rr73, &him, -8).unwrap().text,
+            "K1ABC W9XYZ RR73"
+        );
+        assert_eq!(
+            std.materialize(Reply::Seven3, &him, -8).unwrap().text,
+            "K1ABC W9XYZ 73"
+        );
+
+        // Field Day opener is the bare exchange (Tx2), and its roger+exchange (Tx3).
+        let fd = engine(ContestProfile::ArrlFieldDay);
+        assert_eq!(
+            fd.materialize(Reply::Opener, &him, -8).unwrap().text,
+            "K1ABC W9XYZ 3A WI"
+        );
+        assert_eq!(
+            fd.materialize(Reply::FdRogerExchange, &him, -8).unwrap().text,
+            "K1ABC W9XYZ R 3A WI"
+        );
     }
 }
