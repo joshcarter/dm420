@@ -434,6 +434,9 @@ pub fn save_hardware_config(cfg: &HardwareConfig) {
             ("autodetect", bool_str(cfg.serial.autodetect)),
         ],
     );
+    // Persist the on-air mode alongside the other display prefs so it's restored
+    // next launch (read back by [`read_mode`]); env `DM420_MODE` still overrides.
+    let text = update_toml_table(&text, "display", &[("mode", protocol_str(cfg.protocol))]);
     write_config(&path, &text);
 }
 
@@ -662,18 +665,43 @@ fn serial_from_env() -> SerialConfig {
     }
 }
 
+/// Resolve the startup on-air mode. `DM420_MODE` wins (a quick override, like the
+/// other env bindings); otherwise the persisted `[display] mode` from the last
+/// session ([`save_mode`]); otherwise FT8.
 fn protocol_from_env() -> Protocol {
     match env_nonempty("DM420_MODE") {
-        Some(s) => match s.trim().to_lowercase().as_str() {
-            "ft8" => Protocol::Ft8,
-            "ft4" => Protocol::Ft4,
-            _ => {
-                tracing::warn!(value = %s, "DM420_MODE unknown (use ft8|ft4); using ft8");
-                Protocol::Ft8
-            }
-        },
-        None => Protocol::Ft8,
+        Some(s) => parse_protocol(&s).unwrap_or_else(|| {
+            tracing::warn!(value = %s, "DM420_MODE unknown (use ft8|ft4); using ft8");
+            Protocol::Ft8
+        }),
+        None => read_mode().unwrap_or(Protocol::Ft8),
     }
+}
+
+/// Parse an `ft8`/`ft4` token (case-insensitive) into a [`Protocol`].
+fn parse_protocol(s: &str) -> Option<Protocol> {
+    match s.trim().to_lowercase().as_str() {
+        "ft8" => Some(Protocol::Ft8),
+        "ft4" => Some(Protocol::Ft4),
+        _ => None,
+    }
+}
+
+/// The lowercase `[display] mode` token written by [`save_mode`].
+fn protocol_str(p: Protocol) -> &'static str {
+    match p {
+        Protocol::Ft8 => "ft8",
+        Protocol::Ft4 => "ft4",
+    }
+}
+
+/// The persisted on-air mode: the `[display] mode` key, written by
+/// [`save_hardware_config`]. `None` when unset/garbled, so the caller falls back
+/// to FT8. Set whenever the operator flips FT8/FT4 (the waterslide toggle or the
+/// settings form).
+pub fn read_mode() -> Option<Protocol> {
+    let text = std::fs::read_to_string(config_path()).ok()?;
+    parse_table_value(&text, "display", "mode").as_deref().and_then(parse_protocol)
 }
 
 fn wav_from_env() -> Option<PathBuf> {
@@ -746,6 +774,19 @@ mod tests {
             Some("W4LL"),
             "callsign survives the station_id write: {text}"
         );
+    }
+
+    #[test]
+    fn mode_round_trips_through_the_display_table() {
+        // What `save_hardware_config` writes for the mode, read back by `read_mode`.
+        assert_eq!(parse_protocol("FT4"), Some(Protocol::Ft4), "case-insensitive");
+        for p in [Protocol::Ft8, Protocol::Ft4] {
+            let text = update_toml_table("[serial]\nbaud = \"19200\"\n", "display", &[("mode", protocol_str(p))]);
+            let got = parse_table_value(&text, "display", "mode").as_deref().and_then(parse_protocol);
+            assert_eq!(got, Some(p), "mode survives the [display] write: {text}");
+        }
+        // Unset/garbled ⇒ no opinion (the caller falls back to FT8).
+        assert_eq!(parse_protocol("ssb"), None);
     }
 
     #[test]
