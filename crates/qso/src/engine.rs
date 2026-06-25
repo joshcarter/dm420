@@ -918,13 +918,15 @@ impl Engine {
 
     /// Advance a committed contact from received content.
     fn advance_active(&mut self, msg: &ParsedMessage, _snr: i8) -> Option<CompletedQso> {
-        // Pull what we need without holding a borrow across `&mut self` calls.
-        let (role, partner, partner_snr, logged) = match &self.state {
-            State::Active(a) => (a.role, a.partner.clone(), a.partner_snr, a.logged),
+        // Pull what the addressing check needs without holding a borrow across the
+        // `&mut self` apply.
+        let (role, partner) = match &self.state {
+            State::Active(a) => (a.role, a.partner.clone()),
             _ => return None,
         };
 
-        // Auto-stop / lost-race: the partner is now addressing a different call.
+        // Auto-stop / lost-race: the partner is now addressing a different call. This
+        // routing pre-check is unchanged — only the post-check decision is now tabled.
         match addressed(msg) {
             Some((to, from)) => {
                 if from == &partner && to != &self.me.call {
@@ -937,107 +939,72 @@ impl Engine {
             None => return None, // a CQ or unaddressed line — ignore mid-QSO
         }
 
-        let me_fd = self.me.is_field_day();
-        match (role, me_fd, msg) {
-            // ---------- Standard, answering side: their report → roger+report ----------
-            (
-                Role::Answering,
-                false,
-                ParsedMessage::Exchange {
-                    payload: ExchangePayload::Report(r),
-                    ..
-                },
-            ) => {
-                let reply = message::roger_report(&self.me, &partner, partner_snr);
-                if let State::Active(a) = &mut self.state {
-                    a.rcvd_report = Some(*r);
-                    a.next = Some(reply);
-                    a.step = 2;
-                    a.overs_since_progress = 0;
-                }
-                None
-            }
+        // The decision, consolidated: the `advance` table maps (role, contest, content)
+        // to a transition; `apply_advance` writes it onto the live contact (or leaves it
+        // on `Ignore`). This replaces the four hand-enumerated arms and their silent
+        // `_ => None`.
+        let fd = self.me.is_field_day();
+        self.apply_advance(advance(role, fd, MsgKind::classify(msg)))
+    }
 
-            // ---------- Field Day, answering side: their R+exchange → RR73 ----------
-            (
-                Role::Answering,
-                true,
-                ParsedMessage::Exchange {
-                    payload:
-                        ExchangePayload::FieldDay {
-                            class,
-                            section,
-                            rogered: true,
-                        },
-                    ..
-                },
-            ) => {
-                // Their R+exchange — send RR73 and log when it goes out (RR73 sent).
-                let rr = message::rr73(&self.me, &partner);
-                if let State::Active(a) = &mut self.state {
-                    a.rcvd_fd = Some((class.clone(), section.clone()));
-                    a.next = Some(rr);
-                    a.finish_after_tx = Some(Finish::Idle);
-                    a.log_on_tx = true;
-                    a.step = 2;
-                    a.overs_since_progress = 0;
-                }
-                None
-            }
+    /// Apply a [`Transition`] from the `advance` table to the live contact. `Ignore`
+    /// leaves it untouched (the contact keeps repeating; the give-up counter climbs).
+    /// `Act` materializes the reply and writes the contact's fields — now the single
+    /// place an in-progress contact's `next` / `finish_after_tx` / `log_on_tx` / `step`
+    /// / captured-fact writes happen. Returns a completed-QSO log for the "log on
+    /// receive" (sign-off) case.
+    fn apply_advance(&mut self, t: Transition) -> Option<CompletedQso> {
+        let Transition::Act(o) = t else {
+            return None; // Ignore — no mutation, give-up counter untouched
+        };
 
-            // ---------- Standard, CQ side: their R-report → RR73 (log on send) ----------
-            (
-                Role::CallingCq,
-                false,
-                ParsedMessage::Exchange {
-                    payload: ExchangePayload::RogerReport(r),
-                    ..
-                },
-            ) => {
-                let rr = message::rr73(&self.me, &partner);
-                if let State::Active(a) = &mut self.state {
-                    a.rcvd_report = Some(*r);
-                    a.next = Some(rr);
-                    a.log_on_tx = true;
-                    a.step = 2;
-                    a.overs_since_progress = 0;
-                }
-                None
+        // "Log on receive" (sign-off): build the record from the live contact, gated on
+        // not-yet-logged, before any mutation.
+        let done = if matches!(o.log, LogWhen::OnReceive) {
+            match &self.state {
+                State::Active(a) if !a.logged => Some(self.completed(a)),
+                _ => None,
             }
+        } else {
+            None
+        };
 
-            // ---------- Any directed sign-off (RRR / RR73 / 73) completes it ----------
-            // P2: a partner who sends us *any* sign-off is done. Bare `73` is the most
-            // common ending on the air, and RRR/RR73/73 are interchangeable here —
-            // gating on one specific token is what used to leave us repeating an over
-            // forever. The answering side (and the FD CQ side, on their RR73) sends a
-            // courtesy `73`; the Standard CQ side has already logged on RR73-sent and
-            // just resumes CQ.
-            (_, _, ParsedMessage::Signoff { kind, .. }) => {
-                // Log on receive (if not already logged) — we're still `Active` here.
-                let done = match &self.state {
-                    State::Active(a) if !logged => Some(self.completed(a)),
-                    _ => None,
-                };
-                let courtesy = matches!(role, Role::Answering) || (me_fd && is_roger(*kind));
-                if courtesy {
-                    let s73 = message::seven3(&self.me, &partner);
-                    let resume = matches!(role, Role::CallingCq);
-                    if let State::Active(a) = &mut self.state {
-                        a.next = Some(s73);
-                        a.finish_after_tx =
-                            Some(if resume { Finish::ResumeCq } else { Finish::Idle });
-                        a.logged = true;
-                        a.step = 3;
-                        a.overs_since_progress = 0;
-                    }
-                } else {
-                    self.resume_cq();
-                }
-                done
-            }
-
-            _ => None,
+        // Non-courtesy sign-off — nothing left to send: resume CQ now, before the writes.
+        if matches!(o.settle, Settle::ResumeCqNow) {
+            self.resume_cq();
+            return done;
         }
+
+        // Materialize the reply against the live contact — partner call + our stored
+        // report of them (not the inbound decode's snr).
+        let reply = match &self.state {
+            State::Active(a) => self.materialize(o.reply, &a.partner, a.partner_snr),
+            _ => return done,
+        };
+        if let State::Active(a) = &mut self.state {
+            if let Some(m) = reply {
+                a.next = Some(m);
+            }
+            a.step = o.step;
+            match &o.capture {
+                Capture::None => {}
+                Capture::Grid(g) => a.partner_grid = g.clone(),
+                Capture::Report(r) => a.rcvd_report = Some(*r),
+                Capture::Fd(class, section) => {
+                    a.rcvd_fd = Some((class.clone(), section.clone()))
+                }
+            }
+            match o.log {
+                LogWhen::OnSend => a.log_on_tx = true,
+                LogWhen::OnReceive => a.logged = true,
+                LogWhen::Never => {}
+            }
+            if let Settle::FinishOnSend(f) = o.settle {
+                a.finish_after_tx = Some(f);
+            }
+            a.overs_since_progress = 0;
+        }
+        done
     }
 
     /// Lost the race mid-QSO: stop, and re-arm (answering) or resume CQ.
