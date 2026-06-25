@@ -44,6 +44,10 @@ const RECV_BUF: usize = 64 * 1024;
 pub struct NetConfig {
     /// This operator's stable id, used as the gossip key and mDNS instance name.
     pub station: StationId,
+    /// IPv4 address to bind the UDP socket to. Production binds `UNSPECIFIED`
+    /// (all interfaces); the loopback integration test binds `LOCALHOST` to keep
+    /// traffic off the wire.
+    pub bind: Ipv4Addr,
     /// UDP listen port; `0` binds an ephemeral port (advertised via mDNS).
     pub port: u16,
     /// Static peers for segments where mDNS is unavailable (`host:port`).
@@ -76,6 +80,7 @@ impl NetConfig {
             .unwrap_or_default();
         Some(NetConfig {
             station,
+            bind: Ipv4Addr::UNSPECIFIED,
             port,
             manual_peers,
             enable_mdns: true,
@@ -107,44 +112,97 @@ fn parse_peers(s: &str) -> Vec<SocketAddr> {
 pub fn spawn(bus: &BusHandle, cfg: NetConfig) {
     let bus = bus.clone();
     tokio::spawn(async move {
-        if let Err(e) = run(bus, cfg).await {
-            tracing::error!(error = %e, "net: gossip service stopped");
+        match Service::bind(bus, cfg).await {
+            Ok(svc) => {
+                if let Err(e) = svc.run().await {
+                    tracing::error!(error = %e, "net: gossip service stopped");
+                }
+            }
+            Err(e) => tracing::error!(error = %e, "net: bind failed; gossip disabled"),
         }
     });
 }
 
-async fn run(bus: BusHandle, cfg: NetConfig) -> std::io::Result<()> {
-    let socket = Arc::new(UdpSocket::bind((Ipv4Addr::UNSPECIFIED, cfg.port)).await?);
-    let port = socket.local_addr()?.port();
-    tracing::info!(station = %cfg.station.0, port, "net: LAN gossip up");
+/// A bound-but-not-yet-running gossip service.
+///
+/// Splitting *bind* from *run* lets a caller learn the bound UDP port and wire
+/// peers before any loop starts. Production goes straight through [`spawn`]; the
+/// loopback integration test uses this to stand up two instances on ephemeral
+/// `127.0.0.1` ports and cross-connect them deterministically, with mDNS off.
+pub struct Service {
+    bus: BusHandle,
+    socket: Arc<UdpSocket>,
+    peers: Peers,
+    station: StationId,
+    enable_mdns: bool,
+}
 
-    let peers = Peers::default();
-    for addr in &cfg.manual_peers {
-        peers.add_target(*addr);
-        tracing::info!(%addr, "net: manual peer");
-    }
-    if cfg.enable_mdns {
-        if let Err(e) = discovery::spawn(cfg.station.clone(), port, peers.clone()) {
-            tracing::warn!(error = %e, "net: mDNS unavailable; manual peers only");
+impl Service {
+    /// Bind the UDP socket (`cfg.bind:cfg.port`; port `0` = ephemeral) and seed
+    /// the manual peers. Starts no task — call [`Service::run`] to drive the loops.
+    pub async fn bind(bus: BusHandle, cfg: NetConfig) -> std::io::Result<Self> {
+        let socket = Arc::new(UdpSocket::bind((cfg.bind, cfg.port)).await?);
+        let peers = Peers::default();
+        for addr in &cfg.manual_peers {
+            peers.add_target(*addr);
+            tracing::info!(%addr, "net: manual peer");
         }
+        Ok(Self {
+            bus,
+            socket,
+            peers,
+            station: cfg.station,
+            enable_mdns: cfg.enable_mdns,
+        })
     }
 
-    tokio::spawn(recv_loop(
-        socket.clone(),
-        bus.clone(),
-        peers.clone(),
-        cfg.station.clone(),
-    ));
+    /// The bound local UDP port — resolved even when `cfg.port` was `0`.
+    pub fn local_port(&self) -> std::io::Result<u16> {
+        Ok(self.socket.local_addr()?.port())
+    }
 
-    // Beacon loop. Step-1 snapshots carry an empty payload — we're proving
-    // transport + discovery; the bus-fed content lands in steps 2–3.
+    /// Add a beacon target after binding, so a caller that has just learned a
+    /// peer's ephemeral port (e.g. a test cross-wiring two instances) can register
+    /// it before [`run`](Self::run). Idempotent.
+    pub fn add_peer(&self, addr: SocketAddr) {
+        self.peers.add_target(addr);
+    }
+
+    /// Drive the receive + beacon loops until the socket fails. Consumes `self`;
+    /// spawn it onto the runtime if you need it in the background (what [`spawn`]
+    /// does).
+    pub async fn run(self) -> std::io::Result<()> {
+        let port = self.socket.local_addr()?.port();
+        tracing::info!(station = %self.station.0, port, "net: LAN gossip up");
+
+        if self.enable_mdns {
+            if let Err(e) = discovery::spawn(self.station.clone(), port, self.peers.clone()) {
+                tracing::warn!(error = %e, "net: mDNS unavailable; manual peers only");
+            }
+        }
+
+        tokio::spawn(recv_loop(
+            self.socket.clone(),
+            self.bus.clone(),
+            self.peers.clone(),
+            self.station.clone(),
+        ));
+
+        beacon_loop(self.socket, self.peers, self.station).await
+    }
+}
+
+/// Beacon our [`StationSnapshot`] to every known peer on a fixed interval, and
+/// age out peers we've stopped hearing. Step-1 snapshots carry an empty payload —
+/// we're proving transport + discovery; the bus-fed content lands in steps 2–3.
+async fn beacon_loop(socket: Arc<UdpSocket>, peers: Peers, station: StationId) -> std::io::Result<()> {
     let mut seq = 0u64;
     let mut tick = tokio::time::interval(SNAPSHOT_INTERVAL);
     loop {
         tick.tick().await;
         seq += 1;
         let snap = StationSnapshot {
-            station: cfg.station.clone(),
+            station: station.clone(),
             seq,
             working: None,
             band_activity: vec![],
@@ -152,7 +210,7 @@ async fn run(bus: BusHandle, cfg: NetConfig) -> std::io::Result<()> {
         };
         let frame = Frame {
             version: PROTO_VERSION,
-            from: cfg.station.clone(),
+            from: station.clone(),
             msg: Wire::Snapshot(snap),
         };
         match wire::encode(&frame) {
