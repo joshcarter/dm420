@@ -327,7 +327,10 @@ pub fn spawn(bus: &BusHandle, cfg: CoreConfig) -> CoreControl {
     // placeholder); the rest (port, peers, opt-out via `DM420_NET=0`) is still env.
     // Best-effort — `net::spawn` degrades to a logged warning if the socket or
     // mDNS can't come up, so a missing network never blocks the rest of the app.
-    if let Some(net_cfg) = net::NetConfig::from_env(station_id) {
+    if let Some(mut net_cfg) = net::NetConfig::from_env(station_id) {
+        // Address the beacon's working-target subscriptions at the real radio (the
+        // single radio today); `from_env` only knows a placeholder default.
+        net_cfg.radio = radio_id();
         net::spawn(bus, net_cfg);
     }
 
