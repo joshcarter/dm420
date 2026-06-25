@@ -15,10 +15,10 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bus::types::*;
-use bus::{BusError, BusHandle, BusMessage, Topic, TopicSelector};
+use bus::{BusError, BusHandle, BusMessage, Topic, TopicKind, TopicSelector};
 
 use crate::panel_data::Locator;
 
@@ -115,6 +115,33 @@ struct HeardEntry {
     slot: SlotId,
 }
 
+/// One peer's latest LAN beacon ([`StationSnapshot`]) plus the local wall-clock
+/// instant we received it. `last_seen` is stamped on *our* clock at receipt — like
+/// `HeardStation::last_heard` — so peer staleness is immune to operator clock skew.
+/// Accumulated by [`pump_peers`], keyed by [`StationId`] (latest-wins by `seq`).
+struct PeerSnapshot {
+    snap: StationSnapshot,
+    last_seen: Instant,
+}
+
+/// A peer operator's current working intent, projected from their latest snapshot
+/// for the waterslide's deconfliction overlay: the band + audio offset they're
+/// sitting on, the call they're working (if known), and when we last heard from
+/// them (for the staleness cut). Read-only — this drives display only; the overlay
+/// never retunes the rig from peer data (`heard ≠ mine`, display-only by design).
+pub struct PeerWorking {
+    /// The peer's `StationId` string, for the marker label.
+    pub station: String,
+    /// The band the peer is working — the panel filters to the local band.
+    pub band: Band,
+    /// The peer's TX audio offset (Hz), placed on the waterslide's vertical axis.
+    pub offset: f32,
+    /// The call the peer is working, once known (`None` while merely armed).
+    pub call: Option<String>,
+    /// Local receipt instant of the peer's latest snapshot, for the staleness cut.
+    pub last_seen: Instant,
+}
+
 /// The GUI-facing view of live bus state. Cheap to construct once at startup and
 /// held by `App`; every accessor returns an owned snapshot so panels never hold a
 /// lock across drawing. Dropping it drops the runtime, which stops the producers
@@ -161,6 +188,11 @@ pub struct BusView {
     /// Latest health per hardware subsystem (real mode only). Drives the panels'
     /// fault display when a device is missing or disconnected.
     health: Arc<Mutex<HashMap<SubsystemId, SubsystemHealth>>>,
+    /// Every known LAN peer's latest beacon, keyed by `StationId` (latest-wins by
+    /// `seq`), each stamped with our local receipt time. The waterslide reads this
+    /// each frame (via [`Self::peers`]) to draw other operators' working offsets so
+    /// the operator can avoid stomping them — display-only deconfliction.
+    peers: Arc<Mutex<HashMap<StationId, PeerSnapshot>>>,
 
     /// Handle for live reconfiguration of the running producers (real mode only;
     /// empty otherwise).
@@ -213,6 +245,8 @@ impl BusView {
             Arc::new(Mutex::new(HashMap::new()));
         let health: Arc<Mutex<HashMap<SubsystemId, SubsystemHealth>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let peers: Arc<Mutex<HashMap<StationId, PeerSnapshot>>> =
+            Arc::new(Mutex::new(HashMap::new()));
 
         // `tokio::spawn` (used by the producers and the pump helpers) needs an
         // active runtime context; hold the guard while we wire everything up.
@@ -238,7 +272,8 @@ impl BusView {
         // It auto-sends when a rig + the PTT interlock are present (the operator
         // still keys explicitly per over). `station_id` is the single configured
         // identity stamped as the `origin` on every logged contact.
-        let qso_control = qso::spawn(&bus, app_core::radio_id(), station, station_id, true);
+        let qso_control =
+            qso::spawn(&bus, app_core::radio_id(), station, station_id.clone(), true);
 
         pump_state(
             &bus,
@@ -293,6 +328,11 @@ impl BusView {
         for id in [SubsystemId::Rig, SubsystemId::Audio] {
             pump_health(&bus, id, health.clone(), egui_ctx.clone());
         }
+        // LAN peers' working offsets for the deconfliction overlay. A wildcard over
+        // every peer's `station/*/snapshot` (the net crate republishes each beacon
+        // onto its own scope); our own `station_id` is filtered so we never draw
+        // ourselves as a peer.
+        pump_peers(&bus, station_id.clone(), peers.clone(), egui_ctx.clone());
         drop(_guard);
 
         Self {
@@ -310,6 +350,7 @@ impl BusView {
             qso,
             selection,
             health,
+            peers,
             control,
             qso_control,
             applied,
@@ -545,6 +586,31 @@ impl BusView {
     /// panels treat as "not faulted".
     pub fn health(&self, id: SubsystemId) -> Option<SubsystemHealth> {
         self.health.lock().unwrap().get(&id).cloned()
+    }
+
+    /// Each known LAN peer's current working intent (band + audio offset + worked
+    /// call) projected from its latest beacon, with the local receipt instant for
+    /// the caller's staleness cut. Only peers actively working a target appear
+    /// (`working: None` is omitted); empty until a peer beacon arrives. Locks
+    /// briefly and clones out a small `Vec` so the panel never holds the map across
+    /// drawing. **Display-only** — the waterslide draws these to show where other
+    /// operators are sitting; it never commands the rig from them.
+    pub fn peers(&self) -> Vec<PeerWorking> {
+        self.peers
+            .lock()
+            .unwrap()
+            .values()
+            .filter_map(|p| {
+                let w = p.snap.working.as_ref()?;
+                Some(PeerWorking {
+                    station: p.snap.station.0.clone(),
+                    band: w.band,
+                    offset: w.offset.0,
+                    call: w.call.as_ref().map(|c| c.0.clone()),
+                    last_seen: p.last_seen,
+                })
+            })
+            .collect()
     }
 
     /// All retained decodes, newest first. The waterslide wants the full ring (it
@@ -990,6 +1056,66 @@ fn pump_health(
                     health.lock().unwrap().insert(h.id, h);
                     ctx.request_repaint();
                 }
+                Err(BusError::Lagged { .. }) => continue,
+                Err(_) => break,
+            }
+        }
+    });
+}
+
+/// Spawn a pump that collects every LAN peer's latest `StationSnapshot` into a
+/// shared map keyed by [`StationId`], stamping each with the local receipt time for
+/// staleness. A *wildcard* over `station/*/snapshot` (the `net` crate republishes
+/// each peer's beacon onto its own scope) — late-join-primed, so a peer already
+/// known when the pump starts is delivered. Latest-wins per station: an older or
+/// equal `seq` is kept current (equal refreshes `last_seen`); a lower `seq` is
+/// dropped. `me` filters our own beacon — the net crate already drops self, but
+/// stay defensive so we never paint ourselves as a peer.
+///
+/// **Read-only**: this only feeds the display overlay; nothing here commands the rig.
+fn pump_peers(
+    bus: &BusHandle,
+    me: StationId,
+    peers: Arc<Mutex<HashMap<StationId, PeerSnapshot>>>,
+    ctx: egui::Context,
+) {
+    let mut sub = match bus
+        .subscribe::<StationSnapshot>(TopicSelector::Wildcard(TopicKind::StationSnapshot))
+    {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(error = ?e, "bus_view: peer snapshot subscribe failed");
+            return;
+        }
+    };
+    tokio::spawn(async move {
+        loop {
+            match sub.recv().await {
+                Ok(snap) => {
+                    if snap.station == me {
+                        continue; // our own beacon — drawn as the TX lane, not a peer
+                    }
+                    let mut map = peers.lock().unwrap();
+                    // Latest-wins: ignore a strictly older snapshot (a reordered or
+                    // duplicated datagram); accept equal/newer (equal refreshes the
+                    // staleness clock for a peer that re-beacons an unchanged intent).
+                    let stale = map
+                        .get(&snap.station)
+                        .is_some_and(|p| snap.seq < p.snap.seq);
+                    if stale {
+                        continue;
+                    }
+                    map.insert(
+                        snap.station.clone(),
+                        PeerSnapshot {
+                            snap,
+                            last_seen: Instant::now(),
+                        },
+                    );
+                    drop(map);
+                    ctx.request_repaint();
+                }
+                // Lossy lag on the wildcard State stream: keep reading. Closed: end.
                 Err(BusError::Lagged { .. }) => continue,
                 Err(_) => break,
             }

@@ -967,6 +967,39 @@ impl Panel for Waterfall {
                         slots
                     };
 
+                    // LAN peers' working offsets for the deconfliction overlay.
+                    // Filtered to the band we're tuned to — a peer's 40 m offset on
+                    // our 20 m waterslide would be meaningless — and to fresh beacons
+                    // (stale ones are dropped, not parked; see `PEER_STALE_SECS`).
+                    // `local_band` is derived the same way `worked` is (dial freq →
+                    // band); off-band (`None`) draws no peers. Sorted high→low offset
+                    // so the renderer's label stagger cascades downward. Display-only:
+                    // these offsets never drive a retune.
+                    let local_band = ctx
+                        .bus
+                        .rig_state()
+                        .map(|r| r.vfo.0)
+                        .and_then(|hz| Band::from_hz(AbsHz(hz)));
+                    let peer_ticks: Vec<PeerTick> = {
+                        let stale = std::time::Duration::from_secs(PEER_STALE_SECS);
+                        let mut ticks: Vec<PeerTick> = ctx
+                            .bus
+                            .peers()
+                            .into_iter()
+                            .filter(|p| Some(p.band) == local_band)
+                            .filter(|p| p.last_seen.elapsed() <= stale)
+                            .map(|p| {
+                                let label = match &p.call {
+                                    Some(call) => format!("{} \u{00B7} {}", p.station, call),
+                                    None => p.station.clone(),
+                                };
+                                PeerTick { offset: p.offset, label }
+                            })
+                            .collect();
+                        ticks.sort_by(|a, b| b.offset.total_cmp(&a.offset));
+                        ticks
+                    };
+
                     if let Some(click) = draw_waterslide(
                         painter,
                         body,
@@ -990,6 +1023,7 @@ impl Panel for Waterfall {
                         now_frac,
                         self.view_lo_hz,
                         self.view_span_hz,
+                        &peer_ticks,
                     ) {
                         // Publish the click as a selection (the single owner) — who (a
                         // decoded station, or none for bare spectrum) + where (the
@@ -1138,6 +1172,12 @@ impl Waterfall {
 
 /// Audio-offset axis span (Hz): FT8/FT4 decodes land in roughly 0..3000 Hz.
 const WS_MAX_HZ: f32 = 3000.0;
+
+/// How long a LAN peer's beacon stays drawable on the deconfliction overlay, in
+/// seconds. Mirrors the transport's peer TTL (~30 s): a peer we haven't heard from
+/// within this window is dropped from the waterslide rather than left lingering —
+/// a stale "someone is here" tick would mislead the very view it exists to inform.
+const PEER_STALE_SECS: u64 = 30;
 
 /// Tightest frequency span (Hz) the view may zoom to — keeps a few signal lanes
 /// on screen so zoom-in stays useful rather than collapsing to a single trace.
@@ -1555,6 +1595,16 @@ fn draw_tx_hatch_row(
     }
 }
 
+/// One LAN peer's working offset, resolved for the deconfliction overlay: the
+/// audio offset to place on the vertical axis and the label to draw beside it
+/// (`station` plus the worked call, if known). Built by the panel from
+/// [`BusView::peers`](crate::bus_view::BusView::peers) — already filtered to the
+/// local band and freshness, and sorted high→low offset for the label stagger.
+struct PeerTick {
+    offset: f32,
+    label: String,
+}
+
 /// the de-collided text position), anything else a bare TX offset — returned as
 /// the new [`RealSel`]. `tx_off` is the current outgoing offset (marked as the TX
 /// lane), `sel_call`/`tag` highlight + label the selected station's lane, and
@@ -1601,6 +1651,11 @@ fn draw_waterslide(
     // the window are culled; the click→offset inverse reads against it too.
     view_lo: f32,
     view_span: f32,
+    // LAN peers' working offsets (deconfliction): already filtered to the local
+    // band + freshness and sorted high→low offset by the caller. Drawn as thin
+    // dashed lanes distinct from our own solid TX band — display-only, never
+    // commands the rig.
+    peers: &[PeerTick],
 ) -> Option<WsClick> {
     let painter = painter.with_clip_rect(rect);
     let now_x = rect.left() + rect.width() * now_frac; // the NOW line
@@ -1911,6 +1966,53 @@ fn draw_waterslide(
         ],
         egui::Stroke::new(2.0, accent),
     );
+
+    // Deconfliction overlay: other operators' working offsets, beaconed over the
+    // LAN. Each is a thin DASHED full-width rule with a hollow caret + small label
+    // in the secondary accent (`accent2`) — deliberately unlike our own solid,
+    // hatched TX band so "theirs" never reads as "mine" (heard ≠ worked, peers ≠
+    // me). Drawn before the TX lane so our own band sits on top. The caller has
+    // already culled stale and off-band peers and sorted them high→low offset;
+    // here we only cull out-of-window offsets and stagger colliding labels. This is
+    // display-only — nothing here retunes the rig from peer data.
+    if !peers.is_empty() {
+        let peer_col = pal.accent2;
+        let peer_line = egui::Stroke::new(1.0, peer_col.gamma_multiply(0.65));
+        let label_h = snr_pt + 3.0; // min vertical gap between staggered labels
+        let mut last_label_y = f32::NEG_INFINITY;
+        for tick in peers {
+            // Cull peers outside the (possibly zoomed) frequency window — unlike the
+            // own-TX lane, an off-band-window peer isn't parked at an edge (that would
+            // misrepresent where they are; staleness/edge tricks must not mislead).
+            if tick.offset < view_lo || tick.offset > view_hi {
+                continue;
+            }
+            let y = y_of(tick.offset);
+            // Dashed horizontal rule across the full pane.
+            let mut x = rect.left();
+            while x < rect.right() {
+                let x2 = (x + 6.0).min(rect.right());
+                painter.line_segment([Pos2::new(x, y), Pos2::new(x2, y)], peer_line);
+                x += 11.0; // 6 px dash + 5 px gap
+            }
+            // Small label at the left edge, nudged down if it would collide with the
+            // previous one (peers are sorted high→low offset = top→bottom, so the
+            // stagger only ever cascades downward).
+            let label_y = if y < last_label_y + label_h {
+                last_label_y + label_h
+            } else {
+                y
+            };
+            last_label_y = label_y;
+            painter.text(
+                Pos2::new(rect.left() + 5.0, label_y),
+                Align2::LEFT_CENTER,
+                format!("\u{25C1} {}", tick.label), // ◁ hollow caret = a peer, not us
+                snr_font.clone(),
+                peer_col,
+            );
+        }
+    }
 
     // Outgoing-frequency lane (matches the mock-mode indicator): a translucent
     // full-width band shaded to the signal's bandwidth, with bright rules a hair
