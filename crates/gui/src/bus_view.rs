@@ -416,9 +416,17 @@ impl BusView {
         v
     }
 
-    /// The `n` most recent log entries, newest first.
+    /// The `n` most recent log entries by timestamp, newest first.
+    ///
+    /// Sorts by `LogEntry.time` rather than trusting the ring's arrival order:
+    /// peer catch-up injects a station's backlog in `HashMap` (arbitrary) order,
+    /// so arrival order can be out of time-sequence. The ring is small (~512), so
+    /// a per-call sort is cheap.
     pub fn recent_logs(&self, n: usize) -> Vec<LogEntry> {
-        self.logs.snapshot().into_iter().rev().take(n).collect()
+        let mut all = self.logs.snapshot();
+        all.sort_by_key(|e| std::cmp::Reverse(e.time.0));
+        all.truncate(n);
+        all
     }
 
     /// How many log entries are currently held (capped at the ring size).
