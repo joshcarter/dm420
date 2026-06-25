@@ -660,36 +660,27 @@ impl Engine {
             return;
         };
         let target = target.clone();
-        match msg {
-            // The target called CQ — answer in the opposite slot at our chosen TX
-            // offset (self.outgoing), the engine-owned offset the Digital panel set
-            // via `SetTxOffset` when the operator selected this target. Using the
-            // target's decoded offset here would ignore a locked audio offset and
-            // transmit on the wrong frequency.
-            ParsedMessage::Cq { caller, grid, .. } if Some(caller) == target.call.as_ref() => {
-                tracing::info!(target = ?caller, tx_offset = ?self.outgoing, "qso engine: target called CQ → answering");
-                let opener = self.opener(caller);
-                self.state = State::Active(Box::new(Active {
+        // The armed path waits specifically for the *target's* CQ; a non-match means
+        // "stay armed" (not a dropped step), so this stays a dedicated trigger rather
+        // than a table lookup. We answer in the opposite slot at our chosen TX offset
+        // (self.outgoing) — the engine-owned offset the Digital panel set via
+        // `SetTxOffset` when the operator selected this target; the target's decoded
+        // offset would ignore a locked audio offset and transmit on the wrong frequency.
+        if let ParsedMessage::Cq { caller, grid, .. } = msg
+            && Some(caller) == target.call.as_ref()
+        {
+            tracing::info!(target = ?caller, tx_offset = ?self.outgoing, "qso engine: target called CQ → answering");
+            self.open_at(
+                Seed {
                     role: Role::Answering,
                     partner: caller.clone(),
                     target: Some(target),
                     offset: self.outgoing,
                     tx_parity: parity_after(slot),
-                    next: Some(opener),
-                    finish_after_tx: None,
-                    log_on_tx: false,
-                    logged: false,
-                    step: 1,
-                    partner_grid: grid.clone(),
-                    partner_snr: snr,
-                    rcvd_report: None,
-                    rcvd_fd: None,
-                    overs_since_progress: 0,
-                }));
-            }
-            // The target answered someone else — we lost the race; stay armed and
-            // wait for its next CQ (we never transmitted, so nothing to stop).
-            _ => {}
+                    snr,
+                },
+                answer_opener(grid.clone()),
+            );
         }
     }
 
