@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use types::{
     AbsHz, Band, Callsign, Decode, DecodeRef, OffsetHz, OverAirMode, ParsedMessage, QsoPhase,
-    Selection, SelectionContext, SlotId, SubsystemHealth, SubsystemId,
+    ScanStatus, Selection, SelectionContext, SlotId, SubsystemHealth, SubsystemId,
 };
 
 use app_core::Protocol;
@@ -353,6 +353,41 @@ impl Panel for Waterfall {
             13.0,
             80.0,
         );
+
+        // SCAN button — just right of the FREQ readout. Toggles the band scanner; the
+        // label tracks the run state (read from `ScannerState`, the single owner),
+        // showing STOP while a sweep runs. Mouse path, so it works regardless of focus.
+        let scanning = ctx
+            .bus
+            .scanner()
+            .map(|s| s.status == ScanStatus::Scanning)
+            .unwrap_or(false);
+        let scan_label = if scanning { "STOP" } else { "SCAN" };
+        let scan_cell_w = measure(painter, &tracked(scan_label), heading_bold(9.0)) + 14.0;
+        let scan_track_w = scan_cell_w + 4.0;
+        let scan_track = Rect::from_center_size(
+            Pos2::new(header.center().x + 48.0 + scan_track_w * 0.5, cy),
+            egui::Vec2::new(scan_track_w, 20.0),
+        );
+        lcd_panel(painter, scan_track, pal, 4);
+        let scan_cell = Rect::from_min_max(
+            Pos2::new(scan_track.left() + 2.0, scan_track.top() + 2.0),
+            Pos2::new(scan_track.right() - 2.0, scan_track.bottom() - 2.0),
+        );
+        if key_cell_accent(
+            ctx.ui,
+            painter,
+            pal,
+            scan_cell,
+            scan_label,
+            true,
+            pal.accent,
+            ctx.ui.id().with("header_scan"),
+        )
+        .clicked()
+        {
+            Self::toggle_scan(ctx);
+        }
 
         // send row (bottom) + screen (fills between header and the send row).
         let send_row = Rect::from_min_max(

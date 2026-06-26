@@ -199,6 +199,10 @@ pub struct BusView {
     /// Read via [`Self::my_station_id`] so consumers compare a [`LogEntry`]'s
     /// `id.origin` against one owned value instead of re-deriving "mine vs peer".
     my_station_id: StationId,
+    /// The configured `(band, mode)` stops a scan sweeps (`[bands]` in the config —
+    /// the same set the Band Status panel tracks). The Digital panel's SCAN button
+    /// reads this to start a survey.
+    scan_stops: Vec<(Band, OverAirMode)>,
 
     /// Handle for live reconfiguration of the running producers (real mode only;
     /// empty otherwise).
@@ -264,6 +268,9 @@ impl BusView {
             "bus_view: starting producers",
         );
         let applied = Arc::new(Mutex::new(settings.hardware()));
+        // The configured scan stops the Digital panel's SCAN button sweeps (and the
+        // band-status window tracks) — static config, so no pump.
+        let scan_stops = settings.band_stops.clone();
         let _guard = rt.enter();
         // Real rig + decode + clock + logbook + band-scanner producers — `core::spawn`
         // covers them all (the scanner is real too). The decode stream is the real decoder's.
@@ -358,6 +365,7 @@ impl BusView {
             health,
             peers,
             my_station_id: station_id,
+            scan_stops,
             control,
             qso_control,
             applied,
@@ -407,6 +415,11 @@ impl BusView {
     #[allow(dead_code)]
     pub fn scanner(&self) -> Option<ScannerState> {
         self.scanner.lock().unwrap().clone()
+    }
+
+    /// The configured `(band, mode)` stops a scan sweeps (the `[bands]` set).
+    pub fn scan_stops(&self) -> Vec<(Band, OverAirMode)> {
+        self.scan_stops.clone()
     }
 
     /// The current clock/slot status, if seen yet. (Consumer lands next pass.)

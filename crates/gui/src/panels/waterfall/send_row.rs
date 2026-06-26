@@ -8,7 +8,9 @@ use eframe::egui;
 use egui::{Align2, Pos2, Rect};
 use std::collections::{HashMap, HashSet};
 
-use types::{Callsign, Decode, DecodeRef, OffsetHz, OverAirMode, QsoPhase, SelectionContext};
+use types::{
+    Callsign, Decode, DecodeRef, OffsetHz, OverAirMode, QsoPhase, ScanStatus, SelectionContext,
+};
 
 use crate::chrome::{key_cell_accent, lcd_panel, measure};
 use crate::send::{Activation, Command};
@@ -89,6 +91,24 @@ impl Waterfall {
                     digit_consumed = true;
                     continue;
                 }
+                // S — toggle the band scanner: cancel a running sweep (anytime), or
+                // start one over the configured stops (only when not mid-QSO, so a scan
+                // can't hijack a live contact). No modifiers, NOT mid-command.
+                if let egui::Event::Key { key: egui::Key::S, pressed: true, modifiers, .. } = ev
+                    && !modifiers.any()
+                    && !self.send.entering
+                {
+                    let scanning = ctx
+                        .bus
+                        .scanner()
+                        .map(|s| s.status == ScanStatus::Scanning)
+                        .unwrap_or(false);
+                    if scanning || shortcuts_active {
+                        Self::toggle_scan(ctx);
+                    }
+                    digit_consumed = true;
+                    continue;
+                }
                 // Digit shortcut: no modifiers, not mid-command, not armed.
                 if let egui::Event::Key { key, pressed: true, modifiers, .. } = ev
                     && !modifiers.any()
@@ -133,7 +153,20 @@ impl Waterfall {
                         key: egui::Key::Escape,
                         pressed: true,
                         ..
-                    } => self.send.escape(),
+                    } => {
+                        // Abandoning a slash-command entry wins; otherwise ESC cancels a
+                        // running scan.
+                        if self.send.entering {
+                            self.send.escape();
+                        } else if ctx
+                            .bus
+                            .scanner()
+                            .map(|s| s.status == ScanStatus::Scanning)
+                            .unwrap_or(false)
+                        {
+                            ctx.bus.cancel_scan();
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -371,6 +404,7 @@ impl Waterfall {
                     self.resume = None;
                 }
             }
+            Command::Scan => Self::toggle_scan(ctx),
             cmd => {
                 let hz = match cmd {
                     Command::SetFrequency(mhz) => Some((mhz * 1_000_000.0).round() as u64),
@@ -382,12 +416,28 @@ impl Waterfall {
                             .unwrap_or(OverAirMode::Ft8);
                         crate::send::calling_freq_hz(band, mode)
                     }
-                    Command::ClearQsy => unreachable!(),
+                    Command::ClearQsy | Command::Scan => unreachable!(),
                 };
                 if let Some(hz) = hz {
                     ctx.bus.set_freq(hz);
                 }
             }
+        }
+    }
+
+    /// Start a survey of the configured stops, or cancel the one in progress —
+    /// shared by the SCAN button, the `s` key, and `/scan`. Which way to toggle is
+    /// read from the authoritative `ScannerState`, never a panel-local flag.
+    pub(super) fn toggle_scan(ctx: &PanelCtx) {
+        let scanning = ctx
+            .bus
+            .scanner()
+            .map(|s| s.status == ScanStatus::Scanning)
+            .unwrap_or(false);
+        if scanning {
+            ctx.bus.cancel_scan();
+        } else {
+            ctx.bus.start_scan(ctx.bus.scan_stops(), 2);
         }
     }
 }
