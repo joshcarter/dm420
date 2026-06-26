@@ -27,6 +27,7 @@ use bus::types::{Band, OverAirMode, RadioId, StationId};
 mod clock;
 mod control;
 mod decode;
+mod enrich;
 mod health;
 mod interlock;
 mod map;
@@ -284,6 +285,8 @@ pub fn spawn(bus: &BusHandle, cfg: CoreConfig) -> CoreControl {
     // The band scanner (spawned after the decode match below) needs the radio id,
     // but that match consumes `radio` — clone it here while it's still owned.
     let scanner_radio = radio.clone();
+    // The enricher also needs the radio id past the decode match that consumes it.
+    let enrich_radio = radio.clone();
 
     // The active mode for the slot clock below: live capture follows it through
     // `AudioControl`, so capture this only as the WAV/none fallback.
@@ -316,6 +319,15 @@ pub fn spawn(bus: &BusHandle, cfg: CoreConfig) -> CoreControl {
     // inject into the real path. In live mode it tracks the operator's selected
     // mode via `AudioControl`; otherwise it uses the configured protocol.
     clock::spawn(bus, control.audio.clone(), fallback_proto);
+
+    // The decode enricher: stamps each decode with its RF band (from the per-slot
+    // dial/scanner timeline — see `enrich`) and worked-status, republishing
+    // `EnrichedDecode` on `radio/{id}/decodes_enriched`. The band-status producer
+    // (and, later, the map/waterslide/scanner tally) read band+worked from here
+    // instead of re-deriving band-from-VFO and the dupe rule. Subscription order is
+    // immaterial — it reads decodes/rig_state/scanner/clock/worked as they publish,
+    // regardless of which producer spawned first.
+    enrich::spawn(bus, enrich_radio);
 
     // The logbook owns `logbook/entries` in real mode: it persists QSOs the engine
     // logs on RR73 and replays history on startup. In mock mode there's no path, so
