@@ -16,6 +16,10 @@
 - [ ] **Shared-logbook group dupes + origin UI (multi-op headline)** — J — MVP transport (push/merge/catch-up) is landed and peer entries already flow onto `logbook/entries`, but the worked producer still hard-codes `WorkedByMe` (`crates/core/src/worked.rs:94`) — peers' QSOs aren't classified `WorkedByNetwork`, so a teammate's contact is not yet a group dupe or rendered origin-distinct. Classify by `entry.origin` + add origin-distinct UI (`docs/networking.md`).
 - [ ] **Send box doesn't update live during a QSO** — J — only refreshes after TX (`tx_hold` latch); operational blindness mid-over.
 
+### Joel's notes on this section
+
+I think we can disregard the log reset and the FD log tags. The rationale is we can just move our old log files to another location and start with clean logs for field day and then archive / parse / score those logs after field day. This will save us a task we don't have time for.
+
 ## Field Day Desired
 
 - [ ] Tri-state control for clear QSY/follow station/lock offset. In "Clear" mode it would always attempt to find a clear part of the audio passband. In "Follow" it would behave as it does today--following the offset of whatever station we are answering, or using the current offset for CQ. In "Lock" it would lock to the current offset.
