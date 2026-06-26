@@ -24,6 +24,7 @@ use std::time::Duration;
 use bus::BusHandle;
 use bus::types::{Band, OverAirMode, RadioId, StationId};
 
+mod band_status;
 mod clock;
 mod control;
 mod decode;
@@ -233,9 +234,8 @@ pub fn spawn(bus: &BusHandle, cfg: CoreConfig) -> CoreControl {
         decode_archive,
         tx_output,
         tx_gain,
-        // Consumed by the band-status / enrich producers (wired in a later step).
-        band_status_stops: _,
-        band_status_window: _,
+        band_status_stops,
+        band_status_window,
     } = cfg;
 
     tracing::info!(
@@ -285,8 +285,10 @@ pub fn spawn(bus: &BusHandle, cfg: CoreConfig) -> CoreControl {
     // The band scanner (spawned after the decode match below) needs the radio id,
     // but that match consumes `radio` — clone it here while it's still owned.
     let scanner_radio = radio.clone();
-    // The enricher also needs the radio id past the decode match that consumes it.
+    // The enricher and band-status producers also need the radio id past the decode
+    // match that consumes it.
     let enrich_radio = radio.clone();
+    let band_status_radio = radio.clone();
 
     // The active mode for the slot clock below: live capture follows it through
     // `AudioControl`, so capture this only as the WAV/none fallback.
@@ -328,6 +330,18 @@ pub fn spawn(bus: &BusHandle, cfg: CoreConfig) -> CoreControl {
     // immaterial — it reads decodes/rig_state/scanner/clock/worked as they publish,
     // regardless of which producer spawned first.
     enrich::spawn(bus, enrich_radio);
+
+    // The band-status producer: the always-on per-(band,mode) aggregate of who's
+    // active (heard / CQ / unworked), folded from the enriched decode stream + peer
+    // gossip over a retention window and published on `band/status` for the read-only
+    // Band Status panel. Owns that aggregation so no panel re-derives it.
+    band_status::spawn(
+        bus,
+        band_status_radio,
+        station_id.clone(),
+        band_status_stops,
+        band_status_window,
+    );
 
     // The logbook owns `logbook/entries` in real mode: it persists QSOs the engine
     // logs on RR73 and replays history on startup. In mock mode there's no path, so
