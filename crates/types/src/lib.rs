@@ -397,22 +397,27 @@ pub fn calling_freq(band: Band, mode: OverAirMode) -> Option<AbsHz> {
     Some(AbsHz(hz))
 }
 
-/// The default Field Day HF stop set: the six ARRL Field Day HF bands
+/// The six ARRL Field Day HF bands, longest-wavelength first: the universe the
+/// operator's "active bands" selector picks from, the set the band-status producer
+/// tracks, and the default when no `[bands] list` is configured. The single home
+/// for this list so the selector, scanner, and band-status agree by construction.
+pub const HF_BANDS: [Band; 6] = [
+    Band::B160m,
+    Band::B80m,
+    Band::B40m,
+    Band::B20m,
+    Band::B15m,
+    Band::B10m,
+];
+
+/// The default Field Day HF stop set: the six [`HF_BANDS`]
 /// (160/80/40/20/15/10 m) × {FT8, FT4}, filtered to stops that have an established
 /// calling frequency (FT4 has none on 160 m, so that stop drops — 11 total). The
 /// single home for the default band/mode list, so the scanner's `StartSurvey` and
 /// the band-status retention window agree by construction.
 pub fn field_day_stops() -> Vec<(Band, OverAirMode)> {
-    const BANDS: [Band; 6] = [
-        Band::B160m,
-        Band::B80m,
-        Band::B40m,
-        Band::B20m,
-        Band::B15m,
-        Band::B10m,
-    ];
     const MODES: [OverAirMode; 2] = [OverAirMode::Ft8, OverAirMode::Ft4];
-    BANDS
+    HF_BANDS
         .iter()
         .flat_map(|&b| MODES.iter().map(move |&m| (b, m)))
         .filter(|&(b, m)| calling_freq(b, m).is_some())

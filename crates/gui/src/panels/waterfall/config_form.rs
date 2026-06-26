@@ -3,6 +3,7 @@
 use eframe::egui;
 
 use app_core::{LineProfile, Protocol, SerialConfig};
+use types::{Band, HF_BANDS};
 
 use crate::bus_view::BusView;
 use crate::settings::{DEFAULT_BAUD, HardwareConfig, KENWOOD_BAUDS};
@@ -24,6 +25,9 @@ pub(super) struct ConfigForm {
     profile: LineProfile,
     autodetect: bool,
     protocol: Protocol,
+    /// The operator's active bands, edited via the BANDS checkbox grid. Seeded from
+    /// the live selection on load; committed to `[bands] list` on re-lock.
+    active_bands: Vec<Band>,
     /// Cached device/port lists for the pickers (refreshed on load / Refresh).
     audio_devices: Vec<String>,
     audio_output_devices: Vec<String>,
@@ -41,6 +45,7 @@ impl Default for ConfigForm {
             profile: LineProfile::Default,
             autodetect: true,
             protocol: Protocol::Ft8,
+            active_bands: Vec::new(),
             audio_devices: Vec::new(),
             audio_output_devices: Vec::new(),
             serial_ports: Vec::new(),
@@ -60,6 +65,7 @@ impl ConfigForm {
         self.profile = cfg.serial.profile;
         self.autodetect = cfg.serial.autodetect;
         self.protocol = cfg.protocol;
+        self.active_bands = bus.active_bands();
         self.audio_devices = bus.audio_inputs();
         self.audio_output_devices = bus.audio_outputs();
         self.serial_ports = bus.serial_ports();
@@ -89,6 +95,16 @@ impl ConfigForm {
             },
             protocol: self.protocol,
         }
+    }
+
+    /// The edited active-band selection, in canonical (longest-wavelength-first)
+    /// order. Committed to `[bands] list` and pushed to the bus on re-lock.
+    pub(super) fn active_bands(&self) -> Vec<Band> {
+        HF_BANDS
+            .iter()
+            .copied()
+            .filter(|b| self.active_bands.contains(b))
+            .collect()
     }
 
     pub(super) fn ui(&mut self, ui: &mut egui::Ui, bus: &BusView, pal: &Palette, wide: &mut bool, auto_hop: &mut bool) {
@@ -254,6 +270,43 @@ impl ConfigForm {
                         .color(pal.sub)
                         .italics(),
                 );
+
+                // Active bands: which HF bands the radio/antenna can use. Like the
+                // hardware settings above, the selection commits on re-lock (persisted
+                // to [bands] list); the scanner, Band Status, and Contacts map then
+                // show only these bands.
+                ui.add_space(10.0);
+                ui.separator();
+                ui.label(egui::RichText::new("BANDS").color(pal.legend).strong());
+                ui.add_space(2.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Check the bands your radio/antenna can use — only these appear \
+                         in the scanner, Band Status, and map.",
+                    )
+                    .color(pal.sub)
+                    .italics(),
+                );
+                ui.add_space(4.0);
+                egui::Grid::new("active_bands_grid")
+                    .num_columns(3)
+                    .spacing([18.0, 6.0])
+                    .show(ui, |ui| {
+                        for (i, &band) in HF_BANDS.iter().enumerate() {
+                            let mut on = self.active_bands.contains(&band);
+                            if ui.checkbox(&mut on, crate::format::band_label(band)).changed() {
+                                if on {
+                                    self.active_bands.push(band);
+                                } else {
+                                    self.active_bands.retain(|b| *b != band);
+                                }
+                            }
+                            // 3 columns → a row break after every third band (2 rows).
+                            if i % 3 == 2 {
+                                ui.end_row();
+                            }
+                        }
+                    });
 
                 // Display preferences apply immediately and persist on their own (not
                 // tied to the lock-to-apply hardware flow), so the change is in effect

@@ -25,11 +25,6 @@ use crate::geo_data;
 use crate::panel_data as pd;
 use crate::theme::*;
 
-/// The bands the map plots, in switcher order. "Worked" is per band (the Field Day
-/// rule), so the map shows one band at a time — mirroring the waterslide.
-const MAP_BANDS: [Band; 4] = [Band::B40m, Band::B20m, Band::B15m, Band::B10m];
-const MAP_BAND_LABELS: [&str; 4] = ["40", "20", "15", "10"];
-
 /// Show station call-sign labels only when the visible span is at most this many
 /// degrees of longitude; at wider zoom only markers draw, to avoid a label mat.
 /// Aligned with the auto-fit minimum span (~80° lon) so the default regional view
@@ -219,6 +214,14 @@ impl Panel for Contacts {
         let painter = ctx.painter;
         let pal = ctx.pal;
 
+        // The bands the map can show: the operator's active set (mirrors the scanner
+        // and Band Status). Clamp the selection into it so a band the operator just
+        // dropped on re-lock can't linger as the shown band. Never empty.
+        let bands = ctx.bus.active_bands();
+        if !bands.contains(&self.band) {
+            self.band = bands[0];
+        }
+
         // Worked stations from the log on the selected band; optionally trimmed to
         // the last 24 h. Band-filtering first keeps "worked" per band — a call
         // logged on another band doesn't count here.
@@ -258,19 +261,15 @@ impl Panel for Contacts {
             block.min,
             Pos2::new(block.right(), block.top() + pd::HEADER_ROW_H),
         );
-        panel_header(
-            painter,
-            header,
-            pal,
-            "Contacts",
-            &format!("World · {}", ctx.grid),
-            ctx.active,
-        );
+        // Sub-label dropped (was "World · <grid>") to free header room for the band
+        // switcher, which now spans the operator's full active-band set.
+        panel_header(painter, header, pal, "Contacts", "", ctx.active);
         // Band switcher (right cluster): pick which band's spots the map shows, the
-        // same per-band partition the waterslide uses. The spot count tucks in just
-        // left of it.
+        // same per-band partition the waterslide uses. Offers the active bands; the
+        // spot count tucks in just left of it.
         let cy = header.center().y;
-        let sel = MAP_BANDS.iter().position(|b| *b == self.band).unwrap_or(0);
+        let labels: Vec<&str> = bands.iter().map(|b| crate::format::band_short(*b)).collect();
+        let sel = bands.iter().position(|b| *b == self.band).unwrap_or(0);
         let (sw_left, clicked) = segmented_select(
             ctx.ui,
             painter,
@@ -279,12 +278,12 @@ impl Panel for Contacts {
             cy,
             18.0,
             "",
-            &MAP_BAND_LABELS,
+            &labels,
             sel,
             "map_band",
         );
         if let Some(i) = clicked {
-            self.band = MAP_BANDS[i];
+            self.band = bands[i];
         }
         painter.text(
             Pos2::new(sw_left - 8.0, cy),

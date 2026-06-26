@@ -13,9 +13,11 @@ use eframe::egui;
 use egui::{Align2, Pos2, Rect};
 use types::{Band, BandStatusRow, OverAirMode, calling_freq};
 
+use std::collections::HashSet;
+
 use super::{Panel, PanelCtx};
 use crate::chrome::{panel_header, split_block};
-use crate::format::mode_label;
+use crate::format::{band_label, mode_label};
 use crate::theme::*;
 
 /// At most this many bands fit. When more are configured, the six shortest-wavelength
@@ -23,21 +25,26 @@ use crate::theme::*;
 const MAX_BANDS: usize = 6;
 /// The two over-air modes shown per band, top to bottom.
 const MODES: [OverAirMode; 2] = [OverAirMode::Ft8, OverAirMode::Ft4];
+/// Target height of one band cell (an FT8 + FT4 line pair). Cells cap at this in the
+/// panel and the pinned pane height is sized from it, so the rows fill with no slack.
+const ROW_H: f32 = 48.0;
 
-/// Short display label for a band, e.g. `"40m"`.
-fn band_label(b: Band) -> &'static str {
-    match b {
-        Band::B160m => "160m",
-        Band::B80m => "80m",
-        Band::B40m => "40m",
-        Band::B30m => "30m",
-        Band::B20m => "20m",
-        Band::B17m => "17m",
-        Band::B15m => "15m",
-        Band::B12m => "12m",
-        Band::B10m => "10m",
-        Band::B6m => "6m",
-    }
+/// The grid shape `n` bands lay out into: a single column for ≤3 bands, two columns
+/// above that, with `rows = ceil(n / cols)`. The single source for the layout shape,
+/// shared by the panel's drawing and the pane-height pin so they always agree.
+fn grid_shape(n: usize) -> (usize, usize) {
+    let cols = if n > 3 { 2 } else { 1 };
+    (cols, n.div_ceil(cols).max(1))
+}
+
+/// The pane height that exactly fits `n` bands: the header + gap + one [`ROW_H`] cell
+/// per grid row. The Band Status pane is pinned to this each frame
+/// ([`crate::pin_band_height`]) so it grows and shrinks with the active-band count
+/// rather than sitting at a fixed height. `n` is clamped to [`MAX_BANDS`] (the panel
+/// shows at most that many) and to ≥1 (one header+row even with nothing yet).
+pub(crate) fn pane_height(n: usize) -> f32 {
+    let (_, rows) = grid_shape(n.clamp(1, MAX_BANDS));
+    crate::panel_data::HEADER_ROW_H + crate::panel_data::HEADER_GAP + rows as f32 * ROW_H + 2.0
 }
 
 pub struct BandStatusPanel {
@@ -92,7 +99,17 @@ impl Panel for BandStatusPanel {
     }
 
     fn ui(&mut self, ctx: &mut PanelCtx, block: Rect) {
-        let rows = ctx.bus.band_status().map(|s| s.rows).unwrap_or_default();
+        // The producer tracks the full HF universe; narrow to the operator's active
+        // bands here so a re-locked selection takes effect live (no restart).
+        let active: HashSet<Band> = ctx.bus.active_bands().into_iter().collect();
+        let rows: Vec<BandStatusRow> = ctx
+            .bus
+            .band_status()
+            .map(|s| s.rows)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| active.contains(&r.band))
+            .collect();
         let pal = ctx.pal;
         let painter = ctx.painter;
         let (header, screen) = split_block(block);
@@ -133,11 +150,11 @@ impl Panel for BandStatusPanel {
             return;
         }
 
-        // Lay the bands out in up to two columns, top to bottom.
-        let cols = if bands.len() > 3 { 2 } else { 1 };
-        let per_col = bands.len().div_ceil(cols);
+        // Lay the bands out in up to two columns, top to bottom. The same shape the
+        // pinned pane height ([`pane_height`]) is sized from, so the rows fit exactly.
+        let (cols, per_col) = grid_shape(bands.len());
         let col_w = screen.width() / cols as f32;
-        let cell_h = (screen.height() / per_col as f32).min(48.0);
+        let cell_h = (screen.height() / per_col as f32).min(ROW_H);
         let y0 = screen.top() + (screen.height() - cell_h * per_col as f32).max(0.0) * 0.5;
         for (i, &band) in bands.iter().enumerate() {
             let col = i / per_col;

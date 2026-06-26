@@ -20,7 +20,9 @@
 
 - [ ] Tri-state control for clear QSY/follow station/lock offset. In "Clear" mode it would always attempt to find a clear part of the audio passband. In "Follow" it would behave as it does today--following the offset of whatever station we are answering, or using the current offset for CQ. In "Lock" it would lock to the current offset.
 
-- [ ] Ability to select which bands the Digital panel and Band Scan should pay attention to. Limits to the bands your radio/antenna setup is capable of.
+- [ ] Selection during scanning needs to be disabled--map and/or decode panel
+
+- [ ] Band scan needs to publish results to network
 
 ## Weird QSO State Thing
 

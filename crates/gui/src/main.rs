@@ -225,9 +225,10 @@ impl<'a> Behavior<Box<dyn Panel>> for Tactical<'a> {
     }
 
     fn min_size(&self) -> f32 {
-        // No pane may be dragged below this — enough for the panel header plus a
-        // modest slice of inner screen. Matches the pinned Band Scan height.
-        pd::BANDSCAN_H
+        // No pane may be dragged below this — enough for a panel header plus a single
+        // band row. Sized to the smallest the (pinned) Band Status pane can take so
+        // that pin, when the operator has few active bands, isn't clamped back up.
+        panels::band_status_pane_height(1)
     }
 
     fn simplification_options(&self) -> egui_tiles::SimplificationOptions {
@@ -470,12 +471,13 @@ fn enforce_min_width(tree: &mut Tree<Box<dyn Panel>>, root: TileId, min_px: f32,
     }
 }
 
-/// Force the Band Scan pane to a fixed pixel height (`pd::BANDSCAN_H`) while
-/// letting Log Book and Contacts keep sharing the remaining height. egui_tiles
-/// lays out a Linear container purely by *shares*, so each frame we solve for
-/// the band share that yields the target height given the container's current
-/// size, leaving the other two children's shares (and thus their ratio) intact.
-fn pin_band_height(tree: &mut Tree<Box<dyn Panel>>, ids: &TreeIds, gap: f32) {
+/// Force the Band Scan pane to `target_h` pixels while letting Log Book and Contacts
+/// keep sharing the remaining height. egui_tiles lays out a Linear container purely
+/// by *shares*, so each frame we solve for the band share that yields the target
+/// height given the container's current size, leaving the other two children's shares
+/// (and thus their ratio) intact. `target_h` tracks the active-band count
+/// ([`panels::band_status_pane_height`]), so the pane grows/shrinks with its rows.
+fn pin_band_height(tree: &mut Tree<Box<dyn Panel>>, ids: &TreeIds, gap: f32, target_h: f32) {
     // The container rect from the previous layout (None on the very first frame).
     let Some(rect) = tree.tiles.rect(ids.right) else {
         return;
@@ -484,7 +486,7 @@ fn pin_band_height(tree: &mut Tree<Box<dyn Panel>>, ids: &TreeIds, gap: f32) {
         let num_gaps = lin.children.len().saturating_sub(1) as f32;
         let avail = (rect.height() - gap * num_gaps).max(1.0);
         // Desired fraction of the available height for the band pane.
-        let frac = (pd::BANDSCAN_H / avail).clamp(0.05, 0.9);
+        let frac = (target_h / avail).clamp(0.05, 0.9);
         // Sum of the other children's shares; band's share is solved so that
         // band / (band + rest) == frac.
         let rest: f32 = lin
@@ -645,7 +647,10 @@ impl eframe::App for App {
                     pd::MIN_PANEL_W,
                     pd::VGROOVE_W,
                 );
-                pin_band_height(&mut self.tree, &self.tree_ids, pd::VGROOVE_W);
+                // Size the Band Status pane to its active-band row count, not a fixed
+                // height, so it doesn't reserve space for bands the operator dropped.
+                let band_h = panels::band_status_pane_height(self.view.active_bands().len());
+                pin_band_height(&mut self.tree, &self.tree_ids, pd::VGROOVE_W, band_h);
                 self.tree.ui(&mut behavior, ui);
                 // Apply a click-to-focus once the tree has been walked.
                 if let Some(id) = clicked {

@@ -443,6 +443,14 @@ impl Panel for Waterfall {
                     crate::settings::save_hardware_config(&edited);
                     ctx.bus.apply_config(edited);
                 }
+                // Active bands commit the same way: persist to [bands] list and push
+                // to the bus, so the scanner, Band Status, and map narrow live (no
+                // restart). Only on an actual change, so a no-edit re-lock is inert.
+                let bands = self.form.active_bands();
+                if bands != ctx.bus.active_bands() {
+                    crate::settings::save_active_bands(&bands);
+                    ctx.bus.set_active_bands(bands);
+                }
                 self.form.loaded = false; // re-sync to applied config on next unlock
             }
 

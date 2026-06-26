@@ -207,10 +207,15 @@ pub struct BusView {
     /// Read via [`Self::my_station_id`] so consumers compare a [`LogEntry`]'s
     /// `id.origin` against one owned value instead of re-deriving "mine vs peer".
     my_station_id: StationId,
-    /// The configured `(band, mode)` stops a scan sweeps (`[bands]` in the config —
-    /// the same set the Band Status panel tracks). The Digital panel's SCAN button
-    /// reads this to start a survey.
-    scan_stops: Vec<(Band, OverAirMode)>,
+    /// The operator's **active bands** — the HF bands their radio/antenna can use
+    /// (`[bands] list`). The single GUI-side owner: the Digital panel's active-bands
+    /// config writes it on re-lock (via [`Self::set_active_bands`]), and the band
+    /// scanner, Band Status panel, and Contacts map all read it (via
+    /// [`Self::active_bands`]). Mutable so a re-lock applies live without a restart.
+    active_bands: Arc<Mutex<Vec<Band>>>,
+    /// The over-air modes the active bands are crossed with for a scan sweep
+    /// (`[bands] modes`, default `{FT8, FT4}`). Static config, so no lock.
+    band_modes: Vec<OverAirMode>,
 
     /// Handle for live reconfiguration of the running producers (real mode only;
     /// empty otherwise).
@@ -276,9 +281,10 @@ impl BusView {
             "bus_view: starting producers",
         );
         let applied = Arc::new(Mutex::new(settings.hardware()));
-        // The configured scan stops the Digital panel's SCAN button sweeps (and the
-        // band-status window tracks) — static config, so no pump.
-        let scan_stops = settings.band_stops.clone();
+        // The operator's active bands (mutable: a re-lock applies a new selection
+        // live) and the modes to cross them with for a scan sweep (static config).
+        let active_bands = Arc::new(Mutex::new(settings.active_bands.clone()));
+        let band_modes = settings.band_modes.clone();
         let _guard = rt.enter();
         // Real rig + decode + clock + logbook + band-scanner producers — `core::spawn`
         // covers them all (the scanner is real too). The decode stream is the real decoder's.
@@ -373,7 +379,8 @@ impl BusView {
             health,
             peers,
             my_station_id: station_id,
-            scan_stops,
+            active_bands,
+            band_modes,
             control,
             qso_control,
             applied,
@@ -425,9 +432,32 @@ impl BusView {
         self.scanner.lock().unwrap().clone()
     }
 
-    /// The configured `(band, mode)` stops a scan sweeps (the `[bands]` set).
+    /// The `(band, mode)` stops a scan sweeps: the operator's active bands crossed
+    /// with the configured modes, dropping stops with no calling frequency. Derived
+    /// live from [`Self::active_bands`], so a re-locked selection takes effect on the
+    /// next SCAN without a restart.
     pub fn scan_stops(&self) -> Vec<(Band, OverAirMode)> {
-        self.scan_stops.clone()
+        crate::settings::cross_stops(&self.active_bands(), &self.band_modes)
+    }
+
+    /// The operator's active bands (the HF bands their radio/antenna can use), read
+    /// by the band scanner, Band Status panel, and Contacts map. Never empty: an
+    /// empty stored selection falls back to all [`HF_BANDS`], so unchecking every
+    /// band resets to all rather than leaving the panels inert.
+    pub fn active_bands(&self) -> Vec<Band> {
+        let bands = self.active_bands.lock().unwrap();
+        if bands.is_empty() {
+            HF_BANDS.to_vec()
+        } else {
+            bands.clone()
+        }
+    }
+
+    /// Replace the active-band selection (the Digital panel's active-bands config
+    /// commits this on re-lock). The stored value may be empty; [`Self::active_bands`]
+    /// applies the "empty ⇒ all" fallback on read.
+    pub fn set_active_bands(&self, bands: Vec<Band>) {
+        *self.active_bands.lock().unwrap() = bands;
     }
 
     /// The current clock/slot status, if seen yet. (Consumer lands next pass.)

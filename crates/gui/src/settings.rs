@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use app_core::{CoreConfig, DecodeSource, LineProfile, Protocol, SerialConfig, DEFAULT_TX_GAIN};
-use types::{Band, OverAirMode, StationId, calling_freq, field_day_stops};
+use types::{Band, HF_BANDS, OverAirMode, StationId, calling_freq};
 
 use crate::config_toml::{
     bool_str, config_path, format_f32, parse_float, parse_table_value, parse_u16, update_toml_table,
@@ -161,9 +161,15 @@ pub struct Settings {
     /// see [`read_station_id`]. **Distinct from the callsign:** a shared club call
     /// can't tell operators apart, so each multi-op instance must set its own.
     pub station_id: StationId,
-    /// The `(band, mode)` stops the band-status panel/producer tracks and the band
-    /// scanner sweeps — `[bands] list × modes`, default [`field_day_stops`].
-    pub band_stops: Vec<(Band, OverAirMode)>,
+    /// The operator's **active bands** — the HF bands their radio/antenna can use,
+    /// the subset of [`HF_BANDS`] shown in the band scanner, Band Status, and the
+    /// Contacts map. From `[bands] list`; an absent/blank list means all of them
+    /// (the operator hasn't narrowed yet). Edited live from the unlocked Digital
+    /// panel and persisted on re-lock ([`save_active_bands`]).
+    pub active_bands: Vec<Band>,
+    /// The over-air modes crossed with the bands for the scanner sweep and the
+    /// band-status universe — `[bands] modes`, default `{FT8, FT4}`.
+    pub band_modes: Vec<OverAirMode>,
     /// How long a heard station stays in the band-status window (`[bands]
     /// retention_secs`, default 5 minutes).
     pub band_retention: Duration,
@@ -176,7 +182,7 @@ impl Settings {
         // Persisted audio device selections (config file [audio]); the env var
         // still wins for the input, for quick overrides.
         let (toml_in, toml_out) = read_audio_config(&config_path());
-        let (band_stops, band_retention) = read_band_config(&config_path());
+        let (active_bands, band_modes, band_retention) = read_band_config(&config_path());
         Settings {
             audio_input: env_nonempty("DM420_AUDIO_INPUT").or(toml_in),
             serial: serial_from_env(),
@@ -185,7 +191,8 @@ impl Settings {
             audio_output: toml_out,
             tx_gain: read_tx_gain(&config_path()),
             station_id: read_station_id(&config_path()),
-            band_stops,
+            active_bands,
+            band_modes,
             band_retention,
         }
     }
@@ -226,7 +233,11 @@ impl Settings {
             tx_output: self.audio_output.clone(),
             tx_gain: self.tx_gain,
             station_id: self.station_id.clone(),
-            band_status_stops: self.band_stops.clone(),
+            // The band-status producer tracks the full HF universe, not just the
+            // active subset, so the Band Status panel can narrow to the operator's
+            // live active-band selection (applied on re-lock) without a restart —
+            // the panel filters the rows; the producer always has the data.
+            band_status_stops: cross_stops(&HF_BANDS, &self.band_modes),
             band_status_window: self.band_retention,
         }
     }
@@ -255,10 +266,21 @@ fn read_archive_config(path: &Path) -> Option<PathBuf> {
     parse_table_value(&text, "archive", "decodes").map(PathBuf::from)
 }
 
-/// Read the `[bands]` table: the `(band, mode)` stops the band-status producer
-/// aggregates and the scanner sweeps, plus the heard-retention window. Delegates
-/// to [`parse_band_config`]. Config-only by design — no env-var override.
-fn read_band_config(path: &Path) -> (Vec<(Band, OverAirMode)>, Duration) {
+/// Cross `bands × modes`, keeping only stops with an established calling frequency
+/// (e.g. 160 m FT4 drops). The shared shape of both the scanner's sweep set and the
+/// band-status producer's tracked universe.
+pub(crate) fn cross_stops(bands: &[Band], modes: &[OverAirMode]) -> Vec<(Band, OverAirMode)> {
+    bands
+        .iter()
+        .flat_map(|&b| modes.iter().map(move |&m| (b, m)))
+        .filter(|&(b, m)| calling_freq(b, m).is_some())
+        .collect()
+}
+
+/// Read the `[bands]` table: the operator's active bands, the over-air modes to
+/// cross them with, and the heard-retention window. Delegates to
+/// [`parse_band_config`]. Config-only by design — no env-var override.
+fn read_band_config(path: &Path) -> (Vec<Band>, Vec<OverAirMode>, Duration) {
     parse_band_config(&std::fs::read_to_string(path).unwrap_or_default())
 }
 
@@ -266,16 +288,17 @@ fn read_band_config(path: &Path) -> (Vec<(Band, OverAirMode)>, Duration) {
 ///
 /// ```toml
 /// [bands]
-/// list = "160,80,40,20,15,10"   # bands; each crossed with every mode below
-/// modes = "ft8,ft4"
+/// list = "20,40"                # the operator's active bands (a subset of HF_BANDS)
+/// modes = "ft8,ft4"             # modes crossed with the bands for scan/band-status
 /// retention_secs = "300"        # band-status heard window, seconds
 /// ```
 ///
-/// `list × modes` is filtered to stops with a calling frequency (so 160 m FT4,
-/// which has none, drops out). If either `list` or `modes` is absent or
-/// unparseable the stops fall back to [`field_day_stops`]; an absent/blank
-/// `retention_secs` falls back to [`DEFAULT_BAND_RETENTION`].
-fn parse_band_config(text: &str) -> (Vec<(Band, OverAirMode)>, Duration) {
+/// Returns `(active_bands, modes, retention)`. An absent / blank / unparseable
+/// `list` means **all** [`HF_BANDS`] (the operator hasn't narrowed yet); an absent
+/// `modes` defaults to `{FT8, FT4}`; an absent/blank `retention_secs` falls back to
+/// [`DEFAULT_BAND_RETENTION`]. The bands aren't crossed with the modes here — the
+/// caller does that for the scanner ([`cross_stops`]); the map needs the bands alone.
+fn parse_band_config(text: &str) -> (Vec<Band>, Vec<OverAirMode>, Duration) {
     let retention = parse_table_value(text, "bands", "retention_secs")
         .and_then(|v| v.parse::<u64>().ok())
         .map(Duration::from_secs)
@@ -283,19 +306,58 @@ fn parse_band_config(text: &str) -> (Vec<(Band, OverAirMode)>, Duration) {
     let bands: Vec<Band> = parse_table_value(text, "bands", "list")
         .map(|s| s.split(',').filter_map(|t| parse_band(t.trim())).collect())
         .unwrap_or_default();
+    let active_bands = if bands.is_empty() {
+        HF_BANDS.to_vec()
+    } else {
+        bands
+    };
     let modes: Vec<OverAirMode> = parse_table_value(text, "bands", "modes")
         .map(|s| s.split(',').filter_map(parse_mode).collect())
         .unwrap_or_default();
-    let stops = if bands.is_empty() || modes.is_empty() {
-        field_day_stops()
+    let band_modes = if modes.is_empty() {
+        vec![OverAirMode::Ft8, OverAirMode::Ft4]
     } else {
-        bands
-            .iter()
-            .flat_map(|&b| modes.iter().map(move |&m| (b, m)))
-            .filter(|&(b, m)| calling_freq(b, m).is_some())
-            .collect()
+        modes
     };
-    (stops, retention)
+    (active_bands, band_modes, retention)
+}
+
+/// Persist the operator's active band selection to `[bands] list`, preserving the
+/// rest of the table (modes, retention) and every comment. Called on GUI re-lock,
+/// like [`save_hardware_config`]. Bands are written longest-wavelength first as bare
+/// meter counts (`"160,80,40"`) — the form the [`parse_band`] reader expects. An
+/// empty selection writes an empty list, which reads back as "all bands" (so
+/// unchecking every band resets to all, never an inert empty UI).
+pub fn save_active_bands(bands: &[Band]) {
+    let path = config_path();
+    let existing = std::fs::read_to_string(&path).unwrap_or_else(|_| {
+        "# DM420 config — written from the UI; safe to hand-edit.\n".to_string()
+    });
+    let list = HF_BANDS
+        .iter()
+        .filter(|b| bands.contains(b))
+        .map(|b| band_list_token(*b))
+        .collect::<Vec<_>>()
+        .join(",");
+    let text = update_toml_table(&existing, "bands", &[("list", &list)]);
+    write_config(&path, &text);
+}
+
+/// The bare meter-count token a band is written as in `[bands] list` — the inverse
+/// of [`parse_band`].
+fn band_list_token(b: Band) -> &'static str {
+    match b {
+        Band::B160m => "160",
+        Band::B80m => "80",
+        Band::B40m => "40",
+        Band::B30m => "30",
+        Band::B20m => "20",
+        Band::B17m => "17",
+        Band::B15m => "15",
+        Band::B12m => "12",
+        Band::B10m => "10",
+        Band::B6m => "6",
+    }
 }
 
 /// Parse an over-air mode token (`ft8`/`ft4`, case-insensitive) for `[bands]
@@ -790,15 +852,22 @@ mod tests {
 
     #[test]
     fn band_config_defaults_then_honors_explicit_table() {
-        // No [bands] table → the Field Day default set + 5-minute window.
-        let (stops, window) = parse_band_config("");
-        assert_eq!(stops, field_day_stops());
+        // No [bands] table → all HF bands active, both modes, 5-minute window.
+        let (bands, modes, window) = parse_band_config("");
+        assert_eq!(bands, HF_BANDS.to_vec());
+        assert_eq!(modes, vec![OverAirMode::Ft8, OverAirMode::Ft4]);
         assert_eq!(window, DEFAULT_BAND_RETENTION);
 
-        // An explicit table crosses list × modes, drops stops with no calling
-        // frequency (160 m FT4), and reads the retention window.
-        let cfg = "[bands]\nlist = \"160,20\"\nmodes = \"ft8,ft4\"\nretention_secs = \"120\"\n";
-        let (stops, window) = parse_band_config(cfg);
+        // An explicit table narrows the active bands and modes and reads the window;
+        // the bands are returned as-is (the caller crosses them with the modes).
+        let cfg = "[bands]\nlist = \"160,20\"\nmodes = \"ft8\"\nretention_secs = \"120\"\n";
+        let (bands, modes, window) = parse_band_config(cfg);
+        assert_eq!(bands, vec![Band::B160m, Band::B20m]);
+        assert_eq!(modes, vec![OverAirMode::Ft8]);
+        assert_eq!(window, Duration::from_secs(120));
+
+        // cross_stops crosses + drops stops with no calling frequency (160 m FT4).
+        let stops = cross_stops(&[Band::B160m, Band::B20m], &[OverAirMode::Ft8, OverAirMode::Ft4]);
         assert_eq!(
             stops,
             vec![
@@ -808,7 +877,27 @@ mod tests {
             ],
             "160 m FT4 has no calling freq, so it is filtered out",
         );
-        assert_eq!(window, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn active_bands_round_trip_through_the_bands_table() {
+        // Saving a subset writes [bands] list in canonical (longest-first) order…
+        let text = update_toml_table(
+            "# top\n[bands]\nmodes = \"ft8,ft4\"\nretention_secs = \"300\"\n",
+            "bands",
+            &[("list", "20,40")],
+        );
+        // …and reading it back yields exactly those bands (parse order is the file's),
+        // with the modes/retention preserved.
+        let (bands, modes, window) = parse_band_config(&text);
+        assert_eq!(bands, vec![Band::B20m, Band::B40m]);
+        assert_eq!(modes, vec![OverAirMode::Ft8, OverAirMode::Ft4]);
+        assert_eq!(window, Duration::from_secs(300));
+        assert!(text.contains("# top"), "header comment kept: {text}");
+
+        // An empty list reads back as "all bands" — unchecking everything resets to all.
+        let (bands, _, _) = parse_band_config("[bands]\nlist = \"\"\n");
+        assert_eq!(bands, HF_BANDS.to_vec());
     }
 
     #[test]

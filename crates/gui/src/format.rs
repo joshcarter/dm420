@@ -3,7 +3,9 @@
 //! screen. These are **not** used to build on-air message payloads; that ASCII
 //! construction lives in the `qso` crate and must stay separate.
 
-use types::{Callsign, Decode, DecodeContent, ExchangePayload, OverAirMode, ParsedMessage, Signoff};
+use types::{
+    Band, Callsign, Decode, DecodeContent, ExchangePayload, OverAirMode, ParsedMessage, Signoff,
+};
 
 /// SNR like the rest of the console: Unicode minus, two digits.
 pub(crate) fn fmt_snr(snr: i8) -> String {
@@ -79,6 +81,29 @@ pub(crate) fn fmt_signoff(kind: Signoff) -> &'static str {
         Signoff::Rr73 => "RR73",
         Signoff::Seven3 => "73",
     }
+}
+
+/// Full display label for a band, e.g. `"40m"`. The single home for band labels,
+/// shared by the Band Status panel, the active-bands config grid, and elsewhere.
+pub(crate) fn band_label(b: Band) -> &'static str {
+    match b {
+        Band::B160m => "160m",
+        Band::B80m => "80m",
+        Band::B40m => "40m",
+        Band::B30m => "30m",
+        Band::B20m => "20m",
+        Band::B17m => "17m",
+        Band::B15m => "15m",
+        Band::B12m => "12m",
+        Band::B10m => "10m",
+        Band::B6m => "6m",
+    }
+}
+
+/// Compact (meters-only) band label, e.g. `"40"` — for tight clusters like the
+/// Contacts map's band switcher.
+pub(crate) fn band_short(b: Band) -> &'static str {
+    band_label(b).trim_end_matches('m')
 }
 
 /// Short display label for an over-the-air mode, e.g. `"FT8"`.

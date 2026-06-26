@@ -28,9 +28,11 @@ pub const HEADER_GAP: f32 = 6.0; // gap between title row and recessed screen
 
 // Right-column panel heights (top→bottom). MAP is flex and fills the rest (~228).
 pub const LOG_H: f32 = 142.0;
-// Band Status is pinned to this exact pixel height (not resizable): tall enough for
-// up to three band rows per column, each carrying an FT8 + FT4 line, plus the header.
-// See `pin_band_height`.
+// Band Status default/seed height: the initial layout share before the live pin
+// takes over. Tall enough for the full six-band grid (three rows per column, each an
+// FT8 + FT4 line, plus the header). The pane is then pinned each frame to fit its
+// *active*-band row count, which may be shorter — see `pin_band_height` and
+// `panels::band_status_pane_height`.
 pub const BANDSCAN_H: f32 = 176.0;
 // Call Sign card: header/gap + callsign/flag + two info lines (country · grid ·
 // distance, then the message exchange). Compact; a normal resizable pane.

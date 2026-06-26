@@ -17,6 +17,13 @@ below, with three agreed tweaks:
 - **Loops until the user cancels** (rather than one pass then auto-return), so later
   passes pick up traffic an earlier one missed. Cancel restores the operator's prior
   band + mode (the spec's "return to normal operating state").
+- **Active bands** (the "all active bands" the spec sweeps) are the operator's
+  configured subset of the six HF bands (160/80/40/20/15/10 m), checked in the
+  **BANDS** section of the unlocked Digital panel and persisted to `[bands] list` in
+  `config.toml`. The selection commits on re-lock and narrows the scanner sweep, the
+  Band Status panel, and the Contacts map's band switcher alike (an empty selection
+  means all six). The band-status producer still tracks all six so a re-locked change
+  applies live without a restart.
 
 Per-band heard/unworked counts come from live decodes cross-referenced against the
 logbook. Counts are cumulative over the scan (distinct callsigns) and split per
