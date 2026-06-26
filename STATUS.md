@@ -1,6 +1,6 @@
 # DM420 — Status & Open Work
 
-> Single source of truth for **open** work. Done work is **not** tracked here — `git log` is its record. The *why* behind architecture tasks lives in `ARCHITECTURE_REVIEW.md`; component specs in `docs/`; the multi-op protocol in `docs/networking.md`. Owners: **J** = Josh/N0JDC, **W** = Joel/W4LL, **—** = either. _Updated 2026-06-25._
+> Single source of truth for **open** work. Done work is **not** tracked here — `git log` is its record. The *why* behind architecture tasks lives in `ARCHITECTURE_REVIEW.md`; component specs in `docs/`; the multi-op protocol in `docs/networking.md`. Owners: **J** = Josh/N0JDC, **W** = Joel/W4LL, **—** = either. _Updated 2026-06-26._
 
 ## 🔴 Field Day blockers (June 27–28)
 
@@ -10,7 +10,6 @@
 
 - [ ] **🔴 FD exchange won't encode — `modes` packer has no Field Day message type** — W — the `<his> <mine> <class> <section>` exchange (the over *after* `CQ FD`) mis-encodes: `modes::encode_message("K1ABC N0JDC 3A CO")` packs it as a standard `to/de/grid` message, treating `3A` as a report and **dropping the section** — it transmits/decodes as `K1ABC N0JDC +03`. Verified via `synth_message`→`decode` round-trip (FT8 *and* FT4). `CQ FD …` itself encodes fine (the `is_cq_modifier_tok` path handles `FD`); only the bare exchange is broken. Needs the FT8/FT4 ARRL-FD message type (i3=3: 4-bit class + section enum) in `crates/modes/src/message.rs` (`encode_message`/`encode_std`/`decode`), mirroring WSJT-X's pack. Until then every FD QSO sends a garbage report instead of the exchange. Distinct from the now-fixed send-box/engine config split.
 - [ ] **On-air validation of the FD QSO flow** — W/J — the FSM and the P1–P3 fixes are landed and unit-tested but have never run against real radios; reproduce/diagnose the earlier on-air symptoms against the now-landed engine. Subsumes the old "report not grid is ignored" item (the P3 fix is in — verify it on air) and gates on completing a real **FT4** contact (`docs/live_pipeline_notes.md`).
-- [ ] **Log entries carry no FD-vs-normal tag** — — — `LogEntry` has no contest/exchange-kind field; `3A WI` vs. `-07` is only inferable by parsing the exchange string (the stored `Section` is a weak proxy). Add an explicit tag (serde-default for back-compat), set from `is_field_day()` at construction. Cheap; matters for clean export/scoring.
 
 ## Field Day Desired
 
@@ -38,6 +37,7 @@
 - [ ] 0b — wire `Granter::revoke` into the QSO-Stop / scan-cancel abort path (the method exists but is unused)
 - [ ] A2 — carve the dead prototype tables (`panel_data.rs`) + the mock-only `waterslide_panel.rs`
 - [ ] `draw_waterslide`'s 22 positional args → a `WaterslideView` struct (deferred from the `waterfall/` decomposition; the fn now lives in `panels/waterfall/render.rs`)
+- [ ] **Waterslide renders re-derived decode text, not canonical `raw`** (SSOT) — `decode_text` (`crates/gui/src/format.rs`) rebuilds each lane's body from the structured `ParsedMessage` instead of the verbatim `raw` the bus already carries, so any grammar token the formatter doesn't explicitly re-emit silently vanishes from the display. The `CQ FD`/`TEST` modifier was just patched in the `Cq` arm (f63953f), but `CQ DX` still drops — the parser maps `DX → None` (`crates/core/src/parse.rs:165`), so the formatter can't reach it (the lenient `cq_dx_modifier` test, `parse.rs:199`, masks the loss). Fix: render `raw` for the body, keep `ParsedMessage` for semantics only — kills the whole drift class. Caveat: touches all decode-line rendering and subsumes `display_call`'s hashed-call (`<…>`) handling, so it wants a full `decode_text` review. Pairs with the `draw_waterslide`→`WaterslideView` item above.
 - [ ] Phase 4 — reconcile `docs/message-catalog.md` with reality (mark each topic built / delete the dead ones)
 
 **Multi-op feature track** — see `docs/networking.md`:
