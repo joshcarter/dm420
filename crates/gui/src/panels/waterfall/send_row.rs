@@ -17,7 +17,7 @@ use crate::send::{Activation, Command};
 use crate::theme::*;
 use crate::waterslide_panel::Target;
 
-use super::render::{decode_station, is_cq};
+use super::render::{decode_station, is_cq, is_my_station};
 use super::{PanelCtx, Waterfall};
 
 impl Waterfall {
@@ -472,6 +472,7 @@ pub(super) fn update_cq_assignments(
     assignments: &mut HashMap<String, (usize, i64)>,
     decodes: &[Decode],
     worked: &HashSet<String>,
+    my_call: Option<&str>,
     current_slot_ms: i64,
     slot_ms: i64,
 ) {
@@ -480,7 +481,7 @@ pub(super) fn update_cq_assignments(
     // ensures exact integer arithmetic against the boundary-aligned d.t.0 values.
     let age_limit = current_slot_ms - slot_ms * 2;
     assignments.retain(|call, &mut (_, assigned_at)| {
-        !worked.contains(call) && assigned_at >= age_limit
+        !worked.contains(call) && !is_my_station(call, my_call) && assigned_at >= age_limit
     });
 
     // Collect free digit slots (ascending order = lowest index wins).
@@ -504,6 +505,11 @@ pub(super) fn update_cq_assignments(
         let Some((call, _)) = decode_station(d) else {
             continue;
         };
+        // Never list our own station as an answer-candidate: by callsign, so it
+        // covers our own over (any contest form) and a peer under our shared call.
+        if is_my_station(&call, my_call) {
+            continue;
+        }
         let upper = call.to_ascii_uppercase();
         if worked.contains(&upper) || assignments.contains_key(&upper) {
             continue;
