@@ -41,7 +41,7 @@ use app::App;
 use bus_view::BusView;
 use chrome::{lcd_panel, make_brushed, make_relief, measure, paint_chassis, shadow};
 use panel_data as pd;
-use panels::{BandScan, CallSign, Contacts, LogBook, Panel, PanelCtx, Waterfall};
+use panels::{BandStatusPanel, CallSign, Contacts, LogBook, Panel, PanelCtx, Waterfall};
 use theme::*;
 
 fn main() -> eframe::Result<()> {
@@ -392,7 +392,7 @@ fn build_tree() -> (Tree<Box<dyn Panel>>, TreeIds) {
     let mut tiles = Tiles::default();
     let waterfall = tiles.insert_pane(Box::new(Waterfall::new()) as Box<dyn Panel>);
     let log = tiles.insert_pane(Box::new(LogBook::new()) as Box<dyn Panel>);
-    let band = tiles.insert_pane(Box::new(BandScan::new()) as Box<dyn Panel>);
+    let band = tiles.insert_pane(Box::new(BandStatusPanel::new()) as Box<dyn Panel>);
     let callsign = tiles.insert_pane(Box::new(CallSign::new()) as Box<dyn Panel>);
     let contacts = tiles.insert_pane(Box::new(Contacts::new()) as Box<dyn Panel>);
 

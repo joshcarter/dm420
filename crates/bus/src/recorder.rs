@@ -102,6 +102,7 @@ fn publish_envelope(bus: &BusHandle, env: &Envelope) -> Result<(), BusError> {
         // scanner/candidates carries the full per-scan snapshot (one BandActivity
         // per scanned band/mode) as a single State value.
         TopicKind::ScannerCandidates => pub_as!(Vec<BandActivity>),
+        TopicKind::BandStatus => pub_as!(BandStatus),
         TopicKind::ClockStatus => pub_as!(ClockStatus),
         TopicKind::Health => pub_as!(SubsystemHealth),
         // Not produced by publish(): command topics + deferred §9 gossip. Skip.

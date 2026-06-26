@@ -18,8 +18,6 @@
 
 ## Field Day Desired
 
-- [ ] Band scan function needs to move to the Digital panel. Band Scan panel needs to be read-only.
-
 - [ ] Tri-state control for clear QSY/follow station/lock offset. In "Clear" mode it would always attempt to find a clear part of the audio passband. In "Follow" it would behave as it does today--following the offset of whatever station we are answering, or using the current offset for CQ. In "Lock" it would lock to the current offset.
 
 - [ ] Ability to select which bands the Digital panel and Band Scan should pay attention to. Limits to the bands your radio/antenna setup is capable of.
@@ -34,17 +32,19 @@
 - [ ] **1a — close the TX-outcome loop** ⚠ *the deepest fault*: the FSM advances open-loop (`TxAck` only has `Accepted`); a denied/failed over advances like a sent one → logged contacts that never aired. Safety-adjacent.
 - [ ] 1c — clock unification (wire the dead `BusView.clock`; remaining direct `Utc::now()` reads) — spectrogram drift only partly fixed
 - [ ] 2c — publish `OperatingState` (the mode+band owner) + a `SessionCommand` bus path — retires the interim band-from-`RigState` workaround in the beacon
+- [ ] 2b follow-through — `core::enrich` now stamps `EnrichedDecode{band, worked}` onto `decodes_enriched` (consumed by `core::band_status`). Remaining: migrate the other band-from-VFO derivations (`bus_view::pump_heard`, the `net` beacon, `core::scan`'s private `slot_band`) onto it, and have the enricher emit `origin` / `WorkedByNetwork`
 - [ ] 3b — per-radio control lease (Operate | Scanning | Configuring) + operate⊥configure invariant; config off the lock edge
 - [ ] 0a — derive watchdog / `max_tx` / `grant_ttl` from one `slot_period` + `debug_assert`; explicit `ForceUnkey` (the stale comments are already fixed); tighten the FT4 TX watchdog (currently runs too long, ~2 slots — non-blocking)
 - [ ] 0b — wire `Granter::revoke` into the QSO-Stop / scan-cancel abort path (the method exists but is unused)
 - [ ] A2 — carve the dead prototype tables (`panel_data.rs`) + the mock-only `waterslide_panel.rs`
+- [ ] `draw_waterslide`'s 22 positional args → a `WaterslideView` struct (deferred from the `waterfall/` decomposition; the fn now lives in `panels/waterfall/render.rs`)
 - [ ] Phase 4 — reconcile `docs/message-catalog.md` with reality (mark each topic built / delete the dead ones)
 
 **Multi-op feature track** — see `docs/networking.md`:
 - [ ] Shared logbook, full (Step 2): outbound push, inbound merge, G-set, anti-entropy digest/request/reply, origin-distinct UI
 - [ ] Origin prerequisites: `origin: Mine|Peer` on the GUI `HeardEntry` / `MapSpot`; the worked producer emits `WorkedByNetwork`
 - [ ] Working-intent (Step 3): the deconfliction overlay shipped; remaining = auto-pick exclusion of peers' offsets
-- [ ] Heard/band aggregation (Step 4): peers' heard-stations + band-activity into the local views
+- [ ] Heard/band aggregation (Step 4): peers' heard-stations + band-activity into the local views — `core::band_status` already merges peer `StationSnapshot.heard` (now carrying `mode`) and `HeardStation` has the field; remaining is the LAN beacon *populating* `heard` (from the producer's `Mine`-origin set) so peer rows fill
 - [ ] Shared band-scan: beacon `band_activity`; show peers' scan results
 
 **Decoder** — see `docs/decoder_*.md` (W's lane):
@@ -65,6 +65,7 @@
 - RX clipping indicator (audio level)
 - Clear-lane finder: jump to an optimum CQ calling frequency (occupancy map + lane scoring) — `lane-finder` branch
 - Band-scanner enhancements: per-offset sweep, FD-only filter, SNR floor, configurable dwell
+- Band Status panel polish: tune the six-band grid + header SCAN-button placement once eyeballed; populate it in pure-mock mode (the producers run in real/WAV `core::spawn` only, so mock mode shows empty); rename the now-misnamed `BANDSCAN_H` constant
 - Decode-archive analytics: querying, logbook recovery, whole-QSO view, SQLite, origin stamping
 - Waterfall render gap on refocus (the App-Nap *unkey* is already fixed; spectrogram-freeze-on-refocus remains)
 - _Design calls to settle:_ wait-for-CQ vs answer-immediately (`docs/joel/joels-notes.md`); jump on a station after their RR73; behavior when clicking another station (decode or map) while armed / mid-QSO; drop SNR from own transmissions

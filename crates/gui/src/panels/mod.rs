@@ -10,13 +10,13 @@ use egui::{Rect, TextureHandle};
 use crate::bus_view::BusView;
 use crate::theme::Palette;
 
-mod band_scan;
+mod band_status;
 mod call_sign;
 mod contacts;
 mod log_book;
 pub(crate) mod waterfall;
 
-pub use band_scan::BandScan;
+pub use band_status::BandStatusPanel;
 pub use call_sign::CallSign;
 pub use contacts::Contacts;
 pub use log_book::LogBook;

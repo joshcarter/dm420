@@ -75,6 +75,15 @@ pub struct StationId(pub String);
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Callsign(pub String);
 
+impl Callsign {
+    /// The canonical comparison form — trimmed and ASCII-upper-cased. The single
+    /// place callsign normalization lives, so the worked set, the band-status
+    /// aggregate, and the decode enricher all key the same station identically.
+    pub fn normalized(&self) -> Callsign {
+        Callsign(self.0.trim().to_ascii_uppercase())
+    }
+}
+
 /// A Maidenhead grid locator, e.g. `"FN31"` / `"DN70KA"`.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct GridSquare(pub String);
@@ -288,6 +297,9 @@ pub struct EnrichedDecode {
     pub callsign: Option<Callsign>,
     pub grid: Option<GridSquare>,
     pub worked: WorkedStatus,
+    /// The RF band the decode's slot was received on. The dial isn't on the raw
+    /// [`Decode`] (it's audio-domain), so the enricher resolves and stamps it here.
+    pub band: Band,
 }
 
 // =====================================================================
@@ -383,6 +395,28 @@ pub fn calling_freq(band: Band, mode: OverAirMode) -> Option<AbsHz> {
         },
     };
     Some(AbsHz(hz))
+}
+
+/// The default Field Day HF stop set: the six ARRL Field Day HF bands
+/// (160/80/40/20/15/10 m) × {FT8, FT4}, filtered to stops that have an established
+/// calling frequency (FT4 has none on 160 m, so that stop drops — 11 total). The
+/// single home for the default band/mode list, so the scanner's `StartSurvey` and
+/// the band-status retention window agree by construction.
+pub fn field_day_stops() -> Vec<(Band, OverAirMode)> {
+    const BANDS: [Band; 6] = [
+        Band::B160m,
+        Band::B80m,
+        Band::B40m,
+        Band::B20m,
+        Band::B15m,
+        Band::B10m,
+    ];
+    const MODES: [OverAirMode; 2] = [OverAirMode::Ft8, OverAirMode::Ft4];
+    BANDS
+        .iter()
+        .flat_map(|&b| MODES.iter().map(move |&m| (b, m)))
+        .filter(|&(b, m)| calling_freq(b, m).is_some())
+        .collect()
 }
 
 impl Band {
@@ -685,7 +719,7 @@ pub enum WorkedStatus {
 /// today; keeping the parameter means a future per-mode award view (e.g. "WAS on
 /// FT8") is a change here rather than a literal scattered across consumers.
 pub fn worked_key(entry: &LogEntry, contest: ContestProfile) -> (Callsign, Band) {
-    let call = Callsign(entry.call.0.trim().to_ascii_uppercase());
+    let call = entry.call.normalized();
     match contest {
         // Field Day collapses every digital mode into one; the Standard profile we
         // run is likewise all-digital today, so both key on `(call, band)` alone.
@@ -793,6 +827,32 @@ pub struct BandActivity {
     pub t: Timestamp,
 }
 
+/// `band/status` (State) — the always-on band-activity aggregate written by the
+/// `core::band_status` producer. Unlike [`BandActivity`] (the scanner's per-sweep
+/// gossip, populated only while a survey runs), this is a rolling window over
+/// *every* decode source (local receive, scanning, and peers) for the configured
+/// `(band, mode)` stops, so the read-only Band Status panel shows what's active
+/// with no scan running.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct BandStatus {
+    pub rows: Vec<BandStatusRow>,
+    pub t: Timestamp,
+}
+
+/// One configured `(band, mode)`'s rolling counts of distinct stations over the
+/// retention window. `cq` and `unworked` are each subsets of `heard`.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct BandStatusRow {
+    pub band: Band,
+    pub mode: OverAirMode,
+    /// Distinct stations heard (mine ∪ peers).
+    pub heard: u32,
+    /// Distinct stations heard calling CQ (a subset of `heard`).
+    pub cq: u32,
+    /// Distinct heard stations not worked on this band (a subset of `heard`).
+    pub unworked: u32,
+}
+
 // =====================================================================
 // §9  Cross-station gossip  —  station/{id}/snapshot  (State + gossiped)
 // =====================================================================
@@ -828,6 +888,7 @@ pub struct HeardStation {
     pub call: Callsign,
     pub grid: Option<GridSquare>,
     pub band: Band,
+    pub mode: OverAirMode,
     pub snr: i8,
     pub last_heard: Timestamp,
 }
@@ -1184,6 +1245,7 @@ mod tests {
             callsign: Some(Callsign("N0JDC".into())),
             grid: Some(GridSquare("DN70".into())),
             worked: WorkedStatus::WorkedByNetwork(StationId("peer-1".into())),
+            band: Band::B20m,
         });
         round_trip(WorkedSet::default());
         round_trip(WorkedSet {
@@ -1513,5 +1575,37 @@ mod tests {
         assert!(!set.is_worked(&Callsign("W1ABC".into()), Band::B40m));
         // A different call is unworked.
         assert!(!set.is_worked(&Callsign("K2DEF".into()), Band::B20m));
+    }
+
+    #[test]
+    fn callsign_normalized_trims_and_upcases() {
+        assert_eq!(Callsign("  w4ll ".into()).normalized(), Callsign("W4LL".into()));
+        // Already-canonical input is unchanged.
+        assert_eq!(Callsign("N0JDC".into()).normalized(), Callsign("N0JDC".into()));
+    }
+
+    #[test]
+    fn field_day_stops_are_the_six_hf_bands_with_a_calling_freq() {
+        let stops = field_day_stops();
+        // 6 bands × 2 modes = 12, less 160 m FT4 (no established calling freq) = 11.
+        assert_eq!(stops.len(), 11);
+        assert!(stops.iter().all(|&(b, m)| calling_freq(b, m).is_some()));
+        assert!(!stops.contains(&(Band::B160m, OverAirMode::Ft4)));
+        assert!(stops.contains(&(Band::B160m, OverAirMode::Ft8)));
+        assert!(stops.contains(&(Band::B10m, OverAirMode::Ft4)));
+    }
+
+    #[test]
+    fn band_status_round_trips() {
+        round_trip(BandStatus {
+            rows: vec![BandStatusRow {
+                band: Band::B20m,
+                mode: OverAirMode::Ft8,
+                heard: 7,
+                cq: 2,
+                unworked: 5,
+            }],
+            t: Timestamp(1_700_000_000_000),
+        });
     }
 }

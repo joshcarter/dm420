@@ -174,7 +174,10 @@ pub struct BusView {
     /// `worked_spots`/`worked_calls_on_band` read this instead of re-deriving the dupe
     /// rule from the log.
     worked: Cell<WorkedSet>,
-    bands: Arc<Mutex<Vec<BandActivity>>>,
+    /// Latest band-status aggregate (`band/status`) from `core::band_status` — the
+    /// always-on per-(band, mode) heard/cq/unworked counts the read-only Band Status
+    /// panel renders.
+    band_status: Cell<BandStatus>,
     logs: Ring<LogEntry>,
     decodes: Ring<Decode>,
     /// Stations heard with a grid, keyed by call → newest [`HeardEntry`].
@@ -204,6 +207,10 @@ pub struct BusView {
     /// Read via [`Self::my_station_id`] so consumers compare a [`LogEntry`]'s
     /// `id.origin` against one owned value instead of re-deriving "mine vs peer".
     my_station_id: StationId,
+    /// The configured `(band, mode)` stops a scan sweeps (`[bands]` in the config —
+    /// the same set the Band Status panel tracks). The Digital panel's SCAN button
+    /// reads this to start a survey.
+    scan_stops: Vec<(Band, OverAirMode)>,
 
     /// Handle for live reconfiguration of the running producers (real mode only;
     /// empty otherwise).
@@ -243,7 +250,7 @@ impl BusView {
         let worked = cell();
         let qso = cell();
         let selection = cell();
-        let bands: Arc<Mutex<Vec<BandActivity>>> = Arc::new(Mutex::new(Vec::new()));
+        let band_status = cell();
         let logs = Ring::new(512);
         // Sized to hold every decode that can be on the waterslide at once: the panel
         // shows (panel_width / line_width) slot-columns of history (monitor-dependent —
@@ -269,6 +276,9 @@ impl BusView {
             "bus_view: starting producers",
         );
         let applied = Arc::new(Mutex::new(settings.hardware()));
+        // The configured scan stops the Digital panel's SCAN button sweeps (and the
+        // band-status window tracks) — static config, so no pump.
+        let scan_stops = settings.band_stops.clone();
         let _guard = rt.enter();
         // Real rig + decode + clock + logbook + band-scanner producers — `core::spawn`
         // covers them all (the scanner is real too). The decode stream is the real decoder's.
@@ -318,7 +328,7 @@ impl BusView {
         pump_state(&bus, Topic::ScannerState, scanner.clone(), egui_ctx.clone());
         pump_state(&bus, Topic::ClockStatus, clock.clone(), egui_ctx.clone());
         pump_state(&bus, Topic::Worked, worked.clone(), egui_ctx.clone());
-        pump_bands(&bus, bands.clone(), egui_ctx.clone());
+        pump_state(&bus, Topic::BandStatus, band_status.clone(), egui_ctx.clone());
         pump_stream(
             &bus,
             TopicSelector::Exact(Topic::LogbookEntries),
@@ -354,7 +364,7 @@ impl BusView {
             scanner,
             clock,
             worked,
-            bands,
+            band_status,
             logs,
             decodes,
             heard,
@@ -363,6 +373,7 @@ impl BusView {
             health,
             peers,
             my_station_id: station_id,
+            scan_stops,
             control,
             qso_control,
             applied,
@@ -414,18 +425,21 @@ impl BusView {
         self.scanner.lock().unwrap().clone()
     }
 
+    /// The configured `(band, mode)` stops a scan sweeps (the `[bands]` set).
+    pub fn scan_stops(&self) -> Vec<(Band, OverAirMode)> {
+        self.scan_stops.clone()
+    }
+
     /// The current clock/slot status, if seen yet. (Consumer lands next pass.)
     #[allow(dead_code)]
     pub fn clock(&self) -> Option<ClockStatus> {
         *self.clock.lock().unwrap()
     }
 
-    /// Per-band activity, sorted low band → high. Accumulated from the (provisional)
-    /// single-value `scanner/candidates` State topic — see [`pump_bands`].
-    pub fn band_activity(&self) -> Vec<BandActivity> {
-        let mut v = self.bands.lock().unwrap().clone();
-        v.sort_by_key(|b| band_order(b.band));
-        v
+    /// The latest band-status aggregate (`band/status`), or `None` before the first
+    /// publish. Read by the Band Status panel.
+    pub fn band_status(&self) -> Option<BandStatus> {
+        self.band_status.lock().unwrap().clone()
     }
 
     /// The `n` most recent log entries by timestamp, newest first.
@@ -771,12 +785,6 @@ impl BusView {
         self.send_scanner_command(ScannerCommand::Cancel);
     }
 
-    /// Replace the live sweep's stops (the panel's band/mode toggles) without
-    /// resetting counts. Sent as the operator toggles during a scan.
-    pub fn set_stops(&self, stops: Vec<(Band, OverAirMode)>) {
-        self.send_scanner_command(ScannerCommand::SetStops { stops });
-    }
-
     fn send_scanner_command(&self, cmd: ScannerCommand) {
         let bus = self.bus.clone();
         self._rt.spawn(async move {
@@ -855,22 +863,6 @@ impl BusView {
     #[allow(dead_code)]
     pub fn bus(&self) -> &BusHandle {
         &self.bus
-    }
-}
-
-/// Sort key for a band, low frequency → high.
-fn band_order(b: Band) -> u8 {
-    match b {
-        Band::B160m => 0,
-        Band::B80m => 1,
-        Band::B40m => 2,
-        Band::B30m => 3,
-        Band::B20m => 4,
-        Band::B17m => 5,
-        Band::B15m => 6,
-        Band::B12m => 7,
-        Band::B10m => 8,
-        Band::B6m => 9,
     }
 }
 
@@ -1145,36 +1137,6 @@ fn pump_peers(
                     ctx.request_repaint();
                 }
                 // Lossy lag on the wildcard State stream: keep reading. Closed: end.
-                Err(BusError::Lagged { .. }) => continue,
-                Err(_) => break,
-            }
-        }
-    });
-}
-
-/// Spawn a pump that accumulates per-band activity keyed by [`Band`].
-///
-/// `scanner/candidates` is a single-value `State` topic carrying one
-/// `BandActivity` (the catalog marks the payload shape *provisional*). The mock
-/// publishes the bands spaced apart; this pump folds each into a map so all bands
-/// are visible at once. A `Vec<BandActivity>` snapshot payload would let us drop
-/// this accumulation — a question for whoever finalizes the scanner seam.
-fn pump_bands(bus: &BusHandle, bands: Arc<Mutex<Vec<BandActivity>>>, ctx: egui::Context) {
-    let mut sub =
-        match bus.subscribe::<Vec<BandActivity>>(TopicSelector::Exact(Topic::ScannerCandidates)) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!(error = ?e, "bus_view: candidates subscribe failed");
-                return;
-            }
-        };
-    tokio::spawn(async move {
-        loop {
-            match sub.recv().await {
-                Ok(snapshot) => {
-                    *bands.lock().unwrap() = snapshot;
-                    ctx.request_repaint();
-                }
                 Err(BusError::Lagged { .. }) => continue,
                 Err(_) => break,
             }

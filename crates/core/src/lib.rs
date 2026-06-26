@@ -19,13 +19,16 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bus::BusHandle;
-use bus::types::{RadioId, StationId};
+use bus::types::{Band, OverAirMode, RadioId, StationId};
 
+mod band_status;
 mod clock;
 mod control;
 mod decode;
+mod enrich;
 mod health;
 mod interlock;
 mod map;
@@ -182,6 +185,13 @@ pub struct CoreConfig {
     /// reaches the rig. Clamped to `[0.0, 1.0]`; see [`DEFAULT_TX_GAIN`].
     /// Live-editable afterward via [`CoreControl::tx`].
     pub tx_gain: f32,
+    /// The `(band, mode)` stops the band-status producer aggregates and the band
+    /// scanner sweeps — `[bands] list × modes` from `config.toml`, defaulting to
+    /// [`bus::types::field_day_stops`] (the six Field Day HF bands × FT8/FT4).
+    pub band_status_stops: Vec<(Band, OverAirMode)>,
+    /// How long a heard station stays counted in the band-status window
+    /// (`[bands] retention_secs`, default 5 minutes).
+    pub band_status_window: Duration,
 }
 
 impl Default for CoreConfig {
@@ -199,6 +209,8 @@ impl Default for CoreConfig {
             decode_archive: None,
             tx_output: None,
             tx_gain: DEFAULT_TX_GAIN,
+            band_status_stops: bus::types::field_day_stops(),
+            band_status_window: Duration::from_secs(300),
         }
     }
 }
@@ -222,6 +234,8 @@ pub fn spawn(bus: &BusHandle, cfg: CoreConfig) -> CoreControl {
         decode_archive,
         tx_output,
         tx_gain,
+        band_status_stops,
+        band_status_window,
     } = cfg;
 
     tracing::info!(
@@ -271,6 +285,10 @@ pub fn spawn(bus: &BusHandle, cfg: CoreConfig) -> CoreControl {
     // The band scanner (spawned after the decode match below) needs the radio id,
     // but that match consumes `radio` — clone it here while it's still owned.
     let scanner_radio = radio.clone();
+    // The enricher and band-status producers also need the radio id past the decode
+    // match that consumes it.
+    let enrich_radio = radio.clone();
+    let band_status_radio = radio.clone();
 
     // The active mode for the slot clock below: live capture follows it through
     // `AudioControl`, so capture this only as the WAV/none fallback.
@@ -303,6 +321,27 @@ pub fn spawn(bus: &BusHandle, cfg: CoreConfig) -> CoreControl {
     // inject into the real path. In live mode it tracks the operator's selected
     // mode via `AudioControl`; otherwise it uses the configured protocol.
     clock::spawn(bus, control.audio.clone(), fallback_proto);
+
+    // The decode enricher: stamps each decode with its RF band (from the per-slot
+    // dial/scanner timeline — see `enrich`) and worked-status, republishing
+    // `EnrichedDecode` on `radio/{id}/decodes_enriched`. The band-status producer
+    // (and, later, the map/waterslide/scanner tally) read band+worked from here
+    // instead of re-deriving band-from-VFO and the dupe rule. Subscription order is
+    // immaterial — it reads decodes/rig_state/scanner/clock/worked as they publish,
+    // regardless of which producer spawned first.
+    enrich::spawn(bus, enrich_radio);
+
+    // The band-status producer: the always-on per-(band,mode) aggregate of who's
+    // active (heard / CQ / unworked), folded from the enriched decode stream + peer
+    // gossip over a retention window and published on `band/status` for the read-only
+    // Band Status panel. Owns that aggregation so no panel re-derives it.
+    band_status::spawn(
+        bus,
+        band_status_radio,
+        station_id.clone(),
+        band_status_stops,
+        band_status_window,
+    );
 
     // The logbook owns `logbook/entries` in real mode: it persists QSOs the engine
     // logs on RR73 and replays history on startup. In mock mode there's no path, so

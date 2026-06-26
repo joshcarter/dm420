@@ -27,14 +27,16 @@
 //! - `DM420_GRID` — the operator's Maidenhead grid locator (default `DN70KA`).
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use app_core::{CoreConfig, DecodeSource, LineProfile, Protocol, SerialConfig, DEFAULT_TX_GAIN};
-use types::StationId;
+use types::{Band, OverAirMode, StationId, calling_freq, field_day_stops};
 
 use crate::config_toml::{
     bool_str, config_path, format_f32, parse_float, parse_table_value, parse_u16, update_toml_table,
     write_config,
 };
+use crate::send::parse_band;
 
 /// Default rig baud when `DM420_SERIAL_BAUD` is unset or invalid.
 pub(crate) const DEFAULT_BAUD: u32 = 19_200;
@@ -47,6 +49,10 @@ pub(crate) const KENWOOD_BAUDS: &[u32] = &[115_200, 57_600, 38_400, 19_200, 9_60
 
 /// Default log level when neither `RUST_LOG` nor `[logging] level` is set.
 pub(crate) const DEFAULT_LOG_LEVEL: &str = "info";
+
+/// Default band-status heard-retention window when `[bands] retention_secs` is
+/// unset: 5 minutes.
+const DEFAULT_BAND_RETENTION: Duration = Duration::from_secs(300);
 
 /// The configured log level for DM420's crates: the `[logging] level` key in the
 /// config file, or [`DEFAULT_LOG_LEVEL`] if unset. Read once at startup by
@@ -155,6 +161,12 @@ pub struct Settings {
     /// see [`read_station_id`]. **Distinct from the callsign:** a shared club call
     /// can't tell operators apart, so each multi-op instance must set its own.
     pub station_id: StationId,
+    /// The `(band, mode)` stops the band-status panel/producer tracks and the band
+    /// scanner sweeps — `[bands] list × modes`, default [`field_day_stops`].
+    pub band_stops: Vec<(Band, OverAirMode)>,
+    /// How long a heard station stays in the band-status window (`[bands]
+    /// retention_secs`, default 5 minutes).
+    pub band_retention: Duration,
 }
 
 impl Settings {
@@ -164,6 +176,7 @@ impl Settings {
         // Persisted audio device selections (config file [audio]); the env var
         // still wins for the input, for quick overrides.
         let (toml_in, toml_out) = read_audio_config(&config_path());
+        let (band_stops, band_retention) = read_band_config(&config_path());
         Settings {
             audio_input: env_nonempty("DM420_AUDIO_INPUT").or(toml_in),
             serial: serial_from_env(),
@@ -172,6 +185,8 @@ impl Settings {
             audio_output: toml_out,
             tx_gain: read_tx_gain(&config_path()),
             station_id: read_station_id(&config_path()),
+            band_stops,
+            band_retention,
         }
     }
 
@@ -211,6 +226,8 @@ impl Settings {
             tx_output: self.audio_output.clone(),
             tx_gain: self.tx_gain,
             station_id: self.station_id.clone(),
+            band_status_stops: self.band_stops.clone(),
+            band_status_window: self.band_retention,
         }
     }
 }
@@ -236,6 +253,59 @@ fn logbook_path() -> PathBuf {
 fn read_archive_config(path: &Path) -> Option<PathBuf> {
     let text = std::fs::read_to_string(path).ok()?;
     parse_table_value(&text, "archive", "decodes").map(PathBuf::from)
+}
+
+/// Read the `[bands]` table: the `(band, mode)` stops the band-status producer
+/// aggregates and the scanner sweeps, plus the heard-retention window. Delegates
+/// to [`parse_band_config`]. Config-only by design — no env-var override.
+fn read_band_config(path: &Path) -> (Vec<(Band, OverAirMode)>, Duration) {
+    parse_band_config(&std::fs::read_to_string(path).unwrap_or_default())
+}
+
+/// Parse the `[bands]` table:
+///
+/// ```toml
+/// [bands]
+/// list = "160,80,40,20,15,10"   # bands; each crossed with every mode below
+/// modes = "ft8,ft4"
+/// retention_secs = "300"        # band-status heard window, seconds
+/// ```
+///
+/// `list × modes` is filtered to stops with a calling frequency (so 160 m FT4,
+/// which has none, drops out). If either `list` or `modes` is absent or
+/// unparseable the stops fall back to [`field_day_stops`]; an absent/blank
+/// `retention_secs` falls back to [`DEFAULT_BAND_RETENTION`].
+fn parse_band_config(text: &str) -> (Vec<(Band, OverAirMode)>, Duration) {
+    let retention = parse_table_value(text, "bands", "retention_secs")
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_BAND_RETENTION);
+    let bands: Vec<Band> = parse_table_value(text, "bands", "list")
+        .map(|s| s.split(',').filter_map(|t| parse_band(t.trim())).collect())
+        .unwrap_or_default();
+    let modes: Vec<OverAirMode> = parse_table_value(text, "bands", "modes")
+        .map(|s| s.split(',').filter_map(parse_mode).collect())
+        .unwrap_or_default();
+    let stops = if bands.is_empty() || modes.is_empty() {
+        field_day_stops()
+    } else {
+        bands
+            .iter()
+            .flat_map(|&b| modes.iter().map(move |&m| (b, m)))
+            .filter(|&(b, m)| calling_freq(b, m).is_some())
+            .collect()
+    };
+    (stops, retention)
+}
+
+/// Parse an over-air mode token (`ft8`/`ft4`, case-insensitive) for `[bands]
+/// modes`. `None` for the architecture-only modes (no scanner/decoder support).
+fn parse_mode(s: &str) -> Option<OverAirMode> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "ft8" => Some(OverAirMode::Ft8),
+        "ft4" => Some(OverAirMode::Ft4),
+        _ => None,
+    }
 }
 
 /// The var's value if set and non-empty, else `None`.
@@ -717,6 +787,29 @@ fn wav_from_env() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn band_config_defaults_then_honors_explicit_table() {
+        // No [bands] table → the Field Day default set + 5-minute window.
+        let (stops, window) = parse_band_config("");
+        assert_eq!(stops, field_day_stops());
+        assert_eq!(window, DEFAULT_BAND_RETENTION);
+
+        // An explicit table crosses list × modes, drops stops with no calling
+        // frequency (160 m FT4), and reads the retention window.
+        let cfg = "[bands]\nlist = \"160,20\"\nmodes = \"ft8,ft4\"\nretention_secs = \"120\"\n";
+        let (stops, window) = parse_band_config(cfg);
+        assert_eq!(
+            stops,
+            vec![
+                (Band::B160m, OverAirMode::Ft8),
+                (Band::B20m, OverAirMode::Ft8),
+                (Band::B20m, OverAirMode::Ft4),
+            ],
+            "160 m FT4 has no calling freq, so it is filtered out",
+        );
+        assert_eq!(window, Duration::from_secs(120));
+    }
 
     #[test]
     fn parses_station_table_with_comments() {

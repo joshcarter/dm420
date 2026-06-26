@@ -38,6 +38,9 @@ pub enum Command {
     SetBand(Band),
     /// Jump the TX audio offset to the clearest CQ lane (`/clear`).
     ClearQsy,
+    /// Toggle the band scanner (`/scan`): start a survey of the configured stops, or
+    /// cancel the one in progress. The Digital panel resolves which from `ScannerState`.
+    Scan,
 }
 
 /// Parse a slash/colon command. Returns `None` if it isn't a command or the
@@ -56,13 +59,14 @@ pub fn parse_command(input: &str) -> Option<Command> {
         }
         "b" | "band" => parse_band(tokens.next()?).map(Command::SetBand),
         "clear" => Some(Command::ClearQsy),
+        "scan" => Some(Command::Scan),
         _ => None,
     }
 }
 
 /// Parse a band argument — `20`, `20m`, or `20M` — into a [`Band`]. The meter
 /// count must name a real amateur HF/6 m band.
-fn parse_band(arg: &str) -> Option<Band> {
+pub(crate) fn parse_band(arg: &str) -> Option<Band> {
     let meters: u16 = arg.trim_end_matches(['m', 'M']).parse().ok()?;
     Some(match meters {
         160 => Band::B160m,
@@ -222,6 +226,14 @@ mod tests {
         assert_eq!(parse_command("/b 21"), None);
         assert_eq!(parse_command("/b"), None);
         assert_eq!(parse_command("/b xyz"), None);
+    }
+
+    #[test]
+    fn parses_scan_and_clear_verbs() {
+        for s in ["/scan", ":scan", "  /SCAN ", "/Scan"] {
+            assert_eq!(parse_command(s), Some(Command::Scan), "input {s:?}");
+        }
+        assert_eq!(parse_command("/clear"), Some(Command::ClearQsy));
     }
 
     #[test]
