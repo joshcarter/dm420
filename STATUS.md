@@ -14,6 +14,8 @@
 
 - [ ] Band scan function needs to move to the Digital panel. Band Scan panel needs to be read-only.
 
+- [ ] Tri-state control for clear QSY/follow station/lock offset. In "Clear" mode it would always attempt to find a clear part of the audio passband. In "Follow" it would behave as it does today--following the offset of whatever station we are answering, or using the current offset for CQ. In "Lock" it would lock to the current offset.
+
 ## After Field Day
 
 **Architecture rework (open)** — IDs reference `ARCHITECTURE_REVIEW.md`:
