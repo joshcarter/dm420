@@ -133,6 +133,7 @@ mod tests {
             exchange_rcvd: "3A WCF".into(),
             grid: Some(GridSquare("DN70".into())),
             section: None,
+            contest: None,
         }
     }
 

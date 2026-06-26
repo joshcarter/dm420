@@ -310,6 +310,19 @@ pub(super) fn is_cq(d: &Decode) -> bool {
     )
 }
 
+/// Whether `caller` (a decode's parsed sender callsign) is our own configured
+/// station — case-insensitive equality, `false` when no call is set (`None` or
+/// blank). Callsign-only and origin-agnostic: it matches our own over in any
+/// contest form *and* a LAN peer transmitting under our shared club call. The one
+/// "is this mine?" predicate, shared by the CQ-answer-candidate filter and the
+/// own-TX colour, so the two notions can't drift apart.
+pub(super) fn is_my_station(caller: &str, my_call: Option<&str>) -> bool {
+    my_call.is_some_and(|mine| {
+        let mine = mine.trim();
+        !mine.is_empty() && caller.eq_ignore_ascii_case(mine)
+    })
+}
+
 /// The "waterslide" decode view: each decode placed by audio offset (vertical)
 /// and age (horizontal), newest at the centre NOW line and sliding left as it
 /// ages. The right (FFT) half is left blank until a spectrum producer is wired.
@@ -622,10 +635,9 @@ pub(super) fn draw_waterslide(
         // air (the decoder hears our own over). Draw it in the transmit accent
         // (accent3) so the lane shows our outgoing text in our own colour. This
         // outranks the selected-station tint — it's our message, not one we're working.
-        let is_own_tx = match (&station, my_call) {
-            (Some((c, _)), Some(mine)) => c.eq_ignore_ascii_case(mine),
-            _ => false,
-        };
+        let is_own_tx = station
+            .as_ref()
+            .is_some_and(|(c, _)| is_my_station(c, my_call));
         // A decode addressed *to* our callsign — someone answering our CQ or sending
         // us an exchange/signoff — also reads in accent3 so it catches the eye.
         let is_addressed_to_me = match (&d.content, my_call) {

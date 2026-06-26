@@ -75,6 +75,7 @@ mod tests {
             exchange_rcvd: "-12".into(),
             grid: None,
             section: None,
+            contest: None,
         }
     }
 

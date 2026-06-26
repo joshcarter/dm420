@@ -16,7 +16,7 @@
 //! enrichment + gossip), tail-ending, compound/hashed callsigns, and AP decoding.
 
 use types::{
-    Callsign, Decode, DecodeContent, DecodeRef, ExchangePayload, GridSquare, OffsetHz,
+    Callsign, Contest, Decode, DecodeContent, DecodeRef, ExchangePayload, GridSquare, OffsetHz,
     OutgoingMessage, ParsedMessage, QsoCommand, QsoPhase, QsoState, RadioId, Section, Selection,
     Signoff, SlotId,
 };
@@ -71,6 +71,11 @@ pub struct CompletedQso {
     pub section: Option<Section>,
     pub exchange_sent: String,
     pub exchange_rcvd: String,
+    /// The contest this contact counts toward. `Some(ArrlFieldDay)` only when we are
+    /// running Field Day *and* the partner actually sent a class+section exchange
+    /// (`rcvd_fd`); a grid+report contact worked during Field Day stays `None`. Computed
+    /// once here — the engine owns the exchange semantics — and copied onto the log.
+    pub contest: Option<Contest>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1210,6 +1215,14 @@ impl Engine {
             section: a.rcvd_fd.as_ref().map(|(_, s)| s.clone()),
             exchange_sent: sent,
             exchange_rcvd: rcvd,
+            // Intent-bearing tag: we're running Field Day *and* the partner actually
+            // sent a class+section exchange. Not derived from `section` downstream — a
+            // peer/imported entry could carry a section without an FD QSO occurring.
+            contest: if self.me.is_field_day() && a.rcvd_fd.is_some() {
+                Some(Contest::ArrlFieldDay)
+            } else {
+                None
+            },
         }
     }
 
@@ -1290,7 +1303,9 @@ fn is_roger(kind: Signoff) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use types::{AbsHz, ContestProfile, OverAirMode, SelectionContext, SignalSource, Timestamp};
+    use types::{
+        AbsHz, Contest, ContestProfile, OverAirMode, SelectionContext, SignalSource, Timestamp,
+    };
 
     const ME: &str = "W9XYZ";
     const HIM: &str = "K1ABC";
@@ -1849,6 +1864,72 @@ mod tests {
         assert_eq!(log.exchange_rcvd, "2B IL");
         assert_eq!(tx_text(&mut e, 6).as_deref(), Some("K1ABC W9XYZ 73"));
         assert_eq!(e.state().phase, QsoPhase::Calling);
+    }
+
+    #[test]
+    fn field_day_qso_with_fd_exchange_is_tagged() {
+        // Field Day mode *and* the partner actually sent a class+section exchange
+        // (`rcvd_fd` populated) → the completed contact is tagged as a Field Day QSO.
+        let mut e = engine(ContestProfile::ArrlFieldDay);
+        e.step(Event::Command(start_target()));
+        e.step(Event::Decode(decode(cq_from(HIM, true), 4, -5)));
+        assert_eq!(tx_text(&mut e, 5).as_deref(), Some("K1ABC W9XYZ 3A WI"));
+        // Their R+exchange → we queue RR73; the log fires when RR73 is sent.
+        e.step(Event::Decode(decode(
+            exch(
+                ME,
+                HIM,
+                ExchangePayload::FieldDay {
+                    class: "2B".into(),
+                    section: Section("IL".into()),
+                    rogered: true,
+                },
+            ),
+            6,
+            -5,
+        )));
+        let s = e.step(Event::Tick { slot: SlotId(7) });
+        let log = s.log.expect("FD answering logs on RR73 sent");
+        assert_eq!(log.contest, Some(Contest::ArrlFieldDay));
+    }
+
+    #[test]
+    fn field_day_qso_without_fd_exchange_is_not_tagged() {
+        // Field Day mode but the partner never sent a class+section exchange — here they
+        // sign off before doing so, leaving `rcvd_fd == None`. Per requirement #2 the
+        // contact is logged but NOT tagged, because no contest exchange happened. (FD
+        // mode gates a plain grid+report to "ignore", so an early sign-off is the way a
+        // completed FD-mode QSO can carry no captured exchange.)
+        let mut e = engine(ContestProfile::ArrlFieldDay);
+        e.step(Event::Command(start_target()));
+        e.step(Event::Decode(decode(cq_from(HIM, true), 4, -5)));
+        assert_eq!(tx_text(&mut e, 5).as_deref(), Some("K1ABC W9XYZ 3A WI"));
+        // A directed sign-off before any exchange completes (and logs) the contact.
+        let s = e.step(Event::Decode(decode(signoff(ME, HIM, Signoff::Rr73), 6, -5)));
+        let log = s.log.expect("a directed sign-off completes the QSO");
+        assert_eq!(log.contest, None, "no FD exchange captured → not tagged");
+    }
+
+    #[test]
+    fn standard_qso_is_never_tagged() {
+        // A non-Field-Day QSO carries no contest tag.
+        let mut e = engine(ContestProfile::Standard);
+        e.step(Event::Command(QsoCommand::CallCq));
+        assert_eq!(tx_text(&mut e, 2).as_deref(), Some("CQ W9XYZ EM48"));
+        e.step(Event::Decode(decode(
+            exch(ME, HIM, ExchangePayload::Grid(GridSquare("FN42".into()))),
+            3,
+            -8,
+        )));
+        assert_eq!(tx_text(&mut e, 4).as_deref(), Some("K1ABC W9XYZ -08"));
+        e.step(Event::Decode(decode(
+            exch(ME, HIM, ExchangePayload::RogerReport(-3)),
+            5,
+            -8,
+        )));
+        let s = e.step(Event::Tick { slot: SlotId(6) });
+        let log = s.log.expect("log on RR73 sent");
+        assert_eq!(log.contest, None);
     }
 
     #[test]

@@ -37,6 +37,7 @@
 - [ ] 0b — wire `Granter::revoke` into the QSO-Stop / scan-cancel abort path (the method exists but is unused)
 - [ ] A2 — carve the dead prototype tables (`panel_data.rs`) + the mock-only `waterslide_panel.rs`
 - [ ] `draw_waterslide`'s 22 positional args → a `WaterslideView` struct (deferred from the `waterfall/` decomposition; the fn now lives in `panels/waterfall/render.rs`)
+- [ ] **Waterslide renders re-derived decode text, not canonical `raw`** (SSOT) — `decode_text` (`crates/gui/src/format.rs`) rebuilds each lane's body from the structured `ParsedMessage` instead of the verbatim `raw` the bus already carries, so any grammar token the formatter doesn't explicitly re-emit silently vanishes from the display. The `CQ FD`/`TEST` modifier was just patched in the `Cq` arm (f63953f), but `CQ DX` still drops — the parser maps `DX → None` (`crates/core/src/parse.rs:165`), so the formatter can't reach it (the lenient `cq_dx_modifier` test, `parse.rs:199`, masks the loss). Fix: render `raw` for the body, keep `ParsedMessage` for semantics only — kills the whole drift class. Caveat: touches all decode-line rendering and subsumes `display_call`'s hashed-call (`<…>`) handling, so it wants a full `decode_text` review. Pairs with the `draw_waterslide`→`WaterslideView` item above.
 - [ ] Phase 4 — reconcile `docs/message-catalog.md` with reality (mark each topic built / delete the dead ones)
 
 **Multi-op feature track** — see `docs/networking.md`:

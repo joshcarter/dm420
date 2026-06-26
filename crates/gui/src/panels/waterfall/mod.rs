@@ -617,12 +617,17 @@ impl Panel for Waterfall {
                     let current_slot_ms =
                         if slot_ms > 0 { (now_ms / slot_ms) * slot_ms } else { now_ms };
                     let recent_decodes = ctx.bus.recent_decodes();
+                    // The operator's configured station call (trimmed; `None` when unset),
+                    // shared by the CQ-candidate filter and the own-TX colour in the
+                    // waterslide so both read one "is this mine?" notion.
+                    let my_call = (!ctx.call.trim().is_empty()).then(|| ctx.call.trim());
                     if current_slot_ms != self.last_assigned_slot_ms {
                         self.last_assigned_slot_ms = current_slot_ms;
                         update_cq_assignments(
                             &mut self.cq_assignments,
                             &recent_decodes,
                             &worked,
+                            my_call,
                             current_slot_ms,
                             slot_ms,
                         );
@@ -704,7 +709,7 @@ impl Panel for Waterfall {
                         click,
                         tx_off,
                         sel_call.as_deref(),
-                        (!ctx.call.trim().is_empty()).then(|| ctx.call.trim()),
+                        my_call,
                         &worked,
                         &self.cq_assignments,
                         tag.as_deref(),
