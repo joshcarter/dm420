@@ -125,50 +125,175 @@ it, assert the message string round-trips. Reuse the shape of
 Run with `cargo test -p modes field_day`. It fails today (text is `+03`, type is
 `Standard`) and passes once both the packer and unpacker land.
 
-## How we'll fix it
+## Implementation plan
 
-All self-contained in `crates/modes/src/message.rs`, mirroring WSJT-X's pack:
+### Scope — fully contained in the `modes` crate
 
-1. **Section table.** Add the canonical WSJT-X 85-entry ordered section array
-   (`AB, AK, AL, … WY, DX`) as a `const` — index ↔ 7-bit `isec`.
-   ⚠️ This must be the **WSJT-X order**, not `gui/panel_data.rs`'s `SECTIONS`
-   (that table is map-centric/geographic and only carries lon/lat — wrong order
-   for on-air interop). The canonical list does not exist anywhere in the repo
-   yet; it has to be added.
-
-2. **Encoder** — `encode_arrl_fd(call_to, call_de, rogered, ntx, class, section)`:
-   - Reuse `pack28`'s first return (the 28-bit call value) for both calls — FD has
-     no per-call `/R`/`/P` ip bit, so ignore the ip return.
-   - Map class `A`–`F` → 0–5; look up `section` → `isec`; compute
-     `intx = (ntx − 1) & 0xF` and `n3 = 3 + (ntx − 1)/16`; set `ir` from the
-     leading `R`.
-   - Bit-pack into `p[0..10]`:
-     `n28a(28) | n28b(28) | ir(1) | intx(4) | nclass(3) | isec(7) | n3(3) | i3=0(3)`.
-
-3. **Router** — in `encode_message`, detect the FD shape *before* falling to
-   `encode_std`: tokens of form `[to, de, <count><classLetter>, section]` and
-   `[to, de, "R", <count><classLetter>, section]`, where the class token is
-   `1–2 digits + A–F`. Parse `3A` → (ntx=3, class=A), call `encode_arrl_fd`.
-   (The `CQ FD …` opener already works via the `is_cq_modifier_tok` path — leave it.)
-
-4. **Decoder** — add `MessageType::ArrlFd => decode_arrl_fd(p, hash)` to `decode`
-   (`message.rs:140`). Extract the fields with the FD bit boundaries (not
-   `decode_std`'s 29-bit layout), `unpack28(n28, 0, 0, hash)` for each call,
-   reverse the class/section/ntx mapping, and rebuild
-   `"<to> <de> [R ]<ntx><class> <section>"`.
-
-5. **Tests** — commit the failing tests above; they become the regression guard.
-   Worth adding a **fixed-payload** assertion against a known WSJT-X byte pattern
-   for `K1ABC W9XYZ 6A WI` (the classic example) so we are byte-compatible with
-   real radios, not just self-consistent.
-
-### Why this is the only missing link
-
-The rest of the FD path is already built: the `qso` engine builds the correct
+The rest of the FD path is already built: the `qso` engine produces the correct
 exchange *strings* (`crates/qso/src/message.rs:93`, `engine.rs:1192`), and
-`core::parse` / the GUI already parse inbound FD exchanges into
-`ExchangePayload::FieldDay`. The only gap is the 77-bit pack/unpack itself in
-`modes`. Distinct from the now-fixed send-box/engine config split.
+`core::parse` / the GUI already turn inbound FD exchange *strings* into
+`ExchangePayload::FieldDay`. The **only** missing link is the 77-bit pack/unpack
+that sits behind the existing public seam — `modes::encode_message` /
+`modes::decode` (and therefore `modes::synth_message`). So nothing outside
+`crates/modes/` changes: no `types`, `bus`, `qso`, `core`, or GUI edits. This is
+the architecturally satisfying part — the wire format is owned by the one crate
+that owns the wire format, and everyone else already speaks strings.
+
+### Layering — a semantic pivot type between text and bits
+
+The mistake to avoid is what `encode_std` does for grids: smear token-parsing,
+table lookups, and bit-twiddling into one function. We split it into two layers
+with a small value type in the middle, so each side is independently testable:
+
+```
+  human text  <──parse/format──>  FieldDayExchange  <──pack/unpack──>  [u8; 10]
+  "K1ABC N0JDC 3A CO"            (semantic fields)                   (77-bit payload)
+        └─ arrl_fd.rs (pure: no hash, no bits) ─┘   └─ message.rs (bits + CallHash) ─┘
+```
+
+- **`FieldDayExchange`** (new, in `arrl_fd.rs`) is the semantic middle: the parsed
+  meaning of an FD over, independent of both the on-screen string and the wire
+  bits. Fields: `call_to: String`, `call_de: String`, `rogered: bool`,
+  `ntx: u8` (1–32), `class_idx: u8` (0–5 ⇒ A–F), `section_idx: u8` (0-based index
+  into `SECTIONS`).
+- **Text ↔ semantics** lives in `arrl_fd.rs` and is **pure** — no `CallHash`, no
+  bit layout, trivially unit-tested:
+  - `FieldDayExchange::parse(toks: &[&str]) -> Option<Self>` — returns `None` for
+    anything that isn't a well-formed FD exchange (so callers fall through to the
+    standard/free-text packers).
+  - `FieldDayExchange::to_text(&self) -> String` — the canonical
+    `"<to> <de> [R ]<ntx><class> <section>"` rendering for decode output.
+- **Semantics ↔ wire bits** lives in `message.rs` next to its siblings
+  (`encode_std`/`decode_std`), because only there do we have `pack28`/`unpack28`
+  and `CallHash`:
+  - `encode_arrl_fd(ex: &FieldDayExchange, hash: &mut CallHash) -> Option<[u8; 10]>`
+  - `decode_arrl_fd(p: &[u8; 10], hash: &mut CallHash) -> Option<String>`
+
+This keeps `arrl_fd.rs` free of bus/hash/bit concerns (it's reference data + pure
+parsing) and keeps the bit math encapsulated with the other message types.
+
+### File-by-file
+
+**1. New module `crates/modes/src/arrl_fd.rs`** (declared `mod arrl_fd;` in
+`lib.rs`, alongside `mod message;` — matches the crate's flat-module convention):
+
+- `pub(crate) const SECTIONS: [&str; 85]` — the canonical WSJT-X `csec` table, in
+  the **exact order** `unpack77.f90` uses. The array index *is* the 7-bit `isec`
+  wire value, so the ordering is the interop contract (see "Why WSJT-X order" in
+  this doc). A doc comment says so, and warns against "fixing" it to alphabetical
+  or aligning it to `gui/panel_data.rs`'s geographic `SECTIONS`.
+- `section_index(sec: &str) -> Option<u8>` / `section_name(isec: u8) -> Option<&'static str>`
+  — case-insensitive, trimmed; `None` for unknown (lets non-FD text fall through).
+- `Class` parsing: `parse_class(tok: &str) -> Option<(u8 /*ntx 1..=32*/, u8 /*idx 0..=5*/)>`
+  matching WSJT-X's `bFieldDay_msg` constraints — 1–2 digits, count ≥ 1 and ≤ 32,
+  trailing letter `A`–`F`. Rejects `"0A"`, `"33A"`, `"3G"`, `"R"`, `"3"`.
+- `FieldDayExchange` + `parse`/`to_text` as above. `parse` accepts exactly the two
+  shapes `[to, de, class, sec]` and `[to, de, "R", class, sec]`, requiring both a
+  parseable class token **and** a known section — the conjunction is what keeps a
+  4-word free-text line from being mis-claimed as FD.
+
+**2. `crates/modes/src/message.rs`** — wire layer + dispatch:
+
+- `encode_arrl_fd(ex, hash)`: `pack28` each call (reuse its first return; FD has no
+  per-call `/R`/`/P` ip bit, so the ip return is ignored — a documented limitation,
+  compound/portable calls aren't representable in the FD field and aren't in scope);
+  bail `None` if either call fails to pack. Derive `intx`/`n3` from `ntx`, `ir` from
+  `rogered`, then assemble the fields MSB-first (see layout below).
+- `decode_arrl_fd(p, hash)`: load the 77 bits, take the fields MSB-first,
+  `unpack28(n28, 0, 0, hash)` each call (ip = 0, i3 = 0 ⇒ no suffix logic), map
+  `class_idx`/`section_idx`/`ntx` back, build a `FieldDayExchange`, return
+  `to_text()`. `None` if a call won't unpack or `section_name` is out of range.
+- Two one-line dispatch hooks:
+  - in `encode_message`, *before* the `encode_std` attempt:
+    `if let Some(ex) = arrl_fd::FieldDayExchange::parse(&toks) { if let Some(p) = encode_arrl_fd(&ex, hash) { return Some(p); } }`
+  - in `decode`'s match: `MessageType::ArrlFd => decode_arrl_fd(p, hash)?,`
+
+**3. Bit assembly** — to avoid the off-by-one shift bugs `encode_std`'s hand-rolled
+`>>`/`<<` chain invites, `encode_arrl_fd`/`decode_arrl_fd` use a `u128` accumulator,
+pushing/taking fields MSB-first with the field widths spelled out inline. (We don't
+retrofit `encode_std` now — no churn — but the FD path gets the clearer technique.)
+
+### Wire-format reference (WSJT-X type 0.3 / 0.4)
+
+```
+field   bits  meaning
+n28a     28   call_to   (pack28: DE/QRZ/CQ tokens, 22-bit hash, or standard call)
+n28b     28   call_de
+ir        1   1 ⇒ exchange carries the leading "R" (the rogered Tx3)
+intx      4   transmitter count − 1, low nibble  (combine with n3)
+nclass    3   class letter A..F → 0..5
+isec      7   section index into SECTIONS (0-based)        ← interop-critical
+n3        3   3 ⇒ ntx 1..16,  4 ⇒ ntx 17..32   ⇒  ntx = intx + 1 + 16·(n3 − 3)
+i3        3   0
+        ─────
+         77   (+ 3 pad bits to fill 10 bytes)
+```
+
+⚠️ **The one spec detail to pin, not guess: is `isec` 0-based?** This plan treats
+the wire value as a 0-based index into `SECTIONS` (the natural Rust mapping, and
+consistent with how `get_type` already reads the i3/n3 bits as a 0-based enum). An
+off-by-one here silently decodes every section as its neighbour — exactly the
+score-poisoning failure this whole bug is about. So it is **gated by a golden
+vector**, not by reasoning: see the interop test below. If WSJT-X turns out to
+write `isec` 1-based, the fix is a single `± 1` isolated inside
+`section_index`/`section_name`, and the golden test is what tells us.
+
+> The full ordered `SECTIONS` list (`AB, AK, AL, AR, AZ, BC, CO, … WV, WWA, WY,
+> DX` — 85 entries) goes in `arrl_fd.rs`. **Transcribe it from WSJT-X
+> `unpack77.f90`'s `csec` array verbatim** rather than from memory or by sorting;
+> the order and the exact membership (note `GH`, `KP4`, `PR`, `VI`, `MAR`, the RAC
+> sections, trailing `DX`) are the contract.
+
+### Test plan
+
+Four buckets, fast→broad. All `cargo test -p modes`.
+
+1. **`arrl_fd.rs` unit tests — pure, no bits.** `parse_class` accept/reject table
+   (`3A`,`12E`,`32F` ok; `0A`,`33A`,`3G`,`3`,`R`,`ABC` rejected). `section_index ∘
+   section_name` round-trips all 85 entries; case/space folded (`" co "` → `CO`);
+   unknown (`ZZ`) → `None`; `DX` present. `FieldDayExchange::parse` accepts both
+   shapes (plain + rogered), sets `rogered` correctly, rejects 3-token input,
+   unknown-section input, and a non-FD 4-tuple; `parse` then `to_text` reproduces
+   the canonical string.
+
+2. **`message.rs` unit tests — full bit round-trip** (mirrors the existing
+   `roundtrip_std` helper):
+   - `field_day_exchange_roundtrips`: `encode_message("K1ABC N0JDC 3A CO")` ⇒
+     `get_type == ArrlFd` ⇒ `decode` ⇒ `"K1ABC N0JDC 3A CO"`.
+   - rogered form `"K1ABC N0JDC R 3A CO"`.
+   - `n3 = 4` path: `"K1ABC N0JDC 20A CO"` (ntx 20) round-trips — exercises the
+     transmitter-count split.
+   - spread of class letters `A`–`F` and multi-char sections (`SCV`, `EMA`, `DX`).
+   - **guard / no-regression:** the existing standard cases still encode as
+     `Standard` (a report like `"W9XYZ K1ABC R-09"` is *not* hijacked as FD), and a
+     4-word free-text line still falls through to free text.
+
+3. **Interop golden vector — the byte-compat gate.** Assert
+   `encode_message("K1ABC W9XYZ 6A WI")` equals a fixed `[u8; 10]` captured from
+   WSJT-X for that exact message (via `ft8code "K1ABC W9XYZ 6A WI"`, or by decoding
+   our synth with `jt9`). This single test pins `isec` 0-vs-1-based, MSB bit order,
+   and the `ntx − 1` offset simultaneously — self-consistency can't catch a
+   whole-table shift; this can. Captured once, then it's CI.
+
+4. **`lib.rs` synth round-trip, FT8 *and* FT4** (the STATUS "synth_message→decode
+   round-trip" item, now committed): synth `"K1ABC N0JDC 3A CO"` in each protocol,
+   `decode()` the audio, assert the message comes back. Mirrors
+   `synth_message_is_mode_aware_and_round_trips`.
+
+**On-air confirmation (manual, not CI):** the existing `ab_jt9` example diffs our
+decoder against `jt9` on captured WAVs — point it at a real FD slot to confirm the
+*decode* side against live WSJT-X traffic; `ft8code`/`jt9`-on-synth confirms the
+*encode* side. The golden vector bakes the encode check into CI so we don't depend
+on having a radio to stay correct.
+
+### Out of scope / follow-ups (tracked separately in `STATUS.md`)
+
+- Compound/portable (`/P`, `/R`) calls in the FD exchange — not representable in
+  the 28-bit FD call field; out of scope, documented in `encode_arrl_fd`.
+- The separate STATUS item "Log entries carry no FD-vs-normal tag" — unrelated to
+  packing; not touched here.
+- Closeout: once this lands and the golden vector is green, flip the 🔴 blocker in
+  `STATUS.md` to on-air-validation-only.
 
 ## References
 
