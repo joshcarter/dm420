@@ -20,6 +20,7 @@ use crate::theme::*;
 
 mod config_form;
 mod render;
+mod scan_overlay;
 mod send_row;
 use config_form::ConfigForm;
 use render::*;
@@ -417,7 +418,7 @@ impl Panel for Waterfall {
 
         let body_big = screen.width() > 24.0 && screen.height() > 24.0;
 
-        if ctx.unlocked {
+        if ctx.unlocked && !scanning {
             // Unlocked (GUI EDIT): the screen body becomes the radio/audio settings
             // form, which drives live hardware.
             if body_big {
@@ -474,7 +475,10 @@ impl Panel for Waterfall {
                         ctx.ui.id().with("ws_select"),
                         egui::Sense::click_and_drag(),
                     );
-                    self.apply_view_gestures(ctx.ui, body, &resp);
+                    // Frozen while scanning — the panel is non-interactive then.
+                    if !scanning {
+                        self.apply_view_gestures(ctx.ui, body, &resp);
+                    }
                     let (lo_frac, hi_frac) = self.view_fracs();
                     // Right half: real scrolling spectrogram (brightness = intensity),
                     // flowing right as the decode text flows left. NOW sits at
@@ -541,12 +545,12 @@ impl Panel for Waterfall {
                     // cursor) when disarmed, so the locked selection can't be
                     // overridden; pan/zoom stay live regardless. A double-click is a
                     // view reset (handled in `apply_view_gestures`), not a select.
-                    let resp = if armed {
+                    let resp = if armed || scanning {
                         resp
                     } else {
                         resp.on_hover_cursor(egui::CursorIcon::PointingHand)
                     };
-                    let click = if armed || resp.double_clicked() {
+                    let click = if armed || scanning || resp.double_clicked() {
                         None
                     } else {
                         resp.clicked().then(|| resp.interact_pointer_pos()).flatten()
@@ -770,6 +774,13 @@ impl Panel for Waterfall {
         // and commands (no local arm cadence to step).
         if !ctx.unlocked {
             self.draw_send_row(ctx, send_row);
+        }
+
+        // While the scanner sweeps, frame the inner screen with a hatched SCANNING
+        // border so it reads unmistakably as "scanning, hands off" — the live
+        // waterslide still shows underneath, but the panel ignores interaction (above).
+        if scanning {
+            scan_overlay::draw_scan_border(painter, screen, heading_bold(11.0), pal.accent);
         }
         // The selected-station highlight string is derived centrally (in `App::ui`)
         // from the published selection — the single owner — so no panel writes it.

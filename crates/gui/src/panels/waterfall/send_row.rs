@@ -39,7 +39,15 @@ impl Waterfall {
         // shortcut for the ranked station at that slot when disarmed.
         // Digit shortcuts are suppressed while a QSO is in progress or the TX
         // hold is active — assignments keep tracking, but keys don't fire.
-        let shortcuts_active = self.tx_hold.is_none()
+        // The scanner sweeping makes the panel non-interactive: suppress the digit /
+        // Tab / Q shortcuts (the `s` and ESC scan toggles stay live, gated separately).
+        let scanning = ctx
+            .bus
+            .scanner()
+            .map(|s| s.status == ScanStatus::Scanning)
+            .unwrap_or(false);
+        let shortcuts_active = !scanning
+            && self.tx_hold.is_none()
             && ctx
                 .bus
                 .qso_state()
@@ -344,7 +352,9 @@ impl Waterfall {
         // is busy, otherwise arm — answer the selected station, or call CQ on bare
         // spectrum. The target comes from the published selection above; the TX offset
         // is already placed (engine-owned), so arming carries only *who*.
-        if activate || btn.clicked() {
+        // Blocked while scanning — the panel is non-interactive; cancel a sweep with
+        // the SCAN button, s, or ESC instead.
+        if (activate || btn.clicked()) && !scanning {
             match self.send.activate() {
                 Activation::Command(cmd) => self.apply_command(ctx, cmd),
                 Activation::Toggle => {

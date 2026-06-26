@@ -317,7 +317,7 @@ pub(super) fn is_cq(d: &Decode) -> bool {
 ///
 /// `click` is the pointer position of a click this frame (if any); a click on a
 /// decoded line selects that station (snapping to its *true* audio offset, never
-fn draw_hatch(painter: &egui::Painter, strip: Rect, color: Color32) {
+pub(super) fn draw_hatch(painter: &egui::Painter, strip: Rect, color: Color32) {
     let p = painter.with_clip_rect(strip);
     let h = strip.height().max(1.0);
     let stroke = egui::Stroke::new(1.5, color);
@@ -331,7 +331,24 @@ fn draw_hatch(painter: &egui::Painter, strip: Rect, color: Color32) {
     }
 }
 
-fn draw_tx_hatch_row(
+/// Vertical sibling of [`draw_hatch`]: the same 45° diagonals filling a *tall, thin*
+/// strip (the left/right edges of the scanning border), stepping down in `y` so each
+/// line spans the strip's narrow width rather than its full height.
+pub(super) fn draw_hatch_v(painter: &egui::Painter, strip: Rect, color: Color32) {
+    let p = painter.with_clip_rect(strip);
+    let w = strip.width().max(1.0);
+    let stroke = egui::Stroke::new(1.5, color);
+    let mut y = strip.top() - w;
+    while y < strip.bottom() {
+        p.line_segment(
+            [Pos2::new(strip.left(), y + w), Pos2::new(strip.right(), y)],
+            stroke,
+        );
+        y += 7.0;
+    }
+}
+
+pub(super) fn draw_tx_hatch_row(
     painter: &egui::Painter,
     x_left: f32,
     x_right: f32,
