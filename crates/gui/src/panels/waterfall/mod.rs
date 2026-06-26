@@ -342,7 +342,7 @@ impl Panel for Waterfall {
                 hz % 1_000 / 10
             )
         };
-        crate::chrome::lcd_readout(
+        let freq_chip = crate::chrome::lcd_readout(
             painter,
             pal,
             header.center().x,
@@ -367,7 +367,7 @@ impl Panel for Waterfall {
         let scan_cell_w = measure(painter, &tracked(scan_label), heading_bold(9.0)) + 14.0;
         let scan_track_w = scan_cell_w + 4.0;
         let scan_track = Rect::from_center_size(
-            Pos2::new(header.center().x + 48.0 + scan_track_w * 0.5, cy),
+            Pos2::new(freq_chip.right() + 14.0 + scan_track_w * 0.5, cy),
             egui::Vec2::new(scan_track_w, 20.0),
         );
         lcd_panel(painter, scan_track, pal, 4);
@@ -780,7 +780,7 @@ impl Panel for Waterfall {
         // border so it reads unmistakably as "scanning, hands off" — the live
         // waterslide still shows underneath, but the panel ignores interaction (above).
         if scanning {
-            scan_overlay::draw_scan_border(painter, screen, heading_bold(11.0), pal.accent);
+            scan_overlay::draw_scan_border(painter, screen, heading_bold(16.5), pal.accent);
         }
         // The selected-station highlight string is derived centrally (in `App::ui`)
         // from the published selection — the single owner — so no panel writes it.

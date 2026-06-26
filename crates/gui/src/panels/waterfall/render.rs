@@ -348,6 +348,7 @@ pub(super) fn draw_hatch_v(painter: &egui::Painter, strip: Rect, color: Color32)
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn draw_tx_hatch_row(
     painter: &egui::Painter,
     x_left: f32,
@@ -356,8 +357,9 @@ pub(super) fn draw_tx_hatch_row(
     label: &str,
     font: egui::FontId,
     color: Color32,
+    strip_h: f32,
 ) {
-    let half_h = WS_HATCH_STRIP_H * 0.5;
+    let half_h = strip_h * 0.5;
     let label_gap = 6.0;
     let label_w = measure(painter, label, font.clone());
     let cx = (x_left + x_right) * 0.5;
@@ -871,6 +873,7 @@ pub(super) fn draw_waterslide(
                 &state_label,
                 hatch_font.clone(),
                 lane,
+                WS_HATCH_STRIP_H,
             );
             draw_tx_hatch_row(
                 &painter,
@@ -880,6 +883,7 @@ pub(super) fn draw_waterslide(
                 &state_label,
                 hatch_font,
                 lane,
+                WS_HATCH_STRIP_H,
             );
             painter.text(
                 Pos2::new(rect.left() + 4.0, top_row_y - WS_HATCH_STRIP_H * 0.5 - 1.0),
