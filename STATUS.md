@@ -13,10 +13,6 @@
 - [ ] **Log entries carry no FD-vs-normal tag** — — — `LogEntry` has no contest/exchange-kind field; `3A WI` vs. `-07` is only inferable by parsing the exchange string (the stored `Section` is a weak proxy). Add an explicit tag (serde-default for back-compat), set from `is_field_day()` at construction. Cheap; matters for clean export/scoring.
 - [ ] **Shared-logbook group dupes + origin UI (multi-op headline)** — J — MVP transport (push/merge/catch-up) is landed and peer entries already flow onto `logbook/entries`, but the worked producer still hard-codes `WorkedByMe` (`crates/core/src/worked.rs:94`) — peers' QSOs aren't classified `WorkedByNetwork`, so a teammate's contact is not yet a group dupe or rendered origin-distinct. Classify by `entry.origin` + add origin-distinct UI (`docs/networking.md`).
 
-### Joel's notes on this section
-
-I think we can disregard the log reset. The rationale is we can just move our old log files to another location and start with clean logs for field day and then archive / parse / score those logs after field day. This will save us a task we don't have time for. The tagging would be good because Josh pointed out that if we have various non-FD contacts appear in the log those would be more easily identifible and filterable.
-
 ## Field Day Desired
 
 - [ ] **Multi-caller auto-pick (pileups)** — J — the FD norm is several stations answering one CQ slot; auto-select the highest-SNR non-dupe, exclude calls a peer is working, highlight all answerers, and allow number-key override (`docs/qso_flow.md` §6). Not started.
