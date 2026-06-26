@@ -811,6 +811,11 @@ pub struct WorkingTarget {
     pub radio: RadioId,
     pub band: Band,
     pub offset: OffsetHz,
+    /// The peer's dial (center) frequency the `offset` is measured against. Peers
+    /// on the same band may sit on different dials; a consumer must re-base the
+    /// offset onto its own dial (`offset + peer.dial - my.dial`) before placing it,
+    /// or two stations 1 kHz apart but both at the same audio offset would collide.
+    pub dial: AbsHz,
     /// The target station, once known (unknown while merely armed to a frequency).
     pub call: Option<Callsign>,
 }

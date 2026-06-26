@@ -134,8 +134,13 @@ pub struct PeerWorking {
     pub station: String,
     /// The band the peer is working — the panel filters to the local band.
     pub band: Band,
-    /// The peer's TX audio offset (Hz), placed on the waterslide's vertical axis.
+    /// The peer's TX audio offset (Hz), measured against *their* dial (`dial`).
+    /// Re-base onto the local dial before placing it on the vertical axis.
     pub offset: f32,
+    /// The peer's dial (center) frequency in Hz, the reference for `offset`. Peers
+    /// on the same band may sit on different dials, so the panel shifts `offset` by
+    /// `peer.dial - my.dial` before drawing.
+    pub dial: u64,
     /// The call the peer is working, once known (`None` while merely armed).
     pub call: Option<String>,
     /// Local receipt instant of the peer's latest snapshot, for the staleness cut.
@@ -629,6 +634,7 @@ impl BusView {
                     station: p.snap.station.0.clone(),
                     band: w.band,
                     offset: w.offset.0,
+                    dial: w.dial.0,
                     call: w.call.as_ref().map(|c| c.0.clone()),
                     last_seen: p.last_seen,
                 })

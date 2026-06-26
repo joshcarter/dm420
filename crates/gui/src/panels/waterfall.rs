@@ -975,12 +975,13 @@ impl Panel for Waterfall {
                     // band); off-band (`None`) draws no peers. Sorted high→low offset
                     // so the renderer's label stagger cascades downward. Display-only:
                     // these offsets never drive a retune.
-                    let local_band = ctx
-                        .bus
-                        .rig_state()
-                        .map(|r| r.vfo.0)
-                        .and_then(|hz| Band::from_hz(AbsHz(hz)));
+                    let my_dial = ctx.bus.rig_state().map(|r| r.vfo.0);
+                    let local_band = my_dial.and_then(|hz| Band::from_hz(AbsHz(hz)));
                     let peer_ticks: Vec<PeerTick> = {
+                        // Peers pass the band filter only when `local_band` is `Some`,
+                        // which implies `my_dial` is `Some`; the `0` fallback is never
+                        // reached for a peer that survives the filter below.
+                        let my_dial_hz = my_dial.unwrap_or(0);
                         let stale = std::time::Duration::from_secs(PEER_STALE_SECS);
                         let mut ticks: Vec<PeerTick> = ctx
                             .bus
@@ -993,7 +994,14 @@ impl Panel for Waterfall {
                                     Some(call) => format!("{} \u{00B7} {}", p.station, call),
                                     None => p.station.clone(),
                                 };
-                                PeerTick { offset: p.offset, label }
+                                // Re-base the peer's offset onto our dial: a peer on
+                                // the same band but a different dial sits at a different
+                                // audio offset on our waterslide (offset + their dial -
+                                // our dial). Without this, two stations 1 kHz apart but
+                                // both at e.g. 1500 Hz would draw on the same line.
+                                let delta = p.dial as i64 - my_dial_hz as i64;
+                                let offset = p.offset + delta as f32;
+                                PeerTick { offset, label }
                             })
                             .collect();
                         ticks.sort_by(|a, b| b.offset.total_cmp(&a.offset));
@@ -1969,14 +1977,15 @@ fn draw_waterslide(
 
     // Deconfliction overlay: other operators' working offsets, beaconed over the
     // LAN. Each is a thin DASHED full-width rule with a hollow caret + small label
-    // in the secondary accent (`accent2`) — deliberately unlike our own solid,
-    // hatched TX band so "theirs" never reads as "mine" (heard ≠ worked, peers ≠
-    // me). Drawn before the TX lane so our own band sits on top. The caller has
-    // already culled stale and off-band peers and sorted them high→low offset;
-    // here we only cull out-of-window offsets and stagger colliding labels. This is
-    // display-only — nothing here retunes the rig from peer data.
+    // in the primary accent (`accent`) — the DASHED rule + hollow caret (vs. our own
+    // solid, hatched TX band) is what keeps "theirs" from reading as "mine" (heard ≠
+    // worked, peers ≠ me). Drawn before the TX lane so our own band sits on top. The
+    // caller has already culled stale and off-band peers, re-based their offsets onto
+    // our dial, and sorted them high→low offset; here we only cull out-of-window
+    // offsets and stagger colliding labels. Display-only — nothing here retunes the
+    // rig from peer data.
     if !peers.is_empty() {
-        let peer_col = pal.accent2;
+        let peer_col = pal.accent;
         let peer_line = egui::Stroke::new(1.0, peer_col.gamma_multiply(0.65));
         let label_h = snr_pt + 3.0; // min vertical gap between staggered labels
         let mut last_label_y = f32::NEG_INFINITY;

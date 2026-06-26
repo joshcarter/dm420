@@ -394,7 +394,8 @@ fn assemble_working(
     // `tx_offset` is effectively always `Some` once the QSO engine is up, but treat
     // a missing offset as "nothing to advertise yet".
     let offset = last_qso.as_ref()?.tx_offset?;
-    let band = Band::from_hz(last_rig.as_ref()?.vfo)?;
+    let dial = last_rig.as_ref()?.vfo;
+    let band = Band::from_hz(dial)?;
     // `partner` may be `None` (idle / armed-to-a-frequency): we still advertise the
     // tuned position so idle operators are visible, not just active QSOs.
     let call = last_qso.as_ref().and_then(|q| q.partner.clone());
@@ -402,6 +403,7 @@ fn assemble_working(
         radio: radio.clone(),
         band,
         offset,
+        dial,
         call,
     })
 }
