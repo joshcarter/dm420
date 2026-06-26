@@ -4,7 +4,8 @@
 //! construction lives in the `qso` crate and must stay separate.
 
 use types::{
-    Band, Callsign, Decode, DecodeContent, ExchangePayload, OverAirMode, ParsedMessage, Signoff,
+    Band, Callsign, ContestTag, Decode, DecodeContent, ExchangePayload, OverAirMode, ParsedMessage,
+    Signoff,
 };
 
 /// SNR like the rest of the console: Unicode minus, two digits.
@@ -17,10 +18,21 @@ pub(crate) fn fmt_snr(snr: i8) -> String {
 pub(crate) fn decode_text(d: &Decode) -> String {
     match &d.content {
         DecodeContent::Slotted { message, raw, .. } => match message {
-            ParsedMessage::Cq { caller, grid, .. } => match grid {
-                Some(g) => format!("CQ {} {}", display_call(caller, raw), g.0),
-                None => format!("CQ {}", display_call(caller, raw)),
-            },
+            ParsedMessage::Cq { caller, contest, grid } => {
+                // Re-emit the CQ modifier the parser captured (e.g. Field Day's `FD`),
+                // built as an owned String so the grid/no-grid arms stay uniform —
+                // otherwise it silently drops, showing `CQ FD …` as a plain `CQ …`.
+                let m: String = match contest {
+                    Some(ContestTag::FieldDay) => "FD ".into(),
+                    Some(ContestTag::Test) => "TEST ".into(),
+                    Some(ContestTag::Other(s)) => format!("{s} "),
+                    None => String::new(),
+                };
+                match grid {
+                    Some(g) => format!("CQ {m}{} {}", display_call(caller, raw), g.0),
+                    None => format!("CQ {m}{}", display_call(caller, raw)),
+                }
+            }
             ParsedMessage::Exchange { to, from, payload } => {
                 format!(
                     "{} {} {}",
