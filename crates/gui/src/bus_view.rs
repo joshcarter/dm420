@@ -347,10 +347,10 @@ impl BusView {
             decodes.clone(),
             egui_ctx.clone(),
         );
-        // Heard stations for the map: a second decode subscriber that keeps a
+        // Heard stations for the map: an enriched-decode subscriber that keeps a
         // longer-lived (call → grid) map than the bounded `decodes` ring. Runs in
         // both modes — heard spots come from whatever decoder is live.
-        pump_heard(&bus, heard.clone(), rig.clone(), egui_ctx.clone());
+        pump_heard(&bus, heard.clone(), egui_ctx.clone());
         // Health for the rig + audio subsystems — drives the panels' fault display.
         for id in [SubsystemId::Rig, SubsystemId::Audio] {
             pump_health(&bus, id, health.clone(), egui_ctx.clone());
@@ -1033,37 +1033,43 @@ fn pump_stream<T: BusMessage>(
 
 /// Spawn a pump that folds grid-bearing decodes into the heard-stations map
 /// (call → newest [`HeardEntry`]). Lets the Contacts map plot stations heard but
-/// not worked, retained far longer than the bounded `decodes` ring. The band is
-/// taken from the rig's current dial frequency at decode time, so the map can apply
-/// the same per-band "worked" rule as the waterslide.
+/// not worked, retained far longer than the bounded `decodes` ring. Reads the
+/// *enriched* stream, so the band and absolute frequency come from the decode's
+/// per-slot attribution (the dial its slot was actually captured on) rather than the
+/// live VFO — correct even when a band scan has hopped between capture and decode. The
+/// map can then apply the same per-band "worked" rule as the waterslide.
 fn pump_heard(
     bus: &BusHandle,
     heard: Arc<Mutex<HashMap<String, HeardEntry>>>,
-    rig: Cell<RigState>,
     ctx: egui::Context,
 ) {
-    let mut sub =
-        match bus.subscribe::<Decode>(TopicSelector::Exact(Topic::Decodes(app_core::radio_id()))) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("bus_view: heard subscribe failed: {e:?}");
-                return;
-            }
-        };
+    let mut sub = match bus.subscribe::<EnrichedDecode>(TopicSelector::Exact(
+        Topic::DecodesEnriched(app_core::radio_id()),
+    )) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("bus_view: heard subscribe failed: {e:?}");
+            return;
+        }
+    };
     tokio::spawn(async move {
         loop {
             match sub.recv().await {
-                Ok(d) => {
-                    if let Some((call, loc, cq)) = station_locator(&d) {
-                        let t = d.t.0;
-                        // The rig's current dial — gives both the band this station
-                        // was heard on and the absolute frequency we saw it at
-                        // (dial + audio offset). `None` if the rig state isn't known.
-                        let vfo = rig.lock().unwrap().as_ref().map(|r| r.vfo.0);
-                        let band = vfo.and_then(|hz| Band::from_hz(AbsHz(hz)));
-                        let abs = vfo.map(|v| AbsHz(v + d.offset.0.round().max(0.0) as u64));
+                Ok(ed) => {
+                    // The enricher doesn't expose grid/section + CQ directly, so parse
+                    // them off the embedded raw decode with the shared helper.
+                    if let Some((call, loc, cq)) = station_locator(&ed.decode) {
+                        let t = ed.decode.t.0;
+                        // Band + dial are per-slot attributed by the enricher, so they
+                        // reflect where the radio was when this slot was *captured* —
+                        // immune to a scanner hop between capture and decode. The
+                        // absolute frequency is that recorded dial + the audio offset.
+                        let band = Some(ed.band);
+                        let abs = ed
+                            .dial
+                            .map(|d| AbsHz(d.0 + ed.decode.offset.0.round().max(0.0) as u64));
                         // The slot this decode landed in (for a click-built DecodeRef).
-                        let slot = match &d.content {
+                        let slot = match &ed.decode.content {
                             DecodeContent::Slotted { slot, .. } => *slot,
                             _ => SlotId(0),
                         };

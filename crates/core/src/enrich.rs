@@ -18,7 +18,11 @@
 //! timeline: on every clock / rig / scanner update we stamp
 //! `slot_band[current_slot] = resolved_band`, where the resolved band is the
 //! scanner's *commanded* band while sweeping (authoritative — published right at the
-//! hop) or [`Band::from_hz`] of the dial otherwise. Because a decode for slot `S`
+//! hop) or [`Band::from_hz`] of the dial otherwise. The same per-slot stamping also
+//! records the *actual* dial (`slot_dial[current_slot] = resolved_dial`, the live
+//! VFO — deliberately not the calling frequency, since operation may sit off it), so
+//! a consumer can reconstruct each heard station's absolute frequency correctly even
+//! across a hop. Because a decode for slot `S`
 //! can't arrive until `S` has ended, `slot_band[S]` has had the whole slot to settle
 //! on the right band — so even the first slot after a hop is attributed correctly,
 //! despite the CAT echo landing a beat late. (Mirrors `core::scan`'s private
@@ -107,8 +111,8 @@ async fn run(bus: BusHandle, radio: RadioId) {
     }
 }
 
-/// The per-slot band timeline plus the latest worked set — everything needed to
-/// enrich a decode, kept pure so it tests without the bus (like `core::worked`).
+/// The per-slot band + dial timeline plus the latest worked set — everything needed
+/// to enrich a decode, kept pure so it tests without the bus (like `core::worked`).
 #[derive(Default)]
 struct Timeline {
     /// The slot the clock is currently in (`clock/status`).
@@ -120,6 +124,8 @@ struct Timeline {
     scan_band: Option<Band>,
     /// Which band each recent slot was received on (bounded to [`SLOT_BAND_KEEP`]).
     slot_band: HashMap<SlotId, Band>,
+    /// Which dial each recent slot was received on (bounded to [`SLOT_BAND_KEEP`]).
+    slot_dial: HashMap<SlotId, AbsHz>,
     /// Latest authoritative worked set (`logbook/worked`).
     worked: WorkedSet,
 }
@@ -132,13 +138,26 @@ impl Timeline {
             .or_else(|| self.latest_vfo.and_then(Band::from_hz))
     }
 
-    /// Record the current slot's band. Called on every clock / rig / scanner update,
-    /// so `slot_band[S]` keeps settling for the whole ~slot that `S` is live — and a
-    /// decode for `S` (which can't arrive until `S` ends) reads the settled value.
+    /// The dial the radio is actually on now — the live VFO. Deliberately NOT
+    /// `calling_freq`: operation (and a future scanner) may sit off the calling
+    /// frequency, so we record where the dial truly is.
+    fn resolved_dial(&self) -> Option<AbsHz> {
+        self.latest_vfo
+    }
+
+    /// Record the current slot's band + dial. Called on every clock / rig / scanner
+    /// update, so each `slot_*[S]` keeps settling for the whole ~slot that `S` is live
+    /// — and a decode for `S` (which can't arrive until `S` ends) reads the settled
+    /// value.
     fn stamp(&mut self) {
         if let (Some(slot), Some(band)) = (self.cur_slot, self.resolved_band()) {
             self.slot_band.insert(slot, band);
             self.slot_band
+                .retain(|s, _| s.0 + SLOT_BAND_KEEP >= slot.0);
+        }
+        if let (Some(slot), Some(dial)) = (self.cur_slot, self.resolved_dial()) {
+            self.slot_dial.insert(slot, dial);
+            self.slot_dial
                 .retain(|s, _| s.0 + SLOT_BAND_KEEP >= slot.0);
         }
     }
@@ -151,6 +170,10 @@ impl Timeline {
             return None;
         };
         let band = *self.slot_band.get(slot)?;
+        // Best-effort, unlike `band`: a decode whose slot has a known band but no
+        // recorded dial must still be emitted, so don't `?` here. (Computed before the
+        // literal below moves `d`, since `slot` borrows `d.content`.)
+        let dial = self.slot_dial.get(slot).copied();
         let (callsign, grid) = station_and_grid(message);
         let worked = callsign
             .as_ref()
@@ -161,6 +184,7 @@ impl Timeline {
             grid,
             worked,
             band,
+            dial,
         })
     }
 

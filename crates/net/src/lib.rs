@@ -1091,6 +1091,7 @@ mod tests {
             grid: grid.map(|g| GridSquare(g.into())),
             worked: WorkedStatus::New,
             band,
+            dial: None,
         }
     }
 

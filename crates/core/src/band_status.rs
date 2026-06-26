@@ -280,6 +280,7 @@ mod tests {
             grid: None,
             worked: WorkedStatus::New,
             band,
+            dial: None,
         }
     }
 

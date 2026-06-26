@@ -310,6 +310,11 @@ pub struct EnrichedDecode {
     /// The RF band the decode's slot was received on. The dial isn't on the raw
     /// [`Decode`] (it's audio-domain), so the enricher resolves and stamps it here.
     pub band: Band,
+    /// The dial (VFO) frequency in effect when this decode's slot was captured,
+    /// resolved per-slot like `band` (so a scanner hop between capture and decode
+    /// can't mis-attribute it). `None` until the dial is known. The station's
+    /// absolute frequency is `dial + decode.offset`.
+    pub dial: Option<AbsHz>,
 }
 
 // =====================================================================
@@ -1268,6 +1273,7 @@ mod tests {
             grid: Some(GridSquare("DN70".into())),
             worked: WorkedStatus::WorkedByNetwork(StationId("peer-1".into())),
             band: Band::B20m,
+            dial: Some(AbsHz(14_074_000)),
         });
         round_trip(WorkedSet::default());
         round_trip(WorkedSet {
