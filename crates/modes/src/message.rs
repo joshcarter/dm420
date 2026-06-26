@@ -2,9 +2,10 @@
 //!
 //! Ported from ft8_lib `message.c` (algorithm ours, bit layouts are the spec).
 //! We implement the message types that make up essentially all normal traffic:
-//! Standard (i3 = 1/2: CQ / calls / grids / reports), Free text (0.0),
-//! Non-standard calls (i3 = 4), and Telemetry (0.5). Callsign hashing uses a
-//! session-lived table so hashed `<CALL>` references resolve across slots.
+//! Standard (i3 = 1/2: CQ / calls / grids / reports), Free text (0.0), ARRL Field
+//! Day (0.3/0.4: count+class + section — see the `arrl_fd` module), Non-standard
+//! calls (i3 = 4), and Telemetry (0.5). Callsign hashing uses a session-lived table
+//! so hashed `<CALL>` references resolve across slots.
 
 use crate::arrl_fd::{self, FieldDayExchange};
 use crate::crc;

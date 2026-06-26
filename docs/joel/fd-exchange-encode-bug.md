@@ -200,11 +200,12 @@ parsing) and keeps the bit math encapsulated with the other message types.
 **1. New module `crates/modes/src/arrl_fd.rs`** (declared `mod arrl_fd;` in
 `lib.rs`, alongside `mod message;` — matches the crate's flat-module convention):
 
-- `pub(crate) const SECTIONS: [&str; 85]` — the canonical WSJT-X `csec` table, in
-  the **exact order** `unpack77.f90` uses. The array index *is* the 7-bit `isec`
-  wire value, so the ordering is the interop contract (see "Why WSJT-X order" in
-  this doc). A doc comment says so, and warns against "fixing" it to alphabetical
-  or aligning it to `gui/panel_data.rs`'s geographic `SECTIONS`.
+- `const SECTIONS: [&str; 86]` — the canonical WSJT-X `csec` table, transcribed
+  verbatim from `packjt77.f90`. The wire `isec` is this array's index **+ 1**
+  (WSJT-X is 1-based), so the ordering *and* membership are the interop contract
+  (see "Why WSJT-X order" in this doc). A doc comment says so, and warns against
+  "fixing" it to alphabetical or aligning it to `gui/panel_data.rs`'s geographic
+  `SECTIONS`.
 - `section_index(sec: &str) -> Option<u8>` / `section_name(isec: u8) -> Option<&'static str>`
   — case-insensitive, trimmed; `None` for unknown (lets non-FD text fall through).
 - `Class` parsing: `parse_class(tok: &str) -> Option<(u8 /*ntx 1..=32*/, u8 /*idx 0..=5*/)>`
@@ -245,27 +246,29 @@ n28b     28   call_de
 ir        1   1 ⇒ exchange carries the leading "R" (the rogered Tx3)
 intx      4   transmitter count − 1, low nibble  (combine with n3)
 nclass    3   class letter A..F → 0..5
-isec      7   section index into SECTIONS (0-based)        ← interop-critical
+isec      7   section index, **1-based** (wire = table index + 1)  ← interop-critical
 n3        3   3 ⇒ ntx 1..16,  4 ⇒ ntx 17..32   ⇒  ntx = intx + 1 + 16·(n3 − 3)
 i3        3   0
         ─────
          77   (+ 3 pad bits to fill 10 bytes)
 ```
 
-⚠️ **The one spec detail to pin, not guess: is `isec` 0-based?** This plan treats
-the wire value as a 0-based index into `SECTIONS` (the natural Rust mapping, and
-consistent with how `get_type` already reads the i3/n3 bits as a 0-based enum). An
-off-by-one here silently decodes every section as its neighbour — exactly the
-score-poisoning failure this whole bug is about. So it is **gated by a golden
-vector**, not by reasoning: see the interop test below. If WSJT-X turns out to
-write `isec` 1-based, the fix is a single `± 1` isolated inside
-`section_index`/`section_name`, and the golden test is what tells us.
+✅ **Resolved — this was the one to pin, not guess, and the guess was wrong.** The
+plan assumed `isec` was 0-based; it is **1-based** (WSJT-X writes the section's
+1-based position, valid `1..=86`). The golden vector earned its keep: cross-checking
+`ft8code` immediately exposed *both* the 0-based assumption *and* a `SECTIONS` table
+I'd built from memory that was simply wrong (bogus `KP4`/`MAR`/`NT`/`TX`, missing
+`NS`/`TER`/`NTX`/`PE`/`NB`, 85 vs 86). Self-consistent round-trips passed the whole
+time — only the external reference caught it. Validated against the WSJT-X source
+(`/Users/Shared/wsjtx/lib/77bit/packjt77.f90`): `isec=i` over `do i=1,NSEC`,
+`NSEC=86`, `format(2b28,b1,b4,b3,b7,2b3)`. Fix: `SECTIONS` stays 0-based in Rust and
+the wire layer applies the `+1` (isolated in `encode_arrl_fd`/`decode_arrl_fd`).
 
-> The full ordered `SECTIONS` list (`AB, AK, AL, AR, AZ, BC, CO, … WV, WWA, WY,
-> DX` — 85 entries) goes in `arrl_fd.rs`. **Transcribe it from WSJT-X
-> `unpack77.f90`'s `csec` array verbatim** rather than from memory or by sorting;
-> the order and the exact membership (note `GH`, `KP4`, `PR`, `VI`, `MAR`, the RAC
-> sections, trailing `DX`) are the contract.
+> The full `SECTIONS` list (**86 entries**, `AB … WI … DX, PE, NB`) is transcribed
+> **verbatim from `packjt77.f90`'s `csec` array** — not from memory, which is how it
+> went wrong the first time. Membership is exact: **no** `KP4` (Puerto Rico is `PR`),
+> **no** bare `TX` (it's `STX`/`WTX`/`NTX`); `NS`/`TER` are the current spellings
+> (older WSJT-X used `MAR`/`NT`), and `PE`/`NB` (RAC) close the list.
 
 ### Test plan
 
@@ -273,7 +276,7 @@ Four buckets, fast→broad. All `cargo test -p modes`.
 
 1. **`arrl_fd.rs` unit tests — pure, no bits.** `parse_class` accept/reject table
    (`3A`,`12E`,`32F` ok; `0A`,`33A`,`3G`,`3`,`R`,`ABC` rejected). `section_index ∘
-   section_name` round-trips all 85 entries; case/space folded (`" co "` → `CO`);
+   section_name` round-trips all 86 entries; case/space folded (`" co "` → `CO`);
    unknown (`ZZ`) → `None`; `DX` present. `FieldDayExchange::parse` accepts both
    shapes (plain + rogered), sets `rogered` correctly, rejects 3-token input,
    unknown-section input, and a non-FD 4-tuple; `parse` then `to_text` reproduces
