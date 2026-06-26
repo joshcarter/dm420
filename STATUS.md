@@ -8,7 +8,6 @@
 >
 > _Cleared since last update — now in `main`, evaluated and **no longer blockers** (need **on-air** validation, not code): per-`(call,band)` dupe tracking via the single-owner `WorkedStatus` producer, with mode **deliberately collapsed** (the ARRL-correct digital rule — 20 m FT8 ⇒ dupe on 20 m FT4; supersedes the old "per-band/per-**mode**" framing); the "CQ answered with a report, not grid" drop (P3, `engine.rs:353`, correctly gated **off** in FD); the class/section log columns (`engine.rs:1191`; generic `SNT`/`RCV` columns already render the exchange string); the **Contest-mode setup UI gate** itself (CONTEST selector → `Station` → `[station]` persistence → `to_qso_config()`); and **the FD exchange encode/decode itself** — the `modes` packer now implements the ARRL-FD message type (i3 = 0.3/0.4) in `crates/modes/src/arrl_fd.rs` + `message.rs`, **validated byte-for-byte against the WSJT-X source** (`lib/77bit/packjt77.f90`): three golden-vector tests assert payload byte-identity with `ft8code`, and WSJT-X's `jt9` decodes our synthesized FD signal end-to-end in **FT8 and FT4** (our decoder reads it back to `FieldDay{class,section}`). The earlier "i3=3 / 0-based isec" framing was wrong — it is i3 = 0.3/0.4 with a **1-based** section index into the 86-entry `csec` table._
 
-- [ ] **On-air validation of the FD QSO flow** — W/J — the FSM and the P1–P3 fixes are landed and unit-tested but have never run against real radios; reproduce/diagnose the earlier on-air symptoms against the now-landed engine. **The FD exchange encode/decode is now WSJT-X-validated off-air** (see the cleared list above — golden vectors + `jt9` round-trip), so this item is the QSO-flow timing and the live RF pipeline, **not** the message format. Subsumes the old "report not grid is ignored" item (the P3 fix is in — verify it on air) and gates on completing a real **FT4** contact (`docs/live_pipeline_notes.md`).
 - [ ] **Log entries carry no FD-vs-normal tag** — — — `LogEntry` has no contest/exchange-kind field; `3A WI` vs. `-07` is only inferable by parsing the exchange string (the stored `Section` is a weak proxy). Add an explicit tag (serde-default for back-compat), set from `is_field_day()` at construction. Cheap; matters for clean export/scoring.
 
 ## Field Day Desired
@@ -20,6 +19,8 @@
 - [ ] Selection during scanning needs to be disabled--map and/or decode panel
 
 - [ ] Band scan needs to publish results to network
+
+- [ ] Reply to non-participating stations who send an answer to CQ using a non-participating / standard message format.
 
 ## Weird QSO State Thing
 
