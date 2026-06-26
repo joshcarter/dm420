@@ -422,6 +422,7 @@ fn build_log(
         exchange_rcvd: done.exchange_rcvd,
         grid: done.grid,
         section: done.section,
+        contest: done.contest,
     }
 }
 
@@ -437,6 +438,7 @@ mod tests {
             section: None,
             exchange_sent: "5NN".into(),
             exchange_rcvd: "5NN".into(),
+            contest: None,
         }
     }
 

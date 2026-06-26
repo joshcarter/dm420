@@ -43,6 +43,7 @@ fn sample_entry(origin: &str, seq: u64) -> LogEntry {
         exchange_rcvd: "-12".into(),
         grid: None,
         section: None,
+        contest: None,
     }
 }
 

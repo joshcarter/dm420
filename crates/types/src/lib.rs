@@ -153,6 +153,16 @@ pub enum ContestProfile {
     ArrlFieldDay,
 }
 
+/// The contest a logged contact counts toward — a per-contact *fact* about what the
+/// completed exchange actually was. Deliberately distinct from [`ContestProfile`]
+/// (the operating *mode* the engine builds messages from): a station worked while we
+/// run Field Day that answered with a plain grid+report is logged with `contest: None`,
+/// because no contest exchange happened. `None` means a normal (non-contest) QSO.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Contest {
+    ArrlFieldDay,
+}
+
 /// Whether a spectrum row / decode is received signal or our own transmission —
 /// lets the waterslide render own-TX distinctly.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -685,6 +695,13 @@ pub struct LogEntry {
     /// logs written before this field was added loadable.
     #[serde(default)]
     pub section: Option<Section>,
+    /// The contest this contact counts toward, set only when the completed exchange was
+    /// a recognized contest exchange (today: Field Day class+section). `None` for normal
+    /// QSOs — including ones worked *during* Field Day that completed as a plain
+    /// grid+report. `#[serde(default)]` (matching `section`) keeps logs written before
+    /// this field was added loadable.
+    #[serde(default)]
+    pub contest: Option<Contest>,
     // ...remaining ADIF-mappable fields land here as the logbook crate grows.
 }
 
@@ -1419,9 +1436,36 @@ mod tests {
             exchange_rcvd: "R-12".into(),
             grid: Some(GridSquare("EM73".into())),
             section: None,
+            contest: None,
         });
         round_trip(WorkedStatus::New);
         round_trip(WorkedStatus::WorkedByMe);
+    }
+
+    /// Back-compat: a log line written before the `contest` field existed carries no
+    /// `contest` key. `#[serde(default)]` — the same mechanism `section` relies on —
+    /// must load such a line with `contest: None`, so pre-existing logs keep loading.
+    #[test]
+    fn log_entry_without_contest_key_defaults_to_none() {
+        let old_line = r#"{
+            "id": {"origin": "station-a", "seq": 17},
+            "radio": "k1",
+            "call": "W4LL",
+            "mode": "Ft8",
+            "band": "B20m",
+            "freq": 14074000,
+            "time": 1700000000000,
+            "exchange_sent": "-09",
+            "exchange_rcvd": "R-12",
+            "grid": "EM73",
+            "section": null
+        }"#;
+        let entry: LogEntry =
+            serde_json::from_str(old_line).expect("pre-contest log line deserializes");
+        assert_eq!(entry.contest, None, "absent contest key defaults to None");
+        // The rest still loads, so the assertion above isn't passing for a parse reason.
+        assert_eq!(entry.call, Callsign("W4LL".into()));
+        assert_eq!(entry.section, None);
     }
 
     #[test]
@@ -1509,6 +1553,7 @@ mod tests {
             exchange_rcvd: "3A WCF".into(),
             grid: None,
             section: None,
+            contest: None,
         }
     }
 
