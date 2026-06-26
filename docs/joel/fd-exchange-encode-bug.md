@@ -4,6 +4,18 @@
 > Tracks the 🔴 blocker in `STATUS.md`: "FD exchange won't encode — `modes`
 > packer has no Field Day message type." Written 2026-06-26.
 
+> **Implementation status (2026-06-26): landed on branch `fd-exchange-encode-writeup`.**
+> The plan below is now code, contained to `crates/modes/`: a pure `arrl_fd`
+> module (section table + `<count><class>` grammar + the `FieldDayExchange` pivot)
+> and the wire pack/unpack (`encode_arrl_fd`/`decode_arrl_fd`) in `message.rs`,
+> dispatched from `encode_message`/`decode`. `cargo test -p modes`,
+> `cargo clippy -p modes --all-targets -- -D warnings`, and the workspace build all
+> pass; `core`/`qso` tests unaffected. **One item is deliberately still open:** the
+> WSJT-X interop golden vector (`field_day_matches_wsjtx_golden_vector`) is
+> `#[ignore]`d until its reference bytes are captured from `ft8code`/`jt9` — the
+> on-air radio test is the final interop gate, after which the `STATUS.md` blocker
+> drops to on-air-validation-only.
+
 ## TL;DR
 
 The Field Day bare exchange `<his> <mine> <class> <section>` (the over right after

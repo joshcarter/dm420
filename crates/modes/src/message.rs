@@ -6,6 +6,7 @@
 //! Non-standard calls (i3 = 4), and Telemetry (0.5). Callsign hashing uses a
 //! session-lived table so hashed `<CALL>` references resolve across slots.
 
+use crate::arrl_fd::{self, FieldDayExchange};
 use crate::crc;
 use crate::text::{Table, charn, dd_to_int, int_to_dd, nchar, trim};
 use std::collections::HashMap;
@@ -142,6 +143,7 @@ pub fn decode(p: &[u8; 10], hash: &mut CallHash) -> Option<(String, MessageType)
         }
         MessageType::FreeText => decode_free(p),
         MessageType::Telemetry => decode_telemetry_hex(p),
+        MessageType::ArrlFd => decode_arrl_fd(p, hash)?,
         _ => return None,
     };
     Some((text, msg_type))
@@ -599,6 +601,15 @@ pub fn encode_message(text: &str, hash: &mut CallHash) -> Option<[u8; 10]> {
     let up = text.to_uppercase();
     let toks: Vec<&str> = up.split_whitespace().collect();
     if !toks.is_empty() {
+        // ARRL Field Day exchange (type 0.3/0.4) — try it before the standard
+        // packer, which would otherwise read the `<count><class>` token as a signal
+        // report and drop the section. `parse` returns None for non-FD shapes, so
+        // ordinary traffic falls straight through.
+        if let Some(ex) = FieldDayExchange::parse(&toks) {
+            if let Some(p) = encode_arrl_fd(&ex, hash) {
+                return Some(p);
+            }
+        }
         let (to, de, extra) = if toks[0] == "CQ" {
             if toks.len() >= 2 && is_cq_modifier_tok(toks[1]) {
                 (format!("CQ {}", toks[1]), tok(&toks, 2), tok(&toks, 3))
@@ -613,6 +624,101 @@ pub fn encode_message(text: &str, hash: &mut CallHash) -> Option<[u8; 10]> {
         }
     }
     encode_free(&up)
+}
+
+// ---- ARRL Field Day (message type 0.3 / 0.4) -------------------------------
+//
+// The semantic parsing (tokens ⇄ `FieldDayExchange`) and the section table live
+// in `arrl_fd`; this is the wire half — `FieldDayExchange` ⇄ 77-bit payload —
+// kept here because it needs `pack28`/`unpack28` and `CallHash`.
+//
+// Bit layout, MSB first (matches WSJT-X `unpack77.f90` `format(2b28,b1,b4,b3,b7,b3)`
+// plus the trailing `i3`), 77 bits + 3 pad to fill 10 bytes:
+//
+//   n28a:28  n28b:28  ir:1  intx:4  nclass:3  isec:7  n3:3  i3:3
+//
+// where the transmitter count splits across `intx` and `n3`:
+//   ntx = intx + 1 + 16*(n3 - 3)      (n3 = 3 ⇒ 1..16, n3 = 4 ⇒ 17..32)
+// the class letter is `nclass + 'A'`, and `isec` indexes `arrl_fd::SECTIONS`.
+
+/// Append the low `width` bits of `value` to a big-endian bit accumulator.
+fn push_bits(acc: &mut u128, value: u32, width: u32) {
+    *acc = (*acc << width) | (value as u128 & ((1u128 << width) - 1));
+}
+
+/// Pull the next `width` bits (MSB-first) from `acc`. `pos` is the count of
+/// still-unread low bits; it starts at the total and counts down per read.
+fn take_bits(acc: u128, pos: &mut u32, width: u32) -> u32 {
+    *pos -= width;
+    ((acc >> *pos) & ((1u128 << width) - 1)) as u32
+}
+
+/// Encode an ARRL Field Day exchange into a 77-bit payload. `None` if either
+/// callsign won't pack. The two calls use the standard 28-bit packing (`pack28`);
+/// Field Day carries no per-call `/R` `/P` suffix bit, so compound/portable calls
+/// are not representable in this message type (their suffix is dropped by `pack28`).
+fn encode_arrl_fd(ex: &FieldDayExchange, hash: &mut CallHash) -> Option<[u8; 10]> {
+    let (n28a, _ipa) = pack28(&ex.call_to, hash);
+    let (n28b, _ipb) = pack28(&ex.call_de, hash);
+    if n28a < 0 || n28b < 0 {
+        return None;
+    }
+
+    // Split the transmitter count across the 4-bit intx field and the n3 type bit.
+    let zero_based = ex.ntx.saturating_sub(1) as u32; // 0..=31
+    let n3 = if zero_based >= 16 { 4 } else { 3 };
+    let intx = zero_based & 0x0F;
+
+    let mut bits: u128 = 0;
+    push_bits(&mut bits, n28a as u32, 28);
+    push_bits(&mut bits, n28b as u32, 28);
+    push_bits(&mut bits, ex.rogered as u32, 1);
+    push_bits(&mut bits, intx, 4);
+    push_bits(&mut bits, ex.class_idx as u32, 3);
+    push_bits(&mut bits, ex.section_idx as u32, 7);
+    push_bits(&mut bits, n3, 3);
+    push_bits(&mut bits, 0, 3); // i3 = 0
+    bits <<= 3; // left-align the 77 bits within the 10-byte payload
+
+    let mut p = [0u8; 10];
+    for (i, slot) in p.iter_mut().enumerate() {
+        *slot = (bits >> (8 * (9 - i))) as u8;
+    }
+    Some(p)
+}
+
+/// Decode an ARRL Field Day payload to text. Inverse of [`encode_arrl_fd`]; `None`
+/// if a call won't unpack or the section index is unassigned.
+fn decode_arrl_fd(p: &[u8; 10], hash: &mut CallHash) -> Option<String> {
+    // Load big-endian, then drop the 3 trailing pad bits to right-align the 77.
+    let mut bits: u128 = 0;
+    for &b in p {
+        bits = (bits << 8) | b as u128;
+    }
+    bits >>= 3;
+
+    let mut pos = 77u32;
+    let n28a = take_bits(bits, &mut pos, 28);
+    let n28b = take_bits(bits, &mut pos, 28);
+    let ir = take_bits(bits, &mut pos, 1);
+    let intx = take_bits(bits, &mut pos, 4);
+    let nclass = take_bits(bits, &mut pos, 3);
+    let isec = take_bits(bits, &mut pos, 7);
+    let n3 = take_bits(bits, &mut pos, 3);
+    // The final 3 bits (i3) are 0 by dispatch; no need to read them.
+
+    let section_idx = u8::try_from(isec).ok()?;
+    arrl_fd::section_name(section_idx)?; // reject unassigned section indices
+
+    let ex = FieldDayExchange {
+        call_to: unpack28(n28a, 0, 0, hash)?,
+        call_de: unpack28(n28b, 0, 0, hash)?,
+        rogered: ir != 0,
+        ntx: (intx + 1 + 16 * (n3 - 3)) as u8,
+        class_idx: nclass as u8,
+        section_idx,
+    };
+    Some(ex.to_text())
 }
 
 /// Build the 91-bit (12-byte) message = payload + CRC, for the LDPC encoder.
@@ -648,6 +754,81 @@ mod tests {
     #[test]
     fn cq_dx_modifier_roundtrips() {
         roundtrip_std("CQ DX", "K1ABC", "FN42", "CQ DX K1ABC FN42");
+    }
+
+    /// Encode a full message string, assert it packs as ARRL Field Day, and that it
+    /// decodes back to `expect` — the end-to-end guard for the FD packer.
+    fn roundtrip_fd(input: &str, expect: &str) {
+        let mut h = CallHash::new();
+        let p = encode_message(input, &mut h).expect("encode");
+        assert_eq!(get_type(&p), MessageType::ArrlFd, "type for {input:?}");
+        let mut h2 = CallHash::new();
+        let (text, ty) = decode(&p, &mut h2).expect("decode");
+        assert_eq!(ty, MessageType::ArrlFd);
+        assert_eq!(text, expect, "round-trip for {input:?}");
+    }
+
+    #[test]
+    fn field_day_exchange_roundtrips() {
+        // The plain opener and the rogered (combined R + exchange) form.
+        roundtrip_fd("K1ABC N0JDC 3A CO", "K1ABC N0JDC 3A CO");
+        roundtrip_fd("K1ABC N0JDC R 3A CO", "K1ABC N0JDC R 3A CO");
+    }
+
+    #[test]
+    fn field_day_transmitter_count_split_roundtrips() {
+        // ntx ≤ 16 rides n3 = 3; ntx ≥ 17 rides n3 = 4. Exercise both sides and the
+        // boundary so a mis-split would surface as a changed count.
+        roundtrip_fd("W9XYZ K1ABC 1A WI", "W9XYZ K1ABC 1A WI");
+        roundtrip_fd("W9XYZ K1ABC 16A WI", "W9XYZ K1ABC 16A WI");
+        roundtrip_fd("W9XYZ K1ABC 17A WI", "W9XYZ K1ABC 17A WI");
+        roundtrip_fd("W9XYZ K1ABC 32F WI", "W9XYZ K1ABC 32F WI");
+    }
+
+    #[test]
+    fn field_day_classes_and_sections_roundtrip() {
+        // Every class letter A–F, and single/multi-char sections incl. trailing DX.
+        roundtrip_fd("K1ABC W9XYZ 1A EMA", "K1ABC W9XYZ 1A EMA");
+        roundtrip_fd("K1ABC W9XYZ 2B SCV", "K1ABC W9XYZ 2B SCV");
+        roundtrip_fd("K1ABC W9XYZ 3C NLI", "K1ABC W9XYZ 3C NLI");
+        roundtrip_fd("K1ABC W9XYZ 4D AB", "K1ABC W9XYZ 4D AB");
+        roundtrip_fd("K1ABC W9XYZ 5E PAC", "K1ABC W9XYZ 5E PAC");
+        roundtrip_fd("K1ABC W9XYZ 9F DX", "K1ABC W9XYZ 9F DX");
+    }
+
+    #[test]
+    fn standard_traffic_is_not_misencoded_as_field_day() {
+        // Guard: ordinary overs must still pack as Standard — a report token must
+        // not be hijacked, and CQ stays CQ.
+        for msg in ["W9XYZ K1ABC R-09", "W9XYZ K1ABC RR73", "CQ K1ABC FN42"] {
+            let mut h = CallHash::new();
+            let p = encode_message(msg, &mut h).expect("encode");
+            assert_eq!(get_type(&p), MessageType::Standard, "{msg:?} should stay Standard");
+        }
+    }
+
+    #[test]
+    fn class_shaped_token_with_unknown_section_is_not_field_day() {
+        // A valid `<count><class>` token but a section not in the table is not an FD
+        // exchange; it must fall through rather than pack as ArrlFd.
+        let mut h = CallHash::new();
+        let p = encode_message("K1ABC W9XYZ 3A ZZ", &mut h).expect("encode");
+        assert_ne!(get_type(&p), MessageType::ArrlFd);
+    }
+
+    /// Interop gate: our packing must be byte-identical to WSJT-X for a known
+    /// message — self-consistent round-trips can't catch a whole-table `isec` shift
+    /// or a bit-order error (they decode fine but are wrong on the air). Capture the
+    /// reference bytes once from WSJT-X and drop them in, then remove `#[ignore]`:
+    ///   ft8code "K1ABC W9XYZ 6A WI"      # prints the 77-bit payload, MSB-first
+    /// (or decode our synth with `jt9`). Until then this is documented, not run.
+    #[test]
+    #[ignore = "fill in WSJT-X reference bytes from ft8code, then un-ignore"]
+    fn field_day_matches_wsjtx_golden_vector() {
+        let mut h = CallHash::new();
+        let p = encode_message("K1ABC W9XYZ 6A WI", &mut h).expect("encode");
+        let expected: [u8; 10] = [0; 10]; // TODO: from `ft8code "K1ABC W9XYZ 6A WI"`
+        assert_eq!(p, expected);
     }
 
     #[test]
