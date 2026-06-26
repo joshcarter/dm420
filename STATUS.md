@@ -3,18 +3,28 @@
 > Single source of truth for **open** work. Done work is **not** tracked here — `git log` is its record. The *why* behind architecture tasks lives in `ARCHITECTURE_REVIEW.md`; component specs in `docs/`; the multi-op protocol in `docs/networking.md`. Owners: **J** = Josh/N0JDC, **W** = Joel/W4LL, **—** = either. _Updated 2026-06-25._
 
 ## 🔴 Field Day blockers (June 27–28)
-- [ ] **Per-band/per-mode "unworked" tracking + Field-Day log reset** — J — the core FD dupe rule; reset path + per-`(call,band)` worked display
-- [ ] **QSO correctness investigation** — W/J — on-air symptoms observed, not yet pinned; reproduce + diagnose
-- [ ] **CQ answered with a report (not grid) is ignored** — J — drops real FD contacts; fix drafted+reverted on `lane-finder` branch, needs landing + regression test
-- [ ] **Logbook shows class/section, not signal report** — — — the FD exchange is class+section, not SNR
-- [ ] **Send box doesn't update live during a QSO** — J — only refreshes after TX (`tx_hold` latch); operational blindness mid-over
-- [ ] **Shared logbook MVP (multi-op headline)** — J — Network Step 2; full anti-entropy is risky in 2 days, but an outbound-push + inbound-merge MVP may land (see `docs/networking.md`)
+
+> **The Field Day QSO machinery is built but dormant.** The engine already sequences the full FD flow — `CQ FD …` → bare `<class> <section>` exchange → `R`-exchange → `RR73`/`73`, with the grid step skipped and the roger/`73` roles reversed (log-on-send vs. log-on-received) — plus the P1–P3 idiom fixes (give-up cap, any-sign-off completion, report-opener) and the class/section log columns. All of it is in `main` with characterization tests. **None of it is reachable at runtime:** `to_qso_config()` (`crates/gui/src/settings.rs:124`) hard-codes `ContestProfile::Standard`, and `Station` holds only call/grid, so the engine never enters FD mode. The first blocker is the switch that lights up the rest.
+>
+> _Cleared since last update — now in `main`, evaluated and **no longer blockers** (need **on-air** validation, not code): per-`(call,band)` dupe tracking via the single-owner `WorkedStatus` producer, with mode **deliberately collapsed** (the ARRL-correct digital rule — 20 m FT8 ⇒ dupe on 20 m FT4; supersedes the old "per-band/per-**mode**" framing); the "CQ answered with a report, not grid" drop (P3, `engine.rs:353`, correctly gated **off** in FD); the class/section log columns (`engine.rs:1191`; generic `SNT`/`RCV` columns already render the exchange string)._
+
+- [ ] **Contest-mode setup UI — the gate** — J — the unlocked Digital panel needs a contest selector (`None` | `ARRL Field Day`) plus the operator's exchange (class e.g. `3A`, ARRL section e.g. `CO`). Core is fully wired (`ContestProfile::ArrlFieldDay`, `fd_class`/`fd_section` on `StationConfig`); add the three fields to `Station`, persist them to `[station]` in `config.toml` (mirror d404560's FT8/FT4 persistence), add a ComboBox + class/section fields to `ConfigForm` (`waterfall.rs`), and drop the `Standard` hard-code in `to_qso_config()`. **This one switch unblocks CQ FD, the FD exchange sequencing, and the class/section log columns — all already built.**
+- [ ] **On-air validation of the FD QSO flow** — W/J — the FSM and the P1–P3 fixes are landed and unit-tested but have never run against real radios; reproduce/diagnose the earlier on-air symptoms against the now-landed engine. Subsumes the old "report not grid is ignored" item (the P3 fix is in — verify it on air) and gates on completing a real **FT4** contact (`docs/live_pipeline_notes.md`).
+- [ ] **Field Day log reset** — J — no clear/truncate path exists (no `SessionCommand::ClearLog`; logbook is append-only; `ARCHITECTURE_REVIEW.md:271` flags `scanner.worked` growing unbounded). Needed so practice/prior QSOs don't count as dupes at contest start. Hook: a reset command → logbook archives-then-zeros + republishes an empty `logbook/entries` → the `WorkedStatus` producer and every consumer fall to empty automatically (single-owner pays off here).
+- [ ] **Log entries carry no FD-vs-normal tag** — — — `LogEntry` has no contest/exchange-kind field; `3A WI` vs. `-07` is only inferable by parsing the exchange string (the stored `Section` is a weak proxy). Add an explicit tag (serde-default for back-compat), set from `is_field_day()` at construction. Cheap; matters for clean export/scoring.
+- [ ] **Multi-caller auto-pick (pileups)** — J — the FD norm is several stations answering one CQ slot; auto-select the highest-SNR non-dupe, exclude calls a peer is working, highlight all answerers, and allow number-key override (`docs/qso_flow.md` §6). Not started.
+- [ ] **Shared-logbook group dupes + origin UI (multi-op headline)** — J — MVP transport (push/merge/catch-up) is landed and peer entries already flow onto `logbook/entries`, but the worked producer still hard-codes `WorkedByMe` (`crates/core/src/worked.rs:94`) — peers' QSOs aren't classified `WorkedByNetwork`, so a teammate's contact is not yet a group dupe or rendered origin-distinct. Classify by `entry.origin` + add origin-distinct UI (`docs/networking.md`).
+- [ ] **Send box doesn't update live during a QSO** — J — only refreshes after TX (`tx_hold` latch); operational blindness mid-over.
 
 ## Field Day Desired
 
 - [ ] Band scan function needs to move to the Digital panel. Band Scan panel needs to be read-only.
 
 - [ ] Tri-state control for clear QSY/follow station/lock offset. In "Clear" mode it would always attempt to find a clear part of the audio passband. In "Follow" it would behave as it does today--following the offset of whatever station we are answering, or using the current offset for CQ. In "Lock" it would lock to the current offset.
+
+## Weird QSO State Thing
+
+- [ ] Picking up a QSO mid-stream by clicking on somebody's traffic (addressed to my station) appeared to have the following odd behaviors: 1) My QSO state machine switched to calling CQ after finishing that QSO, even though I did not start by calling CQ. 2) My own CQ traffic is listed with a number shortcut for answering.
 
 ## After Field Day
 
