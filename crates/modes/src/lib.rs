@@ -14,6 +14,7 @@
 //! encoder runs it backwards to synthesize test signals so the whole chain is
 //! self-verifying without a radio.
 
+mod arrl_fd;
 mod cohere;
 mod cohere_ft4;
 mod constants;
@@ -73,5 +74,22 @@ mod tests {
             decode(&ft4, 12000, Protocol::Ft4).iter().any(|d| d.message == text),
             "FT4 synth_message should round-trip"
         );
+    }
+
+    /// The ARRL Field Day exchange (WSJT-X message type 0.3/0.4) survives the whole
+    /// TX path — encode → synth → decode — in both protocols. Regression guard for
+    /// the "FD exchange won't encode" bug, where it used to pack as a standard
+    /// signal report and silently drop the section.
+    #[test]
+    fn field_day_exchange_synth_round_trips() {
+        let text = "K1ABC N0JDC 3A CO";
+        for protocol in [Protocol::Ft8, Protocol::Ft4] {
+            let audio = synth_message(text, protocol, 1500.0, 12000)
+                .unwrap_or_else(|| panic!("{protocol:?} FD synth"));
+            assert!(
+                decode(&audio, 12000, protocol).iter().any(|d| d.message == text),
+                "{protocol:?} FD synth_message should round-trip"
+            );
+        }
     }
 }
