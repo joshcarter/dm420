@@ -4,17 +4,28 @@
 > Tracks the 🔴 blocker in `STATUS.md`: "FD exchange won't encode — `modes`
 > packer has no Field Day message type." Written 2026-06-26.
 
-> **Implementation status (2026-06-26): landed on branch `fd-exchange-encode-writeup`.**
-> The plan below is now code, contained to `crates/modes/`: a pure `arrl_fd`
-> module (section table + `<count><class>` grammar + the `FieldDayExchange` pivot)
-> and the wire pack/unpack (`encode_arrl_fd`/`decode_arrl_fd`) in `message.rs`,
-> dispatched from `encode_message`/`decode`. `cargo test -p modes`,
-> `cargo clippy -p modes --all-targets -- -D warnings`, and the workspace build all
-> pass; `core`/`qso` tests unaffected. **One item is deliberately still open:** the
-> WSJT-X interop golden vector (`field_day_matches_wsjtx_golden_vector`) is
-> `#[ignore]`d until its reference bytes are captured from `ft8code`/`jt9` — the
-> on-air radio test is the final interop gate, after which the `STATUS.md` blocker
-> drops to on-air-validation-only.
+> **Implementation status (2026-06-26): landed on `fd-exchange-encode-writeup` and
+> validated against the WSJT-X source + decoder.** The plan below is code, contained
+> to `crates/modes/`: a pure `arrl_fd` module (section table + `<count><class>`
+> grammar + the `FieldDayExchange` pivot) and the wire pack/unpack in `message.rs`,
+> dispatched from `encode_message`/`decode`.
+>
+> **Interop validation (this is the important part):** cross-checking against the
+> real `ft8code` immediately caught that my first section table was wrong — built
+> from memory, it had bogus entries (`KP4`, `MAR`, `NT`, `TX`), missed real ones
+> (`NS`, `TER`, `NTX`, `PE`, `NB`), and treated `isec` as 0-based. I then validated
+> against the actual WSJT-X source at `/Users/Shared/wsjtx/lib/77bit/packjt77.f90`
+> and corrected it: the table is now the exact 86-entry `csec` array and `isec` is
+> **1-based** (wire = table index + 1), matching the source's
+> `format(2b28,b1,b4,b3,b7,2b3)` and `isec=i`. Evidence now in CI / on hand:
+> - 3 **golden-vector** tests assert our 77-bit payload is byte-identical to
+>   `ft8code` (plain, rogered `R`, and an `n3=4` >16-tx count) — no longer ignored.
+> - WSJT-X's **`jt9` decodes our synthesized FD signal** end-to-end in both **FT8**
+>   (`K1ABC W9XYZ 6A WI`) and **FT4** (`K1ABC W9XYZ R 6A WI`).
+> - Our decoder reads the same WSJT-X-valid WAV back into
+>   `FieldDay { class: "6A", section: "WI" }` (RX path).
+>
+> Remaining: a real over-the-air contact (RF, AGC, timing) — code interop is proven.
 
 ## TL;DR
 

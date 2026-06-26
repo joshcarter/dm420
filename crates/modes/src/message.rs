@@ -639,7 +639,10 @@ pub fn encode_message(text: &str, hash: &mut CallHash) -> Option<[u8; 10]> {
 //
 // where the transmitter count splits across `intx` and `n3`:
 //   ntx = intx + 1 + 16*(n3 - 3)      (n3 = 3 ⇒ 1..16, n3 = 4 ⇒ 17..32)
-// the class letter is `nclass + 'A'`, and `isec` indexes `arrl_fd::SECTIONS`.
+// the class letter is `nclass + 'A'`, and `isec` is WSJT-X's **1-based** section
+// index (1..=86) — our `arrl_fd::SECTIONS` is 0-based, so wire = table index + 1.
+// (Verified against WSJT-X `lib/77bit/packjt77.f90`: `format(2b28,b1,b4,b3,b7,2b3)`,
+// `isec=i` over `do i=1,NSEC`.)
 
 /// Append the low `width` bits of `value` to a big-endian bit accumulator.
 fn push_bits(acc: &mut u128, value: u32, width: u32) {
@@ -675,7 +678,7 @@ fn encode_arrl_fd(ex: &FieldDayExchange, hash: &mut CallHash) -> Option<[u8; 10]
     push_bits(&mut bits, ex.rogered as u32, 1);
     push_bits(&mut bits, intx, 4);
     push_bits(&mut bits, ex.class_idx as u32, 3);
-    push_bits(&mut bits, ex.section_idx as u32, 7);
+    push_bits(&mut bits, ex.section_idx as u32 + 1, 7); // wire isec is 1-based
     push_bits(&mut bits, n3, 3);
     push_bits(&mut bits, 0, 3); // i3 = 0
     bits <<= 3; // left-align the 77 bits within the 10-byte payload
@@ -707,8 +710,10 @@ fn decode_arrl_fd(p: &[u8; 10], hash: &mut CallHash) -> Option<String> {
     let n3 = take_bits(bits, &mut pos, 3);
     // The final 3 bits (i3) are 0 by dispatch; no need to read them.
 
-    let section_idx = u8::try_from(isec).ok()?;
-    arrl_fd::section_name(section_idx)?; // reject unassigned section indices
+    // WSJT-X's isec is 1-based (valid 1..=86); map to our 0-based table index.
+    // `checked_sub` rejects isec = 0; `section_name` rejects isec > 86.
+    let section_idx = u8::try_from(isec.checked_sub(1)?).ok()?;
+    arrl_fd::section_name(section_idx)?;
 
     let ex = FieldDayExchange {
         call_to: unpack28(n28a, 0, 0, hash)?,
@@ -816,19 +821,27 @@ mod tests {
         assert_ne!(get_type(&p), MessageType::ArrlFd);
     }
 
-    /// Interop gate: our packing must be byte-identical to WSJT-X for a known
-    /// message — self-consistent round-trips can't catch a whole-table `isec` shift
-    /// or a bit-order error (they decode fine but are wrong on the air). Capture the
-    /// reference bytes once from WSJT-X and drop them in, then remove `#[ignore]`:
-    ///   ft8code "K1ABC W9XYZ 6A WI"      # prints the 77-bit payload, MSB-first
-    /// (or decode our synth with `jt9`). Until then this is documented, not run.
+    /// Interop gate: our packing must be byte-identical to WSJT-X — self-consistent
+    /// round-trips can't catch a wrong section table or a 0-vs-1-based `isec` slip
+    /// (they decode fine but are wrong on the air). Each `expected` is the 77-bit
+    /// source-encoded payload + 3 pad bits (big-endian) straight from the installed
+    /// WSJT-X's own packer (`lib/77bit/packjt77.f90`), captured with:
+    ///   $ ft8code "<message>"
+    /// Covers the plain opener, the rogered `R` form, and an n3=4 (>16 tx) count with
+    /// a different section — pinning the table, the 1-based isec, the ir bit, and the
+    /// transmitter-count split at once.
     #[test]
-    #[ignore = "fill in WSJT-X reference bytes from ft8code, then un-ignore"]
-    fn field_day_matches_wsjtx_golden_vector() {
-        let mut h = CallHash::new();
-        let p = encode_message("K1ABC W9XYZ 6A WI", &mut h).expect("encode");
-        let expected: [u8; 10] = [0; 10]; // TODO: from `ft8code "K1ABC W9XYZ 6A WI"`
-        assert_eq!(p, expected);
+    fn field_day_matches_wsjtx_golden_vectors() {
+        let cases: &[(&str, [u8; 10])] = &[
+            ("K1ABC W9XYZ 6A WI", [9, 189, 227, 80, 194, 147, 184, 40, 152, 192]),
+            ("K1ABC W9XYZ R 6A WI", [9, 189, 227, 80, 194, 147, 184, 168, 152, 192]),
+            ("K1ABC W9XYZ 20B CO", [9, 189, 227, 80, 194, 147, 184, 25, 15, 0]),
+        ];
+        for (msg, expected) in cases {
+            let mut h = CallHash::new();
+            let p = encode_message(msg, &mut h).expect("encode");
+            assert_eq!(p, *expected, "golden vector mismatch for {msg:?}");
+        }
     }
 
     #[test]

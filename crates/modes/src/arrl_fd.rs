@@ -11,35 +11,38 @@
 //! the other message types in `message.rs`. See
 //! `docs/joel/fd-exchange-encode-bug.md` for the why.
 
-/// Canonical WSJT-X ARRL/RAC Field Day section list, in the **exact order** of the
-/// `csec` array in WSJT-X `lib/77bit/unpack77.f90`. The array index *is* the 7-bit
-/// `isec` value carried on the air, so this ordering is the interop contract: a
-/// station transmits the index and the receiver names the section by looking the
-/// index back up here.
+/// WSJT-X ARRL/RAC Field Day section list, transcribed **verbatim** from the `csec`
+/// array in WSJT-X `lib/77bit/packjt77.f90` (`NSEC = 86`), rows of 10 mirroring the
+/// source. This 0-based array is the interop contract: WSJT-X carries the section as
+/// a **1-based** index (`isec`, valid range 1..=86) on the air, so the wire value is
+/// this array index **+ 1** — that ±1 lives in `message::{encode_arrl_fd,
+/// decode_arrl_fd}`, keeping this a plain table.
 ///
-/// Do **not** re-order this — not to alphabetical, and not to match
-/// `gui::panel_data::SECTIONS` (that one is a *geographic* table for the map, in a
-/// different order). A re-order silently decodes every section as a different one.
-/// Transcribe from WSJT-X verbatim; the membership quirks (`GH`, `KP4`, `PR`,
-/// `VI`, `MAR`, the RAC sections, trailing `DX`) are part of the contract.
-const SECTIONS: [&str; 85] = [
+/// Do **not** re-order or "tidy" this — not to alphabetical, and not to match
+/// `gui::panel_data::SECTIONS` (a *geographic* table for the map). Membership is
+/// exact and easy to get wrong from memory: there is **no** `KP4` (Puerto Rico is
+/// `PR`) and **no** bare `TX` (Texas is `STX`/`WTX`/`NTX`); `NS`/`TER` are the
+/// current spellings (older WSJT-X used `MAR`/`NT`), and `PE`/`NB` (RAC) close the
+/// list. If WSJT-X bumps `NSEC`, re-transcribe from the source file — don't guess.
+const SECTIONS: [&str; 86] = [
     "AB", "AK", "AL", "AR", "AZ", "BC", "CO", "CT", "DE", "EB", // 0..9
     "EMA", "ENY", "EPA", "EWA", "GA", "GH", "IA", "ID", "IL", "IN", // 10..19
-    "KP4", "KS", "KY", "LA", "LAX", "MAR", "MB", "MDC", "ME", "MI", // 20..29
-    "MN", "MO", "MS", "MT", "NC", "ND", "NE", "NFL", "NH", "NL", // 30..39
-    "NLI", "NM", "NNJ", "NNY", "NT", "NV", "OH", "OK", "ONE", "ONN", // 40..49
+    "KS", "KY", "LA", "LAX", "NS", "MB", "MDC", "ME", "MI", "MN", // 20..29
+    "MO", "MS", "MT", "NC", "ND", "NE", "NFL", "NH", "NL", "NLI", // 30..39
+    "NM", "NNJ", "NNY", "TER", "NTX", "NV", "OH", "OK", "ONE", "ONN", // 40..49
     "ONS", "OR", "ORG", "PAC", "PR", "QC", "RI", "SB", "SC", "SCV", // 50..59
     "SD", "SDG", "SF", "SFL", "SJV", "SK", "SNJ", "STX", "SV", "TN", // 60..69
-    "TX", "UT", "VA", "VI", "VT", "WCF", "WI", "WMA", "WNY", "WPA", // 70..79
-    "WTX", "WV", "WWA", "WY", "DX", // 80..84
+    "UT", "VA", "VI", "VT", "WCF", "WI", "WMA", "WNY", "WPA", "WTX", // 70..79
+    "WV", "WWA", "WY", "DX", "PE", "NB", // 80..85
 ];
 
 /// Highest transmitter count representable (4-bit `intx` + the `n3` 3/4 split).
 const MAX_NTX: u8 = 32;
 
-/// Resolve a section abbreviation to its wire index (`isec`). Case-insensitive,
+/// Resolve a section abbreviation to its 0-based table index. Case-insensitive,
 /// trims surrounding space. `None` for anything not in [`SECTIONS`] — callers use
-/// that to let non-Field-Day text fall through to the other packers.
+/// that to let non-Field-Day text fall through to the other packers. (The on-air
+/// `isec` is this + 1; the wire layer applies the offset.)
 pub(crate) fn section_index(sec: &str) -> Option<u8> {
     let s = sec.trim();
     SECTIONS
@@ -48,10 +51,9 @@ pub(crate) fn section_index(sec: &str) -> Option<u8> {
         .map(|i| i as u8)
 }
 
-/// Name a section from its wire index. `None` if out of range (the 7-bit field can
-/// hold 0..127, but only 0..84 are assigned).
-pub(crate) fn section_name(isec: u8) -> Option<&'static str> {
-    SECTIONS.get(isec as usize).copied()
+/// Name a section from its 0-based table index. `None` if out of range (0..=85).
+pub(crate) fn section_name(idx: u8) -> Option<&'static str> {
+    SECTIONS.get(idx as usize).copied()
 }
 
 /// Parse a Field Day class token — `<count><letter>`, e.g. `"3A"`, `"12E"` — into
@@ -164,12 +166,14 @@ mod tests {
 
     #[test]
     fn section_table_is_well_formed() {
-        // 85 unique, uppercase entries; the ends are pinned where WSJT-X puts them.
-        assert_eq!(SECTIONS.len(), 85);
+        // NSEC = 86 unique, upper-case entries; positions pinned against the source
+        // `csec` (0-based here = WSJT-X 1-based − 1: WI is csec(76) ⇒ index 75).
+        assert_eq!(SECTIONS.len(), 86);
         assert_eq!(SECTIONS[0], "AB");
-        assert_eq!(SECTIONS[6], "CO");
-        assert_eq!(SECTIONS[76], "WI");
-        assert_eq!(SECTIONS[84], "DX");
+        assert_eq!(SECTIONS[6], "CO"); // csec(7)
+        assert_eq!(SECTIONS[75], "WI"); // csec(76)
+        assert_eq!(SECTIONS[83], "DX"); // csec(84)
+        assert_eq!(SECTIONS[85], "NB"); // csec(86), last
         let unique: std::collections::HashSet<_> = SECTIONS.iter().collect();
         assert_eq!(unique.len(), SECTIONS.len(), "no duplicate sections");
         assert!(
@@ -178,6 +182,15 @@ mod tests {
                 .all(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())),
             "sections are upper-case alphanumeric"
         );
+        // Membership guards — the exact errors a from-memory list makes. These are
+        // NOT WSJT-X sections; their presence would be a regression.
+        for absent in ["KP4", "MAR", "NT", "TX"] {
+            assert!(!SECTIONS.contains(&absent), "{absent} is not a WSJT-X section");
+        }
+        // …and the ones a stale list drops.
+        for present in ["NS", "TER", "NTX", "PE", "NB"] {
+            assert!(SECTIONS.contains(&present), "{present} must be present");
+        }
     }
 
     #[test]
@@ -189,9 +202,9 @@ mod tests {
         // Case-insensitive and space-trimmed.
         assert_eq!(section_index(" co "), Some(6));
         assert_eq!(section_index("Co"), Some(6));
-        // Unknown / out of range.
+        // Unknown / out of range (last valid index is 85).
         assert_eq!(section_index("ZZ"), None);
-        assert_eq!(section_name(85), None);
+        assert_eq!(section_name(86), None);
         assert_eq!(section_name(200), None);
     }
 
