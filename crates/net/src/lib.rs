@@ -12,7 +12,8 @@
 //! re-publishes peers' snapshots onto `station/{id}/snapshot`. The beacon's
 //! `working` field is populated from local bus state (the deconfliction
 //! [`WorkingTarget`] — band + TX offset + the call being worked; see
-//! [`beacon_loop`]); `heard`/`band_activity` are still empty.
+//! [`beacon_loop`]), and its `heard` list from the local enriched-decode stream
+//! (recency-bounded and datagram-trimmed by the sender); `band_activity` is still empty.
 //!
 //! **Shared logbook (step 2 MVP).** The log G-set ([`gset::Gset`]) now syncs:
 //! - **OUT:** we subscribe `logbook/entries`, hold every entry in the G-set, and
@@ -38,6 +39,7 @@ mod gset;
 mod peers;
 pub mod wire;
 
+use std::collections::{HashMap, hash_map::Entry};
 use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -45,7 +47,8 @@ use std::time::{Duration, Instant};
 use bus::{BusError, BusHandle, BusMessage, Subscription, Topic, TopicSelector};
 use tokio::net::UdpSocket;
 use types::{
-    Band, LogEntry, QsoState, RadioId, RigState, StationId, StationSnapshot, WorkingTarget,
+    Band, Callsign, EnrichedDecode, HeardStation, LogEntry, OverAirMode, QsoState, RadioId,
+    RigState, StationId, StationSnapshot, WorkingTarget,
 };
 
 use crate::gset::Gset;
@@ -77,6 +80,22 @@ const PEER_TTL: Duration = Duration::from_secs(30);
 const REPUSH_INTERVAL: Duration = Duration::from_secs(15);
 /// Receive buffer — one UDP datagram's hard maximum.
 const RECV_BUF: usize = 64 * 1024;
+
+/// How long a locally-decoded station lingers in the beacon's `heard` list. Matched
+/// to the band-status retention window (`CoreConfig.band_status_window`, default
+/// 5 min) so a sender's beacon and a receiver's aggregate age stations out together.
+const HEARD_WINDOW: Duration = Duration::from_secs(300);
+
+/// Upper bound on `heard` entries per beacon — a cheap guard so a busy band can't
+/// build an unbounded list. The *binding* limit is [`PUSH_MTU_BUDGET`]: the snapshot
+/// must fit one UDP datagram, and the JSON wire format is verbose enough that the
+/// byte budget usually bites first ([`encode_beacon`] trims oldest-first to fit).
+const HEARD_CAP: usize = 32;
+
+/// How the beacon keys a heard station, mirroring `core::band_status`'s bucketing:
+/// a normalized callsign per `(band, mode)`. Keying by call alone would collapse a
+/// station heard on two bands into one record (the receiver buckets by band+mode).
+type HeardKey = (Callsign, Band, OverAirMode);
 
 /// Configuration for the gossip service.
 pub struct NetConfig {
@@ -271,17 +290,21 @@ impl Service {
 }
 
 /// Beacon our [`StationSnapshot`] to every known peer on a fixed interval, and
-/// age out peers we've stopped hearing. Step 3: the snapshot's `working` field
-/// carries our live [`WorkingTarget`] (band + TX offset + the call being worked),
-/// summarized from two **local-authority** State topics we only ever READ —
-/// `qso/{radio}/state` and `radio/{radio}/rig_state`. We never republish peer data
-/// onto those topics; the beacon is a one-way curated view of our own tuning.
+/// age out peers we've stopped hearing. The snapshot's `working` field carries our
+/// live [`WorkingTarget`] (band + TX offset + the call being worked), summarized
+/// from two **local-authority** State topics we only ever READ — `qso/{radio}/state`
+/// and `radio/{radio}/rig_state`. Its `heard` list carries the stations we've locally
+/// decoded recently, folded from `radio/{radio}/decodes_enriched` into a per-[`HeardKey`]
+/// map (latest-wins) and recency-bounded by [`HEARD_WINDOW`]. We never republish peer
+/// data onto any of these topics; the beacon is a one-way curated view of our own
+/// ears + tuning.
 ///
-/// The interval tick and the two State subscriptions are multiplexed with
-/// `tokio::select!`: a QsoState/RigState message refreshes the cache; the tick
-/// builds + sends the beacon from whatever is cached. A lagged sub is tolerated
-/// (State watches don't lag, but it's harmless to keep reading); a closed sub is
-/// retired (`None`) so a gone producer neither busy-spins nor stops the beacon.
+/// The interval tick and the three subscriptions are multiplexed with
+/// `tokio::select!`: a QsoState/RigState message refreshes the working cache, an
+/// [`EnrichedDecode`] folds into the heard map; the tick builds + sends the beacon
+/// from whatever is cached. A lagged sub is tolerated (harmless to keep reading); a
+/// closed sub is retired (`None`) so a gone producer neither busy-spins nor stops the
+/// beacon.
 async fn beacon_loop(
     socket: Arc<UdpSocket>,
     peers: Peers,
@@ -309,45 +332,43 @@ async fn beacon_loop(
     let mut rig_sub: Option<Subscription<RigState>> = bus
         .subscribe::<RigState>(TopicSelector::Exact(Topic::RigState(radio.clone())))
         .ok();
+    // The heard source: the local enriched-decode stream (StreamLossless). Same
+    // `.ok()` degradation — a subscribe failure means an empty `heard` list, never a
+    // dead beacon.
+    let mut enriched_sub: Option<Subscription<EnrichedDecode>> = bus
+        .subscribe::<EnrichedDecode>(TopicSelector::Exact(Topic::DecodesEnriched(radio.clone())))
+        .ok();
 
     let mut last_qso: Option<QsoState> = None;
     let mut last_rig: Option<RigState> = None;
+    // Recently-heard stations keyed per `core::band_status`; pruned to `HEARD_WINDOW`
+    // and filled into each beacon's `heard` list.
+    let mut heard: HashMap<HeardKey, HeardStation> = HashMap::new();
 
     loop {
         tokio::select! {
             _ = tick.tick() => {
                 let seq = (types::now_ms() as u64).max(last_seq + 1);
                 last_seq = seq;
-                let snap = StationSnapshot {
-                    station: station.clone(),
-                    seq,
-                    working: assemble_working(&last_qso, &last_rig, &radio),
-                    band_activity: vec![],
-                    heard: vec![],
-                };
-                let frame = Frame {
-                    version: PROTO_VERSION,
-                    from: station.clone(),
-                    msg: Wire::Snapshot(snap),
-                };
-                match wire::encode(&frame) {
-                    Ok(bytes) => {
-                        for addr in peers.targets() {
-                            // Belt-and-suspenders: our gossip socket is IPv4-only, so
-                            // never hand a non-IPv4 target to `send_to` — it would fail
-                            // with EINVAL on every tick and flood the log. A non-IPv4
-                            // target shouldn't reach here (discovery filters them), but a
-                            // manual `DM420_PEERS` entry or future code could; drop it
-                            // silently rather than spam per-iteration.
-                            if !is_sendable(&addr) {
-                                continue;
-                            }
-                            if let Err(e) = socket.send_to(&bytes, addr).await {
-                                tracing::debug!(%addr, error = %e, "net: beacon send failed");
-                            }
+                // Prune stale heard stations and take the freshest for this beacon;
+                // `encode_beacon` trims further if the datagram won't fit.
+                let working = assemble_working(&last_qso, &last_rig, &radio);
+                let heard_vec = assemble_heard(&mut heard, HEARD_WINDOW, HEARD_CAP);
+                if let Some(bytes) = encode_beacon(&station, seq, working, heard_vec) {
+                    for addr in peers.targets() {
+                        // Belt-and-suspenders: our gossip socket is IPv4-only, so
+                        // never hand a non-IPv4 target to `send_to` — it would fail
+                        // with EINVAL on every tick and flood the log. A non-IPv4
+                        // target shouldn't reach here (discovery filters them), but a
+                        // manual `DM420_PEERS` entry or future code could; drop it
+                        // silently rather than spam per-iteration.
+                        if !is_sendable(&addr) {
+                            continue;
+                        }
+                        if let Err(e) = socket.send_to(&bytes, addr).await {
+                            tracing::debug!(%addr, error = %e, "net: beacon send failed");
                         }
                     }
-                    Err(e) => tracing::warn!(error = %e, "net: snapshot encode failed"),
                 }
                 for dropped in peers.expire(PEER_TTL, Instant::now()) {
                     tracing::info!(station = %dropped.0, "net: peer timed out");
@@ -363,13 +384,22 @@ async fn beacon_loop(
                 Err(BusError::Lagged { .. }) => {}
                 Err(_) => rig_sub = None,
             },
+            // Fold each locally-decoded station into the heard map (mirrors how
+            // `core::band_status` consumes this same stream). A StreamLossless sub can
+            // in principle lag — keep reading; a closed producer retires the sub so the
+            // beacon survives, matching `qso_sub`/`rig_sub` above.
+            r = recv_cached(&mut enriched_sub) => match r {
+                Ok(ed) => note_heard(&mut heard, ed),
+                Err(BusError::Lagged { .. }) => {}
+                Err(_) => enriched_sub = None,
+            },
         }
     }
 }
 
-/// Await the next value from an optional State subscription. When the sub is
-/// `None` (never created, or retired after a close) this never resolves, so the
-/// `select!` arm stays inert instead of busy-spinning on a dead source.
+/// Await the next value from an optional subscription (State or Stream). When the
+/// sub is `None` (never created, or retired after a close) this never resolves, so
+/// the `select!` arm stays inert instead of busy-spinning on a dead source.
 async fn recv_cached<M: BusMessage>(sub: &mut Option<Subscription<M>>) -> Result<M, BusError> {
     match sub {
         Some(s) => s.recv().await,
@@ -406,6 +436,97 @@ fn assemble_working(
         dial,
         call,
     })
+}
+
+/// Fold one locally-decoded station into the heard map, latest-wins. The key is a
+/// normalized callsign per `(band, mode)` — exactly how `core::band_status` buckets
+/// the same stream — so a station heard on two bands yields two records and station
+/// identity agrees across operators. A decode without a resolved callsign can't form
+/// a [`HeardStation`] and is skipped; a missing SNR defaults to `0`.
+fn note_heard(heard: &mut HashMap<HeardKey, HeardStation>, ed: EnrichedDecode) {
+    let Some(call) = ed.callsign else {
+        return; // no call → can't identify the station
+    };
+    let call = call.normalized();
+    let hs = HeardStation {
+        call: call.clone(),
+        grid: ed.grid,
+        band: ed.band,
+        mode: ed.decode.mode,
+        snr: ed.decode.snr_db.unwrap_or(0),
+        last_heard: ed.decode.t,
+    };
+    match heard.entry((call, ed.band, ed.decode.mode)) {
+        Entry::Vacant(v) => {
+            v.insert(hs);
+        }
+        // Latest-wins: a newer (or same-instant) decode supersedes the held one, so
+        // the advertised SNR/grid track the most recent hearing.
+        Entry::Occupied(mut o) => {
+            if hs.last_heard.0 >= o.get().last_heard.0 {
+                o.insert(hs);
+            }
+        }
+    }
+}
+
+/// Prune `heard` to `window`, then return the most-recently-heard stations
+/// (newest-first, with a deterministic callsign tie-break), at most `cap`.
+/// Newest-first so [`encode_beacon`]'s datagram-fit trim sheds the *least*-recent
+/// first. Mutates the map in place so it can't grow without bound across beacons.
+fn assemble_heard(
+    heard: &mut HashMap<HeardKey, HeardStation>,
+    window: Duration,
+    cap: usize,
+) -> Vec<HeardStation> {
+    let cutoff = types::now_ms() - window.as_millis() as i64;
+    heard.retain(|_, h| h.last_heard.0 >= cutoff);
+    let mut v: Vec<HeardStation> = heard.values().cloned().collect();
+    v.sort_by(|a, b| {
+        b.last_heard
+            .0
+            .cmp(&a.last_heard.0)
+            .then_with(|| a.call.0.cmp(&b.call.0))
+    });
+    v.truncate(cap);
+    v
+}
+
+/// Build + encode one beacon datagram, trimming the (newest-first) `heard` list
+/// oldest-first until the framed snapshot fits one UDP datagram ([`PUSH_MTU_BUDGET`]).
+/// The JSON wire format is verbose, so the byte budget — not [`HEARD_CAP`] — is
+/// usually what bounds `heard`; size-probing by re-encoding mirrors [`pack_log_push`].
+/// Returns `None` only if encoding fails (logged). An empty `heard` always ships, even
+/// in the unreachable case where the working-target overhead alone exceeds the budget.
+fn encode_beacon(
+    station: &StationId,
+    seq: u64,
+    working: Option<WorkingTarget>,
+    mut heard: Vec<HeardStation>,
+) -> Option<Vec<u8>> {
+    loop {
+        let frame = Frame {
+            version: PROTO_VERSION,
+            from: station.clone(),
+            msg: Wire::Snapshot(StationSnapshot {
+                station: station.clone(),
+                seq,
+                working: working.clone(),
+                band_activity: vec![],
+                heard: heard.clone(),
+            }),
+        };
+        match wire::encode(&frame) {
+            Ok(bytes) if bytes.len() <= PUSH_MTU_BUDGET || heard.is_empty() => return Some(bytes),
+            Ok(_) => {
+                heard.pop(); // over budget — drop the least-recent and retry
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "net: snapshot encode failed");
+                return None;
+            }
+        }
+    }
 }
 
 async fn recv_loop(
@@ -687,7 +808,8 @@ mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv6Addr};
     use types::{
-        AbsHz, Callsign, Meters, OffsetHz, OverAirMode, QsoId, QsoPhase, RigMode, Timestamp,
+        AbsHz, Callsign, Decode, DecodeContent, GridSquare, Meters, OffsetHz, OverAirMode, QsoId,
+        QsoPhase, RigMode, SignalSource, Timestamp, WorkedStatus,
     };
 
     // The IPv4 / IPv6 filter that keeps IPv6 link-local mDNS addresses off our
@@ -943,5 +1065,192 @@ mod tests {
             vec![1, 2],
             "both authored entries delivered, the peer's entry excluded",
         );
+    }
+
+    // ----- heard-list assembly (the beacon's `heard` field) -----
+
+    fn enriched(
+        call: Option<&str>,
+        grid: Option<&str>,
+        band: Band,
+        mode: OverAirMode,
+        snr: Option<i8>,
+        t: i64,
+    ) -> EnrichedDecode {
+        EnrichedDecode {
+            decode: Decode {
+                radio: RadioId(DEFAULT_RADIO_ID.into()),
+                mode,
+                t: Timestamp(t),
+                offset: OffsetHz(1500.0),
+                snr_db: snr,
+                source: SignalSource::Received,
+                content: DecodeContent::Streaming { text: String::new() },
+            },
+            callsign: call.map(|c| Callsign(c.into())),
+            grid: grid.map(|g| GridSquare(g.into())),
+            worked: WorkedStatus::New,
+            band,
+        }
+    }
+
+    fn heard_station(call: &str, band: Band, mode: OverAirMode, t: i64) -> HeardStation {
+        HeardStation {
+            call: Callsign(call.into()),
+            grid: None,
+            band,
+            mode,
+            snr: -10,
+            last_heard: Timestamp(t),
+        }
+    }
+
+    // A decode with a resolved call maps every field across; a missing SNR defaults to
+    // 0. A decode without a call can't form a `HeardStation` and is skipped.
+    #[test]
+    fn note_heard_maps_fields_and_skips_callless() {
+        let mut heard = HashMap::new();
+        note_heard(
+            &mut heard,
+            enriched(
+                Some("W1ABC"),
+                Some("FN42"),
+                Band::B20m,
+                OverAirMode::Ft8,
+                None,
+                1_000,
+            ),
+        );
+        note_heard(
+            &mut heard,
+            enriched(None, None, Band::B20m, OverAirMode::Ft8, Some(-5), 2_000),
+        );
+        assert_eq!(heard.len(), 1, "the call-less decode is skipped");
+        let hs = &heard[&(Callsign("W1ABC".into()), Band::B20m, OverAirMode::Ft8)];
+        assert_eq!(hs.grid, Some(GridSquare("FN42".into())));
+        assert_eq!(hs.band, Band::B20m);
+        assert_eq!(hs.mode, OverAirMode::Ft8);
+        assert_eq!(hs.snr, 0, "a missing SNR defaults to 0");
+        assert_eq!(hs.last_heard, Timestamp(1_000));
+    }
+
+    // The key is (normalized call, band, mode): the same call on two bands is two
+    // records, while a case-folded re-hearing on one band collapses onto one.
+    #[test]
+    fn note_heard_keys_by_normalized_call_band_mode() {
+        let mut heard = HashMap::new();
+        note_heard(
+            &mut heard,
+            enriched(Some("W1ABC"), None, Band::B20m, OverAirMode::Ft8, None, 1_000),
+        );
+        note_heard(
+            &mut heard,
+            enriched(Some("W1ABC"), None, Band::B40m, OverAirMode::Ft8, None, 1_000),
+        );
+        note_heard(
+            &mut heard,
+            enriched(Some("w1abc"), None, Band::B20m, OverAirMode::Ft8, None, 1_500),
+        );
+        assert_eq!(
+            heard.len(),
+            2,
+            "20 m + 40 m are two records; the case-folded 20 m re-hearing is the same one"
+        );
+    }
+
+    // Latest-wins: a newer decode supersedes the held one (so SNR tracks the most
+    // recent hearing); an older decode for the same key is ignored.
+    #[test]
+    fn note_heard_latest_wins() {
+        let mut heard = HashMap::new();
+        let key = (Callsign("K2DEF".into()), Band::B20m, OverAirMode::Ft8);
+        note_heard(
+            &mut heard,
+            enriched(Some("K2DEF"), None, Band::B20m, OverAirMode::Ft8, Some(-10), 2_000),
+        );
+        // An older decode must not overwrite the newer.
+        note_heard(
+            &mut heard,
+            enriched(Some("K2DEF"), None, Band::B20m, OverAirMode::Ft8, Some(-20), 1_000),
+        );
+        assert_eq!(heard[&key].snr, -10);
+        assert_eq!(heard[&key].last_heard, Timestamp(2_000));
+        // A newer decode wins.
+        note_heard(
+            &mut heard,
+            enriched(Some("K2DEF"), None, Band::B20m, OverAirMode::Ft8, Some(-30), 3_000),
+        );
+        assert_eq!(heard[&key].snr, -30);
+        assert_eq!(heard[&key].last_heard, Timestamp(3_000));
+    }
+
+    // `assemble_heard` drops entries past the window, returns the rest newest-first,
+    // caps the count, and prunes the map in place.
+    #[test]
+    fn assemble_heard_prunes_sorts_and_caps() {
+        let now = types::now_ms();
+        let mut heard: HashMap<HeardKey, HeardStation> = HashMap::new();
+        for (call, age_ms) in [("AAA", 0i64), ("BBB", 1_000), ("CCC", 2_000)] {
+            let hs = heard_station(call, Band::B20m, OverAirMode::Ft8, now - age_ms);
+            heard.insert((hs.call.clone(), hs.band, hs.mode), hs);
+        }
+        // 10 minutes old → past the 5-minute window.
+        let stale = heard_station("OLD", Band::B20m, OverAirMode::Ft8, now - 600_000);
+        heard.insert((stale.call.clone(), stale.band, stale.mode), stale);
+
+        let out = assemble_heard(&mut heard, HEARD_WINDOW, 2);
+        assert_eq!(
+            heard.len(),
+            3,
+            "the stale entry was pruned from the map in place"
+        );
+        assert_eq!(out.len(), 2, "the result is capped");
+        assert_eq!(out[0].call, Callsign("AAA".into()), "newest first");
+        assert_eq!(out[1].call, Callsign("BBB".into()), "then the next-newest");
+    }
+
+    // `encode_beacon` trims the (newest-first) heard list oldest-first until the
+    // framed snapshot fits one datagram, keeping the most-recently-heard in order.
+    #[test]
+    fn encode_beacon_trims_to_one_datagram_keeping_newest() {
+        let station = StationId("n0jdc-fieldday".into());
+        // 200 stations, newest-first (t descending), as `assemble_heard` yields.
+        let heard: Vec<HeardStation> = (0..200i64)
+            .rev()
+            .map(|t| heard_station(&format!("W{t}ABC"), Band::B20m, OverAirMode::Ft8, t))
+            .collect();
+        let bytes = encode_beacon(&station, 42, None, heard).expect("encodes");
+        assert!(
+            bytes.len() <= PUSH_MTU_BUDGET,
+            "trimmed snapshot {} B must fit the datagram budget {PUSH_MTU_BUDGET}",
+            bytes.len()
+        );
+        let kept = match wire::decode(&bytes).unwrap().msg {
+            Wire::Snapshot(s) => s.heard,
+            other => panic!("expected Snapshot, got {other:?}"),
+        };
+        assert!(
+            !kept.is_empty() && kept.len() < 200,
+            "some but not all entries survive the trim (got {})",
+            kept.len()
+        );
+        // The survivors are the newest, in order: t = 199, 198, ….
+        for (i, hs) in kept.iter().enumerate() {
+            assert_eq!(
+                hs.last_heard,
+                Timestamp(199 - i as i64),
+                "kept the newest, in order"
+            );
+        }
+    }
+
+    // An empty heard list always produces a (small) datagram — the no-heard beacon.
+    #[test]
+    fn encode_beacon_empty_heard_ships() {
+        let bytes = encode_beacon(&StationId("me".into()), 1, None, vec![]).expect("encodes");
+        match wire::decode(&bytes).unwrap().msg {
+            Wire::Snapshot(s) => assert!(s.heard.is_empty()),
+            other => panic!("expected Snapshot, got {other:?}"),
+        }
     }
 }

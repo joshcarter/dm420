@@ -45,7 +45,7 @@
 - [ ] Shared logbook, full (Step 2): outbound push, inbound merge, G-set, anti-entropy digest/request/reply, origin-distinct UI
 - [ ] Origin prerequisites: `origin: Mine|Peer` on the GUI `HeardEntry` / `MapSpot`; the worked producer emits `WorkedByNetwork`
 - [ ] Working-intent (Step 3): the deconfliction overlay shipped; remaining = auto-pick exclusion of peers' offsets
-- [ ] Heard/band aggregation (Step 4): peers' heard-stations + band-activity into the local views — `core::band_status` already merges peer `StationSnapshot.heard` (now carrying `mode`) and `HeardStation` has the field; remaining is the LAN beacon *populating* `heard` (from the producer's `Mine`-origin set) so peer rows fill
+- [ ] Heard/band aggregation (Step 4): peers' heard-stations + band-activity into the local views — `core::band_status` already merges peer `StationSnapshot.heard` (now carrying `mode`), and the LAN beacon **now populates `heard`** from the local enriched-decode stream (recency-bounded + datagram-trimmed), so peer heard **counts** now reach the band-status panel. Remaining: GUI **map** dots for peer heard (needs `origin` on `MapSpot`/`HeardEntry`, per Origin prerequisites above); `band_activity` still empty (next line)
 - [ ] Shared band-scan: beacon `band_activity`; show peers' scan results
 
 **Decoder** — see `docs/decoder_*.md` (W's lane):
