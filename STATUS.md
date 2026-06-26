@@ -60,6 +60,7 @@
 
 ## Backlog / under consideration
 - [ ] **Field Day log reset** — J — no clear/truncate path exists (no `SessionCommand::ClearLog`; logbook is append-only; `ARCHITECTURE_REVIEW.md:271` flags `scanner.worked` growing unbounded). Needed so practice/prior QSOs don't count as dupes at contest start. Hook: a reset command → logbook archives-then-zeros + republishes an empty `logbook/entries` → the `WorkedStatus` producer and every consumer fall to empty automatically (single-owner pays off here).
+- General QSO optimization. If a station calls us before we start CQ again, instead of directly answering the station we call CQ then (hopefully) they call us after that. We could just call them directly instead of calling CQ.
 - Map: grid squares drawn in the wrong places
 - Map: turn off crosshairs after a QSO clears; highlight a station that answers my CQ
 - After a QSO finishes: unhighlight traffic + reset the Send box to CQ
