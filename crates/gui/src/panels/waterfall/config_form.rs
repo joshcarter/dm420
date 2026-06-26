@@ -3,7 +3,7 @@
 use eframe::egui;
 
 use app_core::{LineProfile, Protocol, SerialConfig};
-use types::{Band, HF_BANDS};
+use types::{Band, ContestProfile, HF_BANDS};
 
 use crate::bus_view::BusView;
 use crate::settings::{DEFAULT_BAUD, HardwareConfig, KENWOOD_BAUDS};
@@ -107,7 +107,18 @@ impl ConfigForm {
             .collect()
     }
 
-    pub(super) fn ui(&mut self, ui: &mut egui::Ui, bus: &BusView, pal: &Palette, wide: &mut bool, auto_hop: &mut bool) {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        bus: &BusView,
+        pal: &Palette,
+        wide: &mut bool,
+        auto_hop: &mut bool,
+        contest: &mut ContestProfile,
+        fd_class: &mut String,
+        fd_section: &mut String,
+    ) {
         if !self.loaded {
             self.load(bus);
         }
@@ -308,6 +319,82 @@ impl ConfigForm {
                         }
                     });
 
+                // Contest: the active exchange profile. Editing it here edits the
+                // station identity directly (like call/grid in the top bar); the
+                // change is persisted to [station] and pushed to the QSO engine when
+                // the GUI re-locks. ARRL Field Day swaps the engine into the FD flow
+                // (CQ FD … + the <class> <section> exchange), so the class/section
+                // fields only appear — and are only sent — for that profile.
+                ui.add_space(10.0);
+                ui.separator();
+                ui.label(egui::RichText::new("CONTEST").color(pal.legend).strong());
+                ui.add_space(4.0);
+                egui::Grid::new("contest_grid")
+                    .num_columns(2)
+                    .spacing([12.0, 8.0])
+                    .show(ui, |ui| {
+                        ui.label("Contest");
+                        egui::ComboBox::from_id_salt("contest")
+                            .selected_text(contest_label(*contest))
+                            .width(180.0)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    contest,
+                                    ContestProfile::Standard,
+                                    contest_label(ContestProfile::Standard),
+                                );
+                                ui.selectable_value(
+                                    contest,
+                                    ContestProfile::ArrlFieldDay,
+                                    contest_label(ContestProfile::ArrlFieldDay),
+                                );
+                            });
+                        ui.end_row();
+
+                        if *contest == ContestProfile::ArrlFieldDay {
+                            // Class + section are kept upper-case to match the on-air
+                            // exchange convention, the same as the call/grid fields.
+                            ui.label("Class");
+                            if ui
+                                .add(
+                                    egui::TextEdit::singleline(fd_class)
+                                        .char_limit(4)
+                                        .desired_width(80.0)
+                                        .hint_text("3A"),
+                                )
+                                .changed()
+                            {
+                                *fd_class = fd_class.to_uppercase();
+                            }
+                            ui.end_row();
+
+                            ui.label("Section");
+                            if ui
+                                .add(
+                                    egui::TextEdit::singleline(fd_section)
+                                        .char_limit(4)
+                                        .desired_width(80.0)
+                                        .hint_text("CO"),
+                                )
+                                .changed()
+                            {
+                                *fd_section = fd_section.to_uppercase();
+                            }
+                            ui.end_row();
+                        }
+                    });
+                if *contest == ContestProfile::ArrlFieldDay {
+                    ui.add_space(2.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "Class = transmitters + power category (e.g. 3A); section = \
+                             your ARRL/RAC section (e.g. CO). Sent in place of the grid.",
+                        )
+                        .color(pal.sub)
+                        .italics(),
+                    );
+                }
+
                 // Display preferences apply immediately and persist on their own (not
                 // tied to the lock-to-apply hardware flow), so the change is in effect
                 // the moment you re-lock and see the waterslide again.
@@ -344,6 +431,13 @@ impl ConfigForm {
                     bus.set_auto_hop(*auto_hop);
                 }
             });
+    }
+}
+
+fn contest_label(c: ContestProfile) -> &'static str {
+    match c {
+        ContestProfile::Standard => "None",
+        ContestProfile::ArrlFieldDay => "ARRL Field Day",
     }
 }
 

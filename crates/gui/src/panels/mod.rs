@@ -7,6 +7,8 @@
 use eframe::egui;
 use egui::{Rect, TextureHandle};
 
+use types::ContestProfile;
+
 use crate::bus_view::BusView;
 use crate::theme::Palette;
 
@@ -44,6 +46,17 @@ pub struct PanelCtx<'a> {
     /// The operator's Maidenhead grid locator. Used by the send row and to centre
     /// the Contacts map on home.
     pub grid: &'a str,
+    /// The active contest exchange profile, edited live by the Digital panel's
+    /// unlocked CONTEST selector. Mutable so the form can flip it; the change is
+    /// committed to the QSO engine + config file when the GUI re-locks (the same
+    /// path as call/grid). Other panels ignore it.
+    pub contest: &'a mut ContestProfile,
+    /// The Field Day transmitter/power class (e.g. `"3A"`), edited by the CONTEST
+    /// selector when Field Day is active. Mutable for the same reason as `contest`.
+    pub fd_class: &'a mut String,
+    /// The Field Day ARRL/RAC section (e.g. `"CO"`), edited by the CONTEST selector
+    /// when Field Day is active.
+    pub fd_section: &'a mut String,
     /// True when the GUI is unlocked (the top-bar GUI switch is on EDIT). Panels
     /// use this to reveal their edit/settings affordances; the default (locked)
     /// is the normal operating view. Each panel decides what unlocking means for

@@ -698,6 +698,15 @@ impl BusView {
         self.qso_control.set_station(station);
     }
 
+    /// The station identity / contest the QSO engine is *currently* transmitting
+    /// with — the last value committed via [`set_qso_station`](Self::set_qso_station)
+    /// (re-lock). The send-box preview builds from this so the box can't show a
+    /// message (e.g. `CQ FD`) the engine wouldn't actually air: same config + same
+    /// `qso::message` builders ⇒ identical text.
+    pub fn qso_station(&self) -> qso::StationConfig {
+        self.qso_control.station()
+    }
+
     /// The current QSO-engine state (phase, partner, queued next message), if it
     /// has published yet.
     pub fn qso_state(&self) -> Option<QsoState> {

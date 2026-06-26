@@ -429,7 +429,16 @@ impl Panel for Waterfall {
                         .layout(egui::Layout::top_down(egui::Align::Min)),
                 );
                 child.set_clip_rect(screen.shrink(2.0));
-                self.form.ui(&mut child, ctx.bus, pal, &mut self.wide_decode, &mut self.auto_hop);
+                self.form.ui(
+                    &mut child,
+                    ctx.bus,
+                    pal,
+                    &mut self.wide_decode,
+                    &mut self.auto_hop,
+                    &mut *ctx.contest,
+                    &mut *ctx.fd_class,
+                    &mut *ctx.fd_section,
+                );
             }
         } else {
             // Locked: re-locking the GUI commits any edits made while unlocked.

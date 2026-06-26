@@ -90,12 +90,24 @@ pub fn calling_freq_hz(band: Band, mode: OverAirMode) -> Option<u64> {
     bus::types::calling_freq(band, mode).map(|a| a.0)
 }
 
-/// The next auto-generated message for the current selection: a CQ call when the
-/// operator picked bare spectrum, or a Tx1 grid answer when they picked a station.
-pub fn next_message(target: &Target, mycall: &str, grid: &str) -> String {
+/// The next auto-generated message for the current selection, built with the same
+/// `qso::message` formatters the engine transmits with — so the send-box preview
+/// can never drift from the real on-air text. A CQ when the operator picked bare
+/// spectrum, or the Tx1 opener when they picked a station; the active
+/// [`qso::StationConfig`] (its `ContestProfile`) selects the wording: Standard
+/// gives `CQ <mine> <grid>` / `<his> <mine> <grid>`, Field Day gives
+/// `CQ FD <mine> <grid>` / the bare `<his> <mine> <class> <section>` opener.
+pub fn next_message(target: &Target, me: &qso::StationConfig) -> String {
     match target.station() {
-        Some(call) => format!("{call} {mycall} {grid}"),
-        None => format!("CQ {mycall} {grid}"),
+        Some(call) => {
+            let his = types::Callsign(call.to_string());
+            if me.is_field_day() {
+                qso::message::fd_exchange(me, &his).text
+            } else {
+                qso::message::answer_grid(me, &his).text
+            }
+        }
+        None => qso::message::cq(me).text,
     }
 }
 
@@ -118,9 +130,9 @@ pub struct SendState {
 impl SendState {
     /// Keep the box mirroring the engine's next message, unless the operator is
     /// mid-command. Independent of arm state — the box always shows what we'd send.
-    pub fn refresh_auto(&mut self, target: &Target, mycall: &str, grid: &str) {
+    pub fn refresh_auto(&mut self, target: &Target, me: &qso::StationConfig) {
         if !self.entering {
-            self.buf = next_message(target, mycall, grid);
+            self.buf = next_message(target, me);
         }
     }
 
@@ -257,17 +269,29 @@ mod tests {
 
     #[test]
     fn auto_message_reflects_selection() {
-        let cq = next_message(&Target::Offset(300), "N0JDC", "DN70");
-        assert_eq!(cq, "CQ N0JDC DN70");
-        let answer = next_message(
-            &Target::Station {
-                call: "K1ABC".into(),
-                off: 1180,
-            },
-            "N0JDC",
-            "DN70",
-        );
-        assert_eq!(answer, "K1ABC N0JDC DN70");
+        let me = qso::StationConfig {
+            call: types::Callsign("N0JDC".into()),
+            grid: types::GridSquare("DN70".into()),
+            fd_class: "3A".into(),
+            fd_section: types::Section("CO".into()),
+            contest: types::ContestProfile::Standard,
+        };
+        let station = Target::Station {
+            call: "K1ABC".into(),
+            off: 1180,
+        };
+        // Standard: plain CQ + grid answer.
+        assert_eq!(next_message(&Target::Offset(300), &me), "CQ N0JDC DN70");
+        assert_eq!(next_message(&station, &me), "K1ABC N0JDC DN70");
+
+        // Field Day: CQ FD + the bare <class> <section> opener (no grid) — the same
+        // strings the engine builds, so the preview matches what actually airs.
+        let fd = qso::StationConfig {
+            contest: types::ContestProfile::ArrlFieldDay,
+            ..me.clone()
+        };
+        assert_eq!(next_message(&Target::Offset(300), &fd), "CQ FD N0JDC DN70");
+        assert_eq!(next_message(&station, &fd), "K1ABC N0JDC 3A CO");
     }
 
     #[test]

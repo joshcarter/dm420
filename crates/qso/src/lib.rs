@@ -20,7 +20,11 @@
 #![forbid(unsafe_code)]
 
 mod engine;
-mod message;
+/// Outgoing-message builders ([`message::cq`], [`message::answer_grid`],
+/// [`message::fd_exchange`], …). Public so consumers — notably the GUI send-box
+/// preview — render the *would-be* next message with the same formatter the engine
+/// transmits with, instead of re-deriving the on-air strings (which drift).
+pub mod message;
 mod shell;
 
 pub use engine::{CompletedQso, Engine, Event, Step, TxIntent};

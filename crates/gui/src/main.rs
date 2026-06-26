@@ -161,6 +161,13 @@ struct Tactical<'a> {
     /// The operator's configured station identity, threaded to the panels.
     call: &'a str,
     grid: &'a str,
+    /// The contest exchange profile + Field Day exchange, threaded mutably so the
+    /// unlocked Digital panel's CONTEST selector can edit them in place (on the
+    /// `App`'s `Station`, the single owner). Disjoint `Station` fields from
+    /// `call`/`grid` above, so the shared + exclusive borrows coexist.
+    contest: &'a mut types::ContestProfile,
+    fd_class: &'a mut String,
+    fd_section: &'a mut String,
     unlocked: bool,
     /// The pane that currently receives keyboard input. Panels compare their own
     /// tile id against this to decide whether Enter/typing is theirs to handle.
@@ -206,6 +213,9 @@ impl<'a> Behavior<Box<dyn Panel>> for Tactical<'a> {
             bus: self.bus,
             call: self.call,
             grid: self.grid,
+            contest: &mut *self.contest,
+            fd_class: &mut *self.fd_class,
+            fd_section: &mut *self.fd_section,
             unlocked: self.unlocked,
             active: id == self.focused,
             selected_station: &mut *self.selected_station,
@@ -636,6 +646,9 @@ impl eframe::App for App {
                     bus: &self.view,
                     call: &self.station.call,
                     grid: &self.station.grid,
+                    contest: &mut self.station.contest,
+                    fd_class: &mut self.station.fd_class,
+                    fd_section: &mut self.station.fd_section,
                     unlocked: self.edit_mode,
                     focused: self.focused,
                     clicked: &mut clicked,

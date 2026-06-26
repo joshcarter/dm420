@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use app_core::{CoreConfig, DecodeSource, LineProfile, Protocol, SerialConfig, DEFAULT_TX_GAIN};
-use types::{Band, HF_BANDS, OverAirMode, StationId, calling_freq};
+use types::{Band, ContestProfile, HF_BANDS, OverAirMode, StationId, calling_freq};
 
 use crate::config_toml::{
     bool_str, config_path, format_f32, parse_float, parse_table_value, parse_u16, update_toml_table,
@@ -83,6 +83,17 @@ pub struct HardwareConfig {
 pub struct Station {
     pub call: String,
     pub grid: String,
+    /// The active contest exchange profile. `Standard` (the default) is normal
+    /// operating; `ArrlFieldDay` switches the QSO engine to the Field Day flow
+    /// (`CQ FD …` + the `<class> <section>` exchange). Edited live from the
+    /// unlocked Digital panel's CONTEST selector; committed on re-lock.
+    pub contest: ContestProfile,
+    /// Field Day transmitter count + power class, e.g. `"3A"`. Only meaningful
+    /// (and only shown) when `contest` is `ArrlFieldDay`. Upper-cased on entry.
+    pub fd_class: String,
+    /// Field Day ARRL/RAC section, e.g. `"CO"`. Like `fd_class`, only used for
+    /// the Field Day exchange. Upper-cased on entry.
+    pub fd_section: String,
 }
 
 impl Station {
@@ -94,7 +105,9 @@ impl Station {
     /// file). The config format/persistence is interim and TBD — see
     /// `joels-notes.md`.
     pub fn load() -> Self {
-        let (toml_call, toml_grid) = read_station_config(&config_path());
+        let path = config_path();
+        let (toml_call, toml_grid) = read_station_config(&path);
+        let (contest, fd_class, fd_section) = read_station_contest(&path);
         Station {
             call: env_nonempty("DM420_CALLSIGN")
                 .or(toml_call)
@@ -104,6 +117,9 @@ impl Station {
                 .or(toml_grid)
                 .unwrap_or_default()
                 .to_uppercase(),
+            contest,
+            fd_class: fd_class.unwrap_or_default().to_uppercase(),
+            fd_section: fd_section.unwrap_or_default().to_uppercase(),
         }
     }
 
@@ -120,20 +136,34 @@ impl Station {
         let path = config_path();
         let existing = std::fs::read_to_string(&path).ok();
         let text = update_station_config(existing.as_deref(), &self.call, &self.grid);
+        // The contest profile + Field Day exchange live in the same `[station]`
+        // table, written in a second pass so the call/grid template logic above is
+        // untouched (a fresh file already carries these keys via `default_station_toml`;
+        // this rewrites them in place). The class/section strings are persisted even
+        // when not in Field Day, so toggling the contest back on restores them.
+        let text = update_toml_table(
+            &text,
+            "station",
+            &[
+                ("contest", contest_str(self.contest)),
+                ("fd_class", &self.fd_class),
+                ("fd_section", &self.fd_section),
+            ],
+        );
         write_config(&path, &text);
     }
 
-    /// The identity the QSO engine builds outgoing messages from. The contest
-    /// profile and Field Day exchange are placeholders until a contest/exchange
-    /// UI exists — TODO: surface `ContestProfile` + the FD `<class> <section>`
-    /// (the engine already sequences both profiles; only the picker is missing).
+    /// The identity the QSO engine builds outgoing messages from: call/grid plus
+    /// the active contest profile and (for Field Day) the `<class> <section>`
+    /// exchange. The CONTEST selector in the unlocked Digital panel edits these
+    /// fields live; this is pushed to the engine on re-lock (`set_qso_station`).
     pub fn to_qso_config(&self) -> qso::StationConfig {
         qso::StationConfig {
             call: types::Callsign(self.call.clone()),
             grid: types::GridSquare(self.grid.clone()),
-            fd_class: "1B".into(),
-            fd_section: types::Section("CO".into()),
-            contest: types::ContestProfile::Standard,
+            fd_class: self.fd_class.clone(),
+            fd_section: types::Section(self.fd_section.clone()),
+            contest: self.contest,
         }
     }
 }
@@ -380,6 +410,51 @@ fn read_station_config(path: &Path) -> (Option<String>, Option<String>) {
     match std::fs::read_to_string(path) {
         Ok(text) => parse_station_config(&text),
         Err(_) => (None, None),
+    }
+}
+
+/// Read the contest exchange settings (`contest`, `fd_class`, `fd_section`) from
+/// the config file's `[station]` table. A missing file (or `[station]`) reads as
+/// the default: `Standard` with no exchange.
+fn read_station_contest(path: &Path) -> (ContestProfile, Option<String>, Option<String>) {
+    match std::fs::read_to_string(path) {
+        Ok(text) => parse_station_contest(&text),
+        Err(_) => (ContestProfile::Standard, None, None),
+    }
+}
+
+/// Pull the contest profile + Field Day exchange from the `[station]` table. An
+/// absent/blank `contest` key reads as `Standard` (normal operating); `fd_class`
+/// / `fd_section` are `None` when unset (the same empty-is-unset convention as the
+/// other `[station]` keys).
+fn parse_station_contest(text: &str) -> (ContestProfile, Option<String>, Option<String>) {
+    let contest = parse_table_value(text, "station", "contest")
+        .map(|s| parse_contest(&s))
+        .unwrap_or(ContestProfile::Standard);
+    let fd_class = parse_table_value(text, "station", "fd_class");
+    let fd_section = parse_table_value(text, "station", "fd_section");
+    (contest, fd_class, fd_section)
+}
+
+/// Parse a `[station] contest` token into a [`ContestProfile`]. `field_day` (the
+/// value [`contest_str`] writes) and a few friendly aliases select ARRL Field Day;
+/// anything else — including `none`, blank, or an unknown contest — is `Standard`,
+/// so a fat-fingered value degrades to normal operating rather than a wrong mode.
+/// Case- and separator-insensitive (`ARRL Field Day`, `arrl-field-day` both work).
+fn parse_contest(s: &str) -> ContestProfile {
+    let norm = s.trim().to_ascii_lowercase().replace([' ', '-'], "_");
+    match norm.as_str() {
+        "field_day" | "fd" | "arrl_field_day" => ContestProfile::ArrlFieldDay,
+        _ => ContestProfile::Standard,
+    }
+}
+
+/// The `[station] contest` token written for a profile (the inverse of
+/// [`parse_contest`]).
+fn contest_str(c: ContestProfile) -> &'static str {
+    match c {
+        ContestProfile::Standard => "none",
+        ContestProfile::ArrlFieldDay => "field_day",
     }
 }
 
@@ -744,6 +819,12 @@ fn default_station_toml(call: &str, grid: &str) -> String {
          [station]\n\
          callsign = \"{call}\"\n\
          grid = \"{grid}\"\n\
+         # Contest exchange: \"none\" for normal operating, or \"field_day\" for ARRL\n\
+         # Field Day — then fd_class (transmitters + power class, e.g. \"3A\") and\n\
+         # fd_section (your ARRL/RAC section, e.g. \"CO\") are exchanged in place of the grid.\n\
+         contest = \"none\"\n\
+         fd_class = \"\"\n\
+         fd_section = \"\"\n\
          # Multi-op identity: who logged/heard a contact, distinct from the (shared)\n\
          # callsign. Blank = auto-derived from this machine's host name. Operators\n\
          # sharing a club call (Field Day) MUST each set a distinct station_id.\n\
@@ -919,6 +1000,33 @@ mod tests {
     #[test]
     fn empty_config_is_unset() {
         assert_eq!(parse_station_config(""), (None, None));
+    }
+
+    #[test]
+    fn contest_defaults_then_round_trips_through_the_station_table() {
+        // Absent / blank / unknown contest ⇒ Standard with no exchange.
+        assert_eq!(parse_station_contest(""), (ContestProfile::Standard, None, None));
+        assert_eq!(parse_contest("none"), ContestProfile::Standard);
+        assert_eq!(parse_contest("ssb sweepstakes"), ContestProfile::Standard);
+        // Field Day aliases (case- and separator-insensitive).
+        assert_eq!(parse_contest("field_day"), ContestProfile::ArrlFieldDay);
+        assert_eq!(parse_contest("ARRL Field Day"), ContestProfile::ArrlFieldDay);
+        assert_eq!(parse_contest("FD"), ContestProfile::ArrlFieldDay);
+
+        // What `Station::save` writes (callsign/grid pass, then the contest pass),
+        // read back the way `Station::load` does — with comments + callsign intact.
+        let base = update_station_config(Some("# top\n[station]\ncallsign = \"W4LL\"\n"), "W4LL", "EM73");
+        let text = update_toml_table(
+            &base,
+            "station",
+            &[("contest", contest_str(ContestProfile::ArrlFieldDay)), ("fd_class", "3A"), ("fd_section", "CO")],
+        );
+        assert!(text.contains("# top"), "header comment kept: {text}");
+        assert_eq!(parse_station_config(&text).0.as_deref(), Some("W4LL"), "callsign survives: {text}");
+        assert_eq!(
+            parse_station_contest(&text),
+            (ContestProfile::ArrlFieldDay, Some("3A".to_string()), Some("CO".to_string())),
+        );
     }
 
     #[test]

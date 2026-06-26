@@ -30,8 +30,17 @@ impl Waterfall {
     pub(super) fn draw_send_row(&mut self, ctx: &mut PanelCtx, row: Rect) {
         // The operator's configured station identity. There is no default, so gate
         // operating until a callsign is set (top bar when unlocked, or the config file).
-        let (mycall, mygrid) = (ctx.call, ctx.grid);
+        let mycall = ctx.call;
         let call_set = !mycall.trim().is_empty();
+        // The config the QSO engine is *currently* transmitting with — read straight
+        // from the engine (its committed `StationConfig`), NOT a parallel copy of the
+        // live `Station`. The send-box preview builds from this with the same
+        // `qso::message` formatters the engine uses, so the box can never show a
+        // message the engine wouldn't actually air (e.g. `CQ FD` before the contest
+        // change has been committed on re-lock). The contest/class/section are applied
+        // to the engine on re-lock (top bar), so until then the box honestly shows the
+        // still-active profile.
+        let me_config = ctx.bus.qso_station();
 
         // Keyboard: only the active panel acts on typed input / Enter. `/` or `:`
         // begins a slash command; Backspace/Escape edit/abort it; Enter activates
@@ -211,7 +220,7 @@ impl Waterfall {
             },
             None => Target::Offset(tx_off as i32),
         };
-        self.send.refresh_auto(&preview, mycall, mygrid);
+        self.send.refresh_auto(&preview, &me_config);
 
         // Live QSO-engine state drives the display and the button.
         let qso = ctx.bus.qso_state();

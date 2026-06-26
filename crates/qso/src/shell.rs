@@ -70,6 +70,15 @@ impl QsoControl {
         *self.station.lock().unwrap() = station;
     }
 
+    /// The station identity / contest the engine is *currently* building messages
+    /// from — the same `StationConfig` the run loop reads before each event (the
+    /// last value `set_station` committed). The GUI reads this so its send-box
+    /// preview is built from the engine's committed config, never a parallel copy
+    /// that could disagree with what actually airs.
+    pub fn station(&self) -> StationConfig {
+        self.station.lock().unwrap().clone()
+    }
+
     /// Enable/disable auto-QSY after unanswered CQs (the UI's AUTO QSY toggle).
     pub fn set_auto_hop(&self, on: bool) {
         self.hop.lock().unwrap().auto = on;
