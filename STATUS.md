@@ -18,7 +18,7 @@
 
 ### Joel's notes on this section
 
-I think we can disregard the log reset and the FD log tags. The rationale is we can just move our old log files to another location and start with clean logs for field day and then archive / parse / score those logs after field day. This will save us a task we don't have time for.
+I think we can disregard the log reset. The rationale is we can just move our old log files to another location and start with clean logs for field day and then archive / parse / score those logs after field day. This will save us a task we don't have time for. The tagging would be good because Josh pointed out that if we have various non-FD contacts appear in the log those would be more easily identifible and filterable.
 
 ## Field Day Desired
 
