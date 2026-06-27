@@ -219,7 +219,7 @@ dupe for the group (Field Day is one group entry). Auto-pick excludes
 | Repeat policy | Keep repeating the current message every period until content advances it or the operator disarms. |
 | CQ with no answer | Keep calling CQ indefinitely. |
 | When to log | **Normal:** `RR73` **received** (we answered) or `RR73` **sent** (we called CQ). **Field Day mirrors this:** we answered → log on `RR73` **sent** (our `Tx4`); we called CQ → log on `RR73` **received** (we then send the final `Tx5` `73`). |
-| After completed QSO | Resume CQ if we started by calling CQ (same offset); go **idle** if we were answering a station. |
+| After completed QSO | **Normal:** resume CQ if we started by calling CQ (same offset); go **idle** if we were answering a station. **Field Day:** always go **idle** — a Field Day contact must be human-initiated, so the CQ side does *not* auto-sequence back into calling CQ. It still sends its courtesy `Tx5 73`, then idles; the operator re-arms (Enter → `CallCq`) to call CQ again. |
 | `RR73` vs `RRR` | Send `RR73`; accept both inbound. |
 
 ## 8. Open / revisit-later

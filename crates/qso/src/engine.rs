@@ -435,10 +435,20 @@ fn advance(role: Role, fd: bool, kind: MsgKind) -> Transition {
 /// the Field Day CQ side on their roger); otherwise we've already logged on RR73-sent
 /// (Standard CQ side) and just resume CQ. Logging-on-receive is gated on `!logged` by
 /// the applier reading the live contact, so it isn't decided here.
+///
+/// **Field Day is human-initiated only:** the FD CQ side still sends its courtesy `73`,
+/// but then drops to **idle** instead of auto-resuming CQ — a Field Day contact may not be
+/// machine-started, so the operator must re-arm (Enter → `CallCq`) to call CQ again. In
+/// **Standard** mode the CQ side keeps resuming CQ hands-off.
 fn signoff_outcome(role: Role, fd: bool, k: Signoff) -> Outcome {
     let courtesy = role == Role::Answering || (fd && is_roger(k));
     if courtesy {
-        let finish = if role == Role::CallingCq {
+        // CQ side resumes CQ after a completed contact — except in Field Day, where it
+        // idles and waits for the operator to re-arm (legality: no auto-initiated QSOs).
+        // The answering side always idles. (Within this branch the CQ side is reached only
+        // in Field Day, so `&& !fd` is what makes the FD courtesy CQ side idle while keeping
+        // the Standard intent legible and correct-by-construction.)
+        let finish = if role == Role::CallingCq && !fd {
             Finish::ResumeCq
         } else {
             Finish::Idle
@@ -1853,7 +1863,9 @@ mod tests {
             -8,
         )));
         assert_eq!(tx_text(&mut e, 4).as_deref(), Some("K1ABC W9XYZ R 3A WI"));
-        // Their RR73 → log on receive, send a single 73, resume CQ.
+        // Their RR73 → log on receive, send the courtesy 73, then go *idle*. Field Day is
+        // human-initiated only: the CQ side does NOT auto-resume CQ — the operator must
+        // re-arm to call CQ again. (Standard mode resumes CQ here.)
         let s = e.step(Event::Decode(decode(
             signoff(ME, HIM, Signoff::Rr73),
             5,
@@ -1863,7 +1875,15 @@ mod tests {
         assert_eq!(log.exchange_sent, "3A WI");
         assert_eq!(log.exchange_rcvd, "2B IL");
         assert_eq!(tx_text(&mut e, 6).as_deref(), Some("K1ABC W9XYZ 73"));
-        assert_eq!(e.state().phase, QsoPhase::Calling);
+        assert_eq!(
+            e.state().phase,
+            QsoPhase::Idle,
+            "FD CQ side idles after the courtesy 73 — operator re-arms to CQ again"
+        );
+        // No auto-CQ on our next slot; the operator re-arms with Enter → calling CQ again.
+        assert_eq!(tx_text(&mut e, 8), None, "idle: no auto-CQ");
+        e.step(Event::Command(QsoCommand::CallCq));
+        assert_eq!(tx_text(&mut e, 10).as_deref(), Some("CQ FD W9XYZ EM48"));
     }
 
     #[test]
@@ -2835,11 +2855,12 @@ mod tests {
                 assert_eq!(o.progress, Progress::Signoff);
             }
         }
-        // FD CQ side on a roger: courtesy 73, then resume CQ.
+        // FD CQ side on a roger: courtesy 73, then *idle* — Field Day is human-initiated
+        // only, so we do not auto-resume CQ; the operator re-arms to call CQ again.
         for k in [Signoff::Rrr, Signoff::Rr73] {
             let o = signoff_outcome(CallingCq, true, k);
             assert_eq!(o.reply, Reply::Seven3);
-            assert_eq!(o.settle, Settle::FinishOnSend(Finish::ResumeCq));
+            assert_eq!(o.settle, Settle::FinishOnSend(Finish::Idle));
         }
         // FD CQ side on a bare 73: no courtesy, resume CQ now.
         let o = signoff_outcome(CallingCq, true, Signoff::Seven3);

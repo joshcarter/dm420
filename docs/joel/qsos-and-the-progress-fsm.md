@@ -299,7 +299,7 @@ fact for the log · ↳ follow-on transition after our *own* TX.
 | 🟩 **Replying** | `Answering · Std` · rx **report** → us | 🟧 RogerReport | 📤 roger+report `Tx3` · 💾 their report |
 | 🟩 **Replying** | `Answering · FD` · rx **R-exchange** → us | 🟥 Rogers | 📤 `RR73` `Tx4` · 📝 **on send** · 💾 their class+section · ↳ ⬜ Idle once it sends |
 | 🟨 **Report** | `CallingCq · Std` · rx **R-report** → us | 🟥 Rogers | 📤 `RR73` `Tx4` · 📝 **on send** · await their 73 |
-| 🟧 **RogerReport** / 🟥 **Rogers** | rx **sign-off** (RRR/RR73/73) → us | ⬛ Signoff ↳ ⬜ Idle *(answering)* / 🟦 Calling *(CQ side)* | 📝 **on receive** (if not yet logged) · 📤 courtesy `73` `Tx5` when we hold the slot (answering, or FD CQ side on RR73); Std CQ side already logged-on-send → no 73 |
+| 🟧 **RogerReport** / 🟥 **Rogers** | rx **sign-off** (RRR/RR73/73) → us | ⬛ Signoff ↳ ⬜ Idle *(answering, **and FD CQ side**)* / 🟦 Calling *(Std CQ side)* | 📝 **on receive** (if not yet logged) · 📤 courtesy `73` `Tx5` when we hold the slot (answering, or FD CQ side on RR73); Std CQ side already logged-on-send → no 73. **Field Day is human-initiated only:** the FD CQ side sends its courtesy 73 then **idles** (does *not* auto-resume CQ) — the operator re-arms to call CQ again. |
 | 🟩🟨🟧🟥 **any in-contact** | partner addresses **someone else** | 🟪 Armed *(answering)* / 🟦 Calling *(CQ side)* | abandon — lost race |
 | 🟩🟨🟧🟥 **any in-contact** | **no progress** for N overs (tick) | 🟦 Calling / ⬜ Idle | one-shot `TimedOut`, then fall back |
 | 🟩🟨🟧🟥 **any in-contact** | repeated / contest-mismatched / non-partner msg | *(unchanged)* | ignored — re-📤 current msg; give-up counter climbs |
