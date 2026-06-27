@@ -67,8 +67,8 @@ pub struct Waterfall {
     /// while it matches the current selection's target. (It can't ride in `Selection`,
     /// which carries who + where, not a `ParsedMessage`.)
     resume: Option<(DecodeRef, ParsedMessage, i8)>,
-    /// The QSO phase observed last frame, so a completed contact deselects exactly
-    /// once on the edge into `Complete` (rather than republishing every frame).
+    /// The QSO phase observed last frame, so a finished contact deselects exactly
+    /// once on the edge *out of* `InExchange` (rather than republishing every frame).
     prev_phase: Option<QsoPhase>,
     /// The message latched on the air for the current over, held in the Send box
     /// until the transmission finishes — even after the engine has advanced its
@@ -216,10 +216,15 @@ impl Panel for Waterfall {
             .qso_state()
             .map(|s| s.phase)
             .unwrap_or(QsoPhase::Idle);
-        // A completed contact (final 73 sent) deselects the worked station so the send
-        // box reverts to the default CQ. Clear the selection once, on the edge into
-        // `Complete`; the audio offset is left where it is (a bare deselect).
-        if op_phase == QsoPhase::Complete && self.prev_phase != Some(QsoPhase::Complete) {
+        // A finished contact deselects the worked station so the send box reverts to
+        // the default CQ and the map crosshair clears. The engine never publishes
+        // `Complete`, so key off the edge *out of* the in-contact phase: `InExchange`
+        // -> a QSO-ended phase (a clean finish resumes `Calling` or goes `Idle`; a
+        // give-up goes `TimedOut`). `Armed` is excluded, so re-targeting another
+        // station mid-contact keeps the new selection. Fires once; offset left as-is.
+        if matches!(self.prev_phase, Some(QsoPhase::InExchange { .. }))
+            && matches!(op_phase, QsoPhase::Idle | QsoPhase::Calling | QsoPhase::TimedOut)
+        {
             ctx.bus.select(None, None);
             self.resume = None;
         }

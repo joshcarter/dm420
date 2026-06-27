@@ -63,8 +63,8 @@
 - [ ] **Field Day log reset** — J — no clear/truncate path exists (no `SessionCommand::ClearLog`; logbook is append-only; `ARCHITECTURE_REVIEW.md:271` flags `scanner.worked` growing unbounded). Needed so practice/prior QSOs don't count as dupes at contest start. Hook: a reset command → logbook archives-then-zeros + republishes an empty `logbook/entries` → the `WorkedStatus` producer and every consumer fall to empty automatically (single-owner pays off here).
 - General QSO optimization. If a station calls us before we start CQ again, instead of directly answering the station we call CQ then (hopefully) they call us after that. We could just call them directly instead of calling CQ.
 - Map: grid squares drawn in the wrong places
-- Map: turn off crosshairs after a QSO clears; highlight a station that answers my CQ
-- After a QSO finishes: unhighlight traffic + reset the Send box to CQ
+- Map: highlight a station that answers my CQ
+- Map: show peers' heard stations as dots — peer heard data already reaches the GUI (`pump_peers` holds each peer's `StationSnapshot.heard`) and band-status counts already merge it, but the map's `heard_spots()` (`bus_view.rs:567`) builds `MapSpot`s from the *local* `heard` map only. Fold peers' `heard` into the map's heard layer with `origin = Peer` (placed from each `HeardStation.grid`), add `origin` to `MapSpot`, render peer dots distinctly (CLAUDE.md invariant). Receive-side GUI wiring only — no beacon/net change. Limits from `HeardStation`: no CQ-triangle / click-to-tune / slot; FD-section-only peers (no grid) can't be placed; dedup mine-wins. (The "GUI map dots" half of the Multi-op heard-aggregation item above.)
 - RX clipping indicator (audio level)
 - Clear-lane finder: jump to an optimum CQ calling frequency (occupancy map + lane scoring) — `lane-finder` branch
 - Band-scanner enhancements: per-offset sweep, FD-only filter, SNR floor, configurable dwell
