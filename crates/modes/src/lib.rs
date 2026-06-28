@@ -31,6 +31,7 @@ mod slot;
 mod text;
 mod waterfall;
 
+pub use ap::set_mycall;
 pub use decode::{Decode, decode, decode_streaming};
 pub use encode::{synth_ft4, synth_ft8};
 pub use message::{CallHash, MessageType};

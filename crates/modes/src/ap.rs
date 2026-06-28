@@ -28,26 +28,53 @@ use crate::decode::verify_codeword;
 use crate::ldpc::{N, bp_decode};
 use crate::message::{CallHash, encode_message};
 use crate::waterfall::Protocol;
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 
 /// LDPC iterations for an AP retry. A touch higher than the blind path's 25: the
 /// strong a-priori clamps give belief propagation a firm anchor, so the extra
 /// sweeps reliably converge the remaining free bits.
 const LDPC_ITERS_AP: usize = 30;
 
-/// Whether AP decoding runs at all. `DM420_AP=1` enables it (default OFF — AP is
-/// opt-in until its contest yield is measured and its false-decode rate trusted).
+/// Whether AP decoding runs at all (default ON). `DM420_AP=0` is the explicit off
+/// switch (A/B testing / a fallback to the exact blind path).
 pub(crate) fn ap_enabled() -> bool {
     static EN: OnceLock<bool> = OnceLock::new();
-    *EN.get_or_init(|| std::env::var("DM420_AP").map(|v| v != "0").unwrap_or(false))
+    *EN.get_or_init(|| std::env::var("DM420_AP").map(|v| v != "0").unwrap_or(true))
 }
 
-/// The operator's callsign for directed hypotheses, from `DM420_AP_MYCALL`.
-/// Absent ⇒ only the context-free CQ hypotheses run.
-fn ap_mycall() -> Option<String> {
-    static C: OnceLock<Option<String>> = OnceLock::new();
-    C.get_or_init(|| std::env::var("DM420_AP_MYCALL").ok().filter(|s| !s.is_empty()))
-        .clone()
+/// The operator's callsign pushed from the app (via `core::CoreControl::set_mycall`,
+/// sourced from the GUI-committed `StationConfig`). `DM420_AP_MYCALL` overrides it
+/// (a test/CLI escape hatch). Absent ⇒ only the context-free CQ hypotheses run.
+static MYCALL: RwLock<Option<String>> = RwLock::new(None);
+
+/// Set the operator callsign for the directed (MyCall) hypothesis. Idempotent;
+/// normalizes case/whitespace and treats empty as unset. The per-protocol
+/// hypothesis caches are keyed on the active call, so they pick this up on next use.
+pub fn set_mycall(call: Option<String>) {
+    let norm = call.map(|c| c.trim().to_uppercase()).filter(|s| !s.is_empty());
+    *MYCALL.write().unwrap() = norm;
+}
+
+/// The `DM420_AP_MYCALL` override, read once. Wins over the pushed call so a test
+/// or CLI run can pin a callsign regardless of app state.
+fn env_mycall() -> Option<&'static str> {
+    static E: OnceLock<Option<String>> = OnceLock::new();
+    E.get_or_init(|| {
+        std::env::var("DM420_AP_MYCALL")
+            .ok()
+            .map(|c| c.trim().to_uppercase())
+            .filter(|s| !s.is_empty())
+    })
+    .as_deref()
+}
+
+/// The callsign the MyCall hypothesis should use right now: env override, else the
+/// value pushed via [`set_mycall`].
+fn current_mycall() -> Option<String> {
+    match env_mycall() {
+        Some(c) => Some(c.to_string()),
+        None => MYCALL.read().unwrap().clone(),
+    }
 }
 
 /// One a-priori hypothesis: a set of payload bit positions clamped to known values.
@@ -102,10 +129,10 @@ fn from_template(template: &str, ranges: &[(usize, usize)], protocol: Protocol, 
 const CALL_TO: (usize, usize) = (0, 29); // addressed call (28) + R/hash flag (1)
 const I3: (usize, usize) = (74, 77); // message-type bits
 
-/// The hypothesis set for `protocol`, built once. Ordered cheapest/most-likely
-/// first. Context-free CQ hypotheses always run; the directed MyCall hypothesis is
-/// added only when `DM420_AP_MYCALL` is set.
-fn hypotheses(protocol: Protocol) -> Vec<Hypothesis> {
+/// The hypothesis set for `protocol` and operator call `mycall` (`None` ⇒ CQ only).
+/// Ordered cheapest/most-likely first: the context-free CQ hypotheses always run;
+/// the directed MyCall hypothesis is added when a callsign is known.
+fn hypotheses(protocol: Protocol, mycall: Option<&str>) -> Vec<Hypothesis> {
     let mut hs = Vec::new();
     // CQ FD — the dominant context-free case on a Field Day band. Fixes the
     // "CQ FD" addressed-call marker and the standard message type; the caller and
@@ -120,7 +147,7 @@ fn hypotheses(protocol: Protocol) -> Vec<Hypothesis> {
     // Directed: messages addressed to the operator (replies to our CQ, exchanges,
     // RR73). Fix only the addressed call (not the type), so one hypothesis covers
     // both standard replies and FD exchanges sent to us.
-    if let Some(mycall) = ap_mycall() {
+    if let Some(mycall) = mycall {
         if let Some(h) = from_template(&format!("{mycall} K1ABC FN42"), &[CALL_TO], protocol, "mycall") {
             hs.push(h);
         }
@@ -132,38 +159,59 @@ fn hypotheses(protocol: Protocol) -> Vec<Hypothesis> {
 /// CRC-valid payload, or `None`. `log174` is the candidate's normalized blind LLRs
 /// (left unmodified — each hypothesis works on a clamped copy).
 pub(crate) fn try_ap(log174: &[f32; N], protocol: Protocol) -> Option<[u8; 10]> {
-    let hyps = hypotheses_cached(protocol);
-    if hyps.is_empty() {
-        return None;
-    }
     // A clamp magnitude that dominates the observed soft information without
     // wholly erasing it (WSJT-X uses 1.1·max|llr|).
     let apmag = 1.1 * log174.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
     if apmag <= 0.0 {
         return None;
     }
-    for h in hyps {
-        let mut llr = *log174;
-        for (&pos, &bit) in h.mask.iter().zip(h.bits.iter()) {
-            llr[pos] = if bit == 1 { apmag } else { -apmag };
+    with_hypotheses(protocol, |hyps| {
+        for h in hyps {
+            let mut llr = *log174;
+            for (&pos, &bit) in h.mask.iter().zip(h.bits.iter()) {
+                llr[pos] = if bit == 1 { apmag } else { -apmag };
+            }
+            let (plain, errors) = bp_decode(&llr, LDPC_ITERS_AP);
+            if errors == 0 {
+                if let Some(p) = verify_codeword(protocol, &plain) {
+                    return Some(p);
+                }
+            }
         }
-        let (plain, errors) = bp_decode(&llr, LDPC_ITERS_AP);
-        if errors == 0 {
-            if let Some(p) = verify_codeword(protocol, &plain) {
-                return Some(p);
+        None
+    })
+}
+
+/// Per-protocol hypothesis cache, keyed on the MyCall it was built for.
+type HypCache = RwLock<Option<(Option<String>, Vec<Hypothesis>)>>;
+
+/// Run `f` over the per-protocol hypothesis set for the *current* MyCall. The CQ
+/// hypotheses never change, but the directed one tracks [`current_mycall`], so the
+/// cache is keyed on the active call and rebuilt (cheaply — a couple
+/// `encode_message` calls) only when the operator's callsign changes.
+fn with_hypotheses<R>(protocol: Protocol, f: impl FnOnce(&[Hypothesis]) -> R) -> R {
+    let want = current_mycall();
+    let cell = hyp_cell(protocol);
+    {
+        let r = cell.read().unwrap();
+        if let Some((have, hyps)) = r.as_ref() {
+            if *have == want {
+                return f(hyps);
             }
         }
     }
-    None
+    let hyps = hypotheses(protocol, want.as_deref());
+    let mut w = cell.write().unwrap();
+    *w = Some((want, hyps));
+    f(&w.as_ref().unwrap().1)
 }
 
-/// Per-protocol hypothesis cache (templates are fixed, so build once).
-fn hypotheses_cached(protocol: Protocol) -> &'static [Hypothesis] {
-    static FT8: OnceLock<Vec<Hypothesis>> = OnceLock::new();
-    static FT4: OnceLock<Vec<Hypothesis>> = OnceLock::new();
+fn hyp_cell(protocol: Protocol) -> &'static HypCache {
+    static FT8: OnceLock<HypCache> = OnceLock::new();
+    static FT4: OnceLock<HypCache> = OnceLock::new();
     match protocol {
-        Protocol::Ft8 => FT8.get_or_init(|| hypotheses(Protocol::Ft8)),
-        Protocol::Ft4 => FT4.get_or_init(|| hypotheses(Protocol::Ft4)),
+        Protocol::Ft8 => FT8.get_or_init(|| RwLock::new(None)),
+        Protocol::Ft4 => FT4.get_or_init(|| RwLock::new(None)),
     }
 }
 
@@ -220,18 +268,33 @@ mod tests {
         );
     }
 
-    /// AP hypotheses are non-empty and only fix bits within the 77-bit payload, for
-    /// both protocols (guards the bit ranges / whitening from drifting out of bounds).
+    /// AP hypotheses are non-empty, only fix bits within the 77-bit payload, and a
+    /// known operator call adds exactly the directed MyCall hypothesis (guards the
+    /// bit ranges / whitening and the mycall plumbing).
     #[test]
     fn hypotheses_are_well_formed() {
         for protocol in [Protocol::Ft8, Protocol::Ft4] {
-            let hs = hypotheses(protocol);
-            assert!(!hs.is_empty(), "{protocol:?} should have CQ hypotheses");
-            for h in &hs {
+            let cq = hypotheses(protocol, None);
+            assert!(!cq.is_empty(), "{protocol:?} should have CQ hypotheses");
+            for h in &cq {
                 assert!(!h.mask.is_empty());
                 assert_eq!(h.mask.len(), h.bits.len());
                 assert!(h.mask.iter().all(|&i| i < 77), "{protocol:?} masks within payload");
             }
+            let directed = hypotheses(protocol, Some("N0JDC"));
+            assert_eq!(directed.len(), cq.len() + 1, "{protocol:?} mycall adds one hypothesis");
+            assert!(directed.last().unwrap().mask.iter().all(|&i| i < 77));
         }
+    }
+
+    /// `set_mycall` normalizes the call and feeds `current_mycall` (with no
+    /// `DM420_AP_MYCALL` override in the test env). Resets the global afterward.
+    #[test]
+    fn set_mycall_normalizes_and_feeds_current() {
+        set_mycall(Some("  n0jdc ".to_string()));
+        assert_eq!(current_mycall().as_deref(), Some("N0JDC"));
+        set_mycall(Some(String::new()));
+        assert_eq!(current_mycall(), None, "empty call is unset");
+        set_mycall(None);
     }
 }
