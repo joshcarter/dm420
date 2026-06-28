@@ -695,6 +695,10 @@ impl BusView {
     /// Push a station-identity / contest change to the running QSO engine (call on
     /// re-lock after the operator edits the call/grid).
     pub fn set_qso_station(&self, station: qso::StationConfig) {
+        // Also feed the operator callsign to the decoder's a-priori module (via core,
+        // which owns the modes dep) so the directed MyCall hypothesis can recover
+        // replies/exchanges addressed to us. Captured before `station` is moved.
+        self.control.set_mycall(Some(station.call.0.clone()));
         self.qso_control.set_station(station);
     }
 

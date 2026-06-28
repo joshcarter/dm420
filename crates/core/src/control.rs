@@ -133,6 +133,18 @@ pub struct CoreControl {
     pub tx: Option<std::sync::Arc<TxControl>>,
 }
 
+impl CoreControl {
+    /// Push the operator callsign to the decoder's a-priori (AP) module so the
+    /// directed (MyCall) hypothesis can recover replies/exchanges addressed to us.
+    /// The UI calls this from re-lock with the committed `StationConfig` call; AP is
+    /// a process-global in `modes`, so this is a thin forward (the app is one
+    /// process wiring core + modes in-process). `None`/empty clears the directed
+    /// hypothesis, leaving the context-free CQ ones.
+    pub fn set_mycall(&self, call: Option<String>) {
+        modes::set_mycall(call);
+    }
+}
+
 /// Why a supervisor's connected session ended — distinguishes a real fault from
 /// a user-requested reconfigure so the supervisor can report the right health.
 #[derive(Clone, Copy, PartialEq, Eq)]

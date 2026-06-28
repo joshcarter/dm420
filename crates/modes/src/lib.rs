@@ -14,6 +14,7 @@
 //! encoder runs it backwards to synthesize test signals so the whole chain is
 //! self-verifying without a radio.
 
+mod ap;
 mod arrl_fd;
 mod cohere;
 mod cohere_ft4;
@@ -30,6 +31,7 @@ mod slot;
 mod text;
 mod waterfall;
 
+pub use ap::set_mycall;
 pub use decode::{Decode, decode, decode_streaming};
 pub use encode::{synth_ft4, synth_ft8};
 pub use message::{CallHash, MessageType};
