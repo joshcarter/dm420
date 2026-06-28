@@ -2,6 +2,7 @@
 //! (port of ft8_lib `decode.c` + the `decode_ft8.c` driver loop). Handles FT8
 //! and FT4. Output is a list of [`Decode`]s per slot.
 
+use crate::ap;
 use crate::cohere;
 use crate::cohere_ft4;
 use crate::constants::{FT4_COSTAS, FT4_GRAY, FT8_COSTAS, FT8_GRAY};
@@ -627,6 +628,12 @@ fn decode_candidate(wf: &Waterfall, c: &Candidate) -> Option<[u8; 10]> {
             }
         }
     }
+    // A-priori fallback: blind (BP + OSD) missed — retry CRC-gated hypotheses.
+    if ap::ap_enabled() {
+        if let Some(p) = ap::try_ap(&log174, wf.protocol) {
+            return Some(p);
+        }
+    }
     None
 }
 
@@ -877,6 +884,14 @@ fn decode_candidate_coherent(
             }
         }
     }
+    // A-priori fallback on the first (full-integration) LLR variant.
+    if ap::ap_enabled() {
+        if let Some(llr) = an.llrs.first() {
+            if let Some(p) = ap::try_ap(llr, wf.protocol) {
+                return Some((p, an.freq_hz, an.dt));
+            }
+        }
+    }
     None
 }
 
@@ -926,6 +941,14 @@ fn decode_candidate_coherent_ft4(
                 if let Some(p) = verify_codeword(wf.protocol, &cand) {
                     return Some((p, an.freq_hz, an.dt));
                 }
+            }
+        }
+    }
+    // A-priori fallback on the first (full-integration) LLR variant.
+    if ap::ap_enabled() {
+        if let Some(llr) = an.llrs.first() {
+            if let Some(p) = ap::try_ap(llr, wf.protocol) {
+                return Some((p, an.freq_hz, an.dt));
             }
         }
     }

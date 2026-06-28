@@ -14,6 +14,7 @@
 //! encoder runs it backwards to synthesize test signals so the whole chain is
 //! self-verifying without a radio.
 
+mod ap;
 mod arrl_fd;
 mod cohere;
 mod cohere_ft4;
