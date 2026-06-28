@@ -150,8 +150,10 @@ struct Active {
     rcvd_fd: Option<(String, Section)>,
     /// TX slots we've sent the current `next` with no received content advancing
     /// the contact. Reset to 0 on every advance; when it reaches the give-up cap
-    /// (`TX_CAP_DEFAULT`, or `TX_CAP_AFTER_LOG` once logged) we stop and fall back
-    /// instead of repeating forever (P1 — `docs/qso_engine_improvements.md`).
+    /// (`TX_CAP_DEFAULT`, or once logged a per-side terminal-`RR73` cap —
+    /// `TX_CAP_AFTER_LOG` for the CQ side, `TX_CAP_FD_ANSWER_RR73` for the FD
+    /// answering side) we stop and fall back instead of repeating forever (P1 —
+    /// `docs/qso_engine_improvements.md`).
     overs_since_progress: u8,
 }
 
@@ -171,6 +173,14 @@ const TX_CAP_DEFAULT: u8 = 3;
 /// QSO already counts for us, so extra `RR73`s only help *them* log us: send a
 /// couple for insurance, then resume CQ.
 const TX_CAP_AFTER_LOG: u8 = 2;
+
+/// Resend cap for the **Field Day answering side's** terminal `RR73` — the side that
+/// sends `RR73` as its last over and then idles. After logging on RR73-sent we stay
+/// active and re-send `RR73` as insurance (a partner who didn't copy it repeats their
+/// `R`+exchange); after this many sends with no further progress we idle and free the
+/// slot. Separate from `TX_CAP_AFTER_LOG` because that side resumes CQ rather than
+/// idling, so the two terminal-`RR73` counts stay independently tunable.
+const TX_CAP_FD_ANSWER_RR73: u8 = 3;
 
 // ---------------------------------------------------- sequencer vocabulary (3a)
 //
@@ -279,12 +289,13 @@ enum LogWhen {
 }
 
 /// What to do once the reply is queued. `FinishOnSend` is today's `finish_after_tx`
-/// (applied after the message goes out); `ResumeCqNow` resumes CQ immediately.
+/// (applied after the message goes out); `FinishNow` finishes immediately — there's no
+/// reply to send — resuming CQ or idling per its [`Finish`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Settle {
     StayActive,
     FinishOnSend(Finish),
-    ResumeCqNow,
+    FinishNow(Finish),
 }
 
 /// One transition's full consequence — pure data the engine then materializes (the
@@ -403,14 +414,18 @@ fn advance(role: Role, fd: bool, kind: MsgKind) -> Transition {
             log: LogWhen::Never,
             settle: Settle::StayActive,
         }),
-        // Field Day, answering side: their R+exchange → RR73; log on send, then idle.
+        // Field Day, answering side: their R+exchange → RR73; log on send, then stay
+        // active and keep re-sending RR73 as insurance (a partner who didn't copy it
+        // repeats their R+exchange). `tick_active`'s post-log cap bounds the resends
+        // (`TX_CAP_FD_ANSWER_RR73`) and then idles — Field Day is human-initiated, so
+        // the answering side never auto-resumes CQ.
         FdRoger { class, section } if role == Answering && fd => Transition::Act(Outcome {
             reply: Reply::Rr73,
             progress: Progress::Rogers,
             step: 2,
             capture: Capture::Fd(class, section),
             log: LogWhen::OnSend,
-            settle: Settle::FinishOnSend(Finish::Idle),
+            settle: Settle::StayActive,
         }),
         // Standard, CQ side: their R-report → RR73; log on send (then hold for a 73).
         RogerReport(r) if role == CallingCq && !fd => Transition::Act(Outcome {
@@ -430,45 +445,48 @@ fn advance(role: Role, fd: bool, kind: MsgKind) -> Transition {
     }
 }
 
-/// The sign-off branch (P2): any directed `RRR`/`RR73`/`73` completes the contact. We
-/// send a courtesy `73` when we hold the courtesy slot (the answering side always, and
-/// the Field Day CQ side on their roger); otherwise we've already logged on RR73-sent
-/// (Standard CQ side) and just resume CQ. Logging-on-receive is gated on `!logged` by
-/// the applier reading the live contact, so it isn't decided here.
+/// The sign-off branch (P2): any directed `RRR`/`RR73`/`73` completes the contact.
 ///
-/// **Field Day is human-initiated only:** the FD CQ side still sends its courtesy `73`,
-/// but then drops to **idle** instead of auto-resuming CQ — a Field Day contact may not be
-/// machine-started, so the operator must re-arm (Enter → `CallCq`) to call CQ again. In
-/// **Standard** mode the CQ side keeps resuming CQ hands-off.
+/// We send a courtesy `73` only when we **hold the courtesy slot** — i.e. our own
+/// terminal over *is* the `73`: the **Standard answering side**, and the **Field Day
+/// CQ side** on the partner's roger (Field Day reverses the `RR73`/`73` roles). Every
+/// other side has already sent its terminal `RR73` — the Standard CQ side, and the
+/// **Field Day answering side** — so a received sign-off just ends the contact;
+/// emitting another `73` (or re-sending `RR73`) would be noise on the band. That last
+/// case is the one that matters here: now that the FD answering side stays active to
+/// resend `RR73`, the partner's courtesy `73` reaches this branch, and it must finish
+/// silently rather than answer.
+///
+/// **Field Day is human-initiated only:** every Field Day finish drops to **idle**
+/// (the operator re-arms with Enter → `CallCq`); only **Standard** mode resumes CQ
+/// hands-off. Logging-on-receive is gated on `!logged` by the applier reading the live
+/// contact, so it isn't decided here.
 fn signoff_outcome(role: Role, fd: bool, k: Signoff) -> Outcome {
-    let courtesy = role == Role::Answering || (fd && is_roger(k));
+    use Role::*;
+    let courtesy = (role == Answering && !fd) || (role == CallingCq && fd && is_roger(k));
     if courtesy {
-        // CQ side resumes CQ after a completed contact — except in Field Day, where it
-        // idles and waits for the operator to re-arm (legality: no auto-initiated QSOs).
-        // The answering side always idles. (Within this branch the CQ side is reached only
-        // in Field Day, so `&& !fd` is what makes the FD courtesy CQ side idle while keeping
-        // the Standard intent legible and correct-by-construction.)
-        let finish = if role == Role::CallingCq && !fd {
-            Finish::ResumeCq
-        } else {
-            Finish::Idle
-        };
+        // Both courtesy holders idle after the `73`: the Standard answering side always,
+        // and the FD CQ side because Field Day never auto-resumes CQ.
         Outcome {
             reply: Reply::Seven3,
             progress: Progress::Signoff,
             step: 3,
             capture: Capture::None,
             log: LogWhen::OnReceive,
-            settle: Settle::FinishOnSend(finish),
+            settle: Settle::FinishOnSend(Finish::Idle),
         }
     } else {
+        // Nothing left to send — finish the contact at once. Standard resumes CQ; Field
+        // Day idles (human-initiated), which is also what stops the FD answering side
+        // from emitting a stray `73` or another `RR73` after the partner's courtesy `73`.
+        let finish = if fd { Finish::Idle } else { Finish::ResumeCq };
         Outcome {
             reply: Reply::None,
             progress: Progress::Signoff,
             step: 3,
             capture: Capture::None,
             log: LogWhen::OnReceive,
-            settle: Settle::ResumeCqNow,
+            settle: Settle::FinishNow(finish),
         }
     }
 }
@@ -500,6 +518,12 @@ pub struct Engine {
     /// Arming today still flows through [`QsoCommand::Start`], so this doesn't drive
     /// behavior on its own — it never moves the offset (the engine owns that).
     selected: Option<DecodeRef>,
+    /// The partner of the most recently logged contact, retained across the idle gap
+    /// that follows it. Lets a *manual resend* — the operator clicking that same
+    /// station's roger again (e.g. their `R`+exchange) to make sure our `RR73` was
+    /// heard — re-send `RR73` *without logging the QSO a second time*. Cleared when any
+    /// new contact is committed ([`Self::open_at`]), so a genuine re-work still logs.
+    last_logged_partner: Option<Callsign>,
 }
 
 impl Engine {
@@ -516,6 +540,7 @@ impl Engine {
             timed_out: None,
             offset_locked: false,
             selected: None,
+            last_logged_partner: None,
         }
     }
 
@@ -569,6 +594,11 @@ impl Engine {
         // The `TimedOut` phase is a one-shot: it's been published in `state`, so
         // clear it — the next snapshot shows the real fall-back state we're now in.
         self.timed_out = None;
+        // Remember who we just logged so a manual resend of their roger re-sends RR73
+        // without logging the QSO a second time (see `last_logged_partner`).
+        if let Some(done) = &log {
+            self.last_logged_partner = Some(done.call.clone());
+        }
         Step { state, tx, log }
     }
 
@@ -805,6 +835,12 @@ impl Engine {
         // resume can pick up partway through). We use the inferred `role` either way;
         // since we never saw the earlier overs, the log can only carry what's on this
         // line plus our own report — partial, but truthful for a late pick-up.
+        //
+        // A resume of the partner we *just logged* (their roger re-clicked to make sure
+        // our RR73 was heard) must re-send RR73 but not log the QSO again: seed the
+        // provisional contact as already-logged so the on-send log is suppressed. An
+        // opener is always a genuinely new contact, so it never carries this.
+        let resend_of_logged = self.last_logged_partner.as_ref() == Some(&from);
         if let Some((_, o)) = open(me_fd, MsgKind::classify(&msg)) {
             self.open_at(
                 Seed {
@@ -828,7 +864,7 @@ impl Engine {
                 next: None,
                 finish_after_tx: None,
                 log_on_tx: false,
-                logged: false,
+                logged: resend_of_logged,
                 step: 0,
                 progress: Progress::Replying,
                 partner_grid: None,
@@ -894,9 +930,14 @@ impl Engine {
             None
         };
 
-        // Non-courtesy sign-off — nothing left to send: resume CQ now, before the writes.
-        if matches!(o.settle, Settle::ResumeCqNow) {
-            self.resume_cq();
+        // Sign-off with nothing left to send — finish the contact at once, before the
+        // writes (there's no queued reply to materialize). Resume CQ (Standard, hands-off)
+        // or idle (Field Day, human-initiated).
+        if let Settle::FinishNow(f) = o.settle {
+            match f {
+                Finish::ResumeCq => self.resume_cq(),
+                Finish::Idle => self.state = State::Idle,
+            }
             return done;
         }
 
@@ -939,6 +980,9 @@ impl Engine {
     /// first reply and then wait; we honor whatever `log`/`settle` the table carries
     /// (today every opener is `Never` / `StayActive`, so these start cleared).
     fn open_at(&mut self, seed: Seed, o: Outcome) {
+        // A brand-new contact begins: forget the previously logged partner so its
+        // resend-suppression can't bleed into this one (a genuine re-work logs).
+        self.last_logged_partner = None;
         let next = self.materialize(o.reply, &seed.partner, seed.snr);
         let mut a = Active {
             role: seed.role,
@@ -1084,8 +1128,17 @@ impl Engine {
         }
         let act = match &self.state {
             State::Active(a) if parity == a.tx_parity && a.next.is_some() => {
+                // Once logged, the only message left to repeat is a terminal RR73. The
+                // resend count differs by side: the Standard CQ side sends a couple then
+                // resumes CQ; the Field Day answering side (`Role::Answering`, whose only
+                // logged-and-repeating message is RR73 — the Standard answering side
+                // finishes on its courtesy 73 before the cap bites) sends up to three
+                // then idles.
                 let cap = if a.logged {
-                    TX_CAP_AFTER_LOG
+                    match a.role {
+                        Role::Answering => TX_CAP_FD_ANSWER_RR73,
+                        Role::CallingCq => TX_CAP_AFTER_LOG,
+                    }
                 } else {
                     TX_CAP_DEFAULT
                 };
@@ -1835,12 +1888,97 @@ mod tests {
             -5,
         )));
         assert!(s.log.is_none(), "FD answering must not log on receive");
+        // First RR73: logs on send, and we *stay active* to resend it as insurance.
         let s = e.step(Event::Tick { slot: SlotId(7) });
         assert_eq!(s.tx.unwrap().message.text, "K1ABC W9XYZ RR73");
         let log = s.log.expect("FD answering logs on RR73 sent");
         assert_eq!(log.exchange_sent, "3A WI");
         assert_eq!(log.exchange_rcvd, "2B IL");
+        assert!(
+            matches!(e.state().phase, QsoPhase::InExchange { .. }),
+            "still active after the first RR73 — resending for insurance"
+        );
+        // Two more RR73s go out (TX_CAP_FD_ANSWER_RR73 = 3 total); neither re-logs.
+        for slot in [9, 11] {
+            let s = e.step(Event::Tick { slot: SlotId(slot) });
+            assert_eq!(s.tx.unwrap().message.text, "K1ABC W9XYZ RR73");
+            assert!(s.log.is_none(), "must not log again while resending RR73");
+        }
+        // After three RR73s we idle and free the slot — no auto-CQ (human-initiated).
+        let s = e.step(Event::Tick { slot: SlotId(13) });
+        assert_eq!(s.tx, None, "stop resending RR73 once the cap is reached");
         assert_eq!(e.state().phase, QsoPhase::Idle);
+    }
+
+    #[test]
+    fn field_day_answering_manual_resend_does_not_relog() {
+        // After an FD answering QSO logs and idles, the operator re-clicks the
+        // partner's R+exchange to make sure our RR73 was heard. We must re-send RR73
+        // but NOT log the contact a second time (the duplicate-log bug).
+        let mut e = engine(ContestProfile::ArrlFieldDay);
+        e.step(Event::Command(start_target()));
+        e.step(Event::Decode(decode(cq_from(HIM, true), 4, -5)));
+        assert_eq!(tx_text(&mut e, 5).as_deref(), Some("K1ABC W9XYZ 3A WI"));
+        let their_roger = exch(
+            ME,
+            HIM,
+            ExchangePayload::FieldDay {
+                class: "2B".into(),
+                section: Section("IL".into()),
+                rogered: true,
+            },
+        );
+        e.step(Event::Decode(decode(their_roger.clone(), 6, -5)));
+        // Drive the contact to completion (RR73 ×3 then idle); it logs exactly once.
+        let logs = [7, 9, 11, 13]
+            .into_iter()
+            .filter(|&slot| e.step(Event::Tick { slot: SlotId(slot) }).log.is_some())
+            .count();
+        assert_eq!(logs, 1, "the QSO logs once across the whole resend window");
+        assert_eq!(e.state().phase, QsoPhase::Idle);
+        // Manual resend: re-click their R+exchange line — RR73 goes out again, no re-log.
+        e.step(Event::Command(resume_cmd(their_roger, 14, -5)));
+        let s = e.step(Event::Tick { slot: SlotId(15) });
+        assert_eq!(s.tx.unwrap().message.text, "K1ABC W9XYZ RR73");
+        assert!(
+            s.log.is_none(),
+            "manual resend must not log the already-logged QSO again"
+        );
+    }
+
+    #[test]
+    fn field_day_answering_no_courtesy_73_after_their_73() {
+        // FD answering side: our terminal over is RR73, so the partner's courtesy 73
+        // closes the contact — we must NOT air a 73 back. (Regression: staying active to
+        // resend RR73 reopened the sign-off path, which used to grant the answering side
+        // a courtesy 73 in *either* contest.)
+        let mut e = engine(ContestProfile::ArrlFieldDay);
+        e.step(Event::Command(start_target()));
+        e.step(Event::Decode(decode(cq_from(HIM, true), 4, -5)));
+        assert_eq!(tx_text(&mut e, 5).as_deref(), Some("K1ABC W9XYZ 3A WI"));
+        e.step(Event::Decode(decode(
+            exch(
+                ME,
+                HIM,
+                ExchangePayload::FieldDay {
+                    class: "2B".into(),
+                    section: Section("IL".into()),
+                    rogered: true,
+                },
+            ),
+            6,
+            -5,
+        )));
+        // Our RR73 goes out (logs); we stay active to resend it.
+        let s = e.step(Event::Tick { slot: SlotId(7) });
+        assert_eq!(s.tx.unwrap().message.text, "K1ABC W9XYZ RR73");
+        s.log.expect("logs on RR73 sent");
+        // Their courtesy 73 → finish and idle, queuing nothing further.
+        let s = e.step(Event::Decode(decode(signoff(ME, HIM, Signoff::Seven3), 8, -5)));
+        assert!(s.log.is_none(), "already logged — no second log on their 73");
+        assert_eq!(e.state().phase, QsoPhase::Idle);
+        // Our next TX slot stays silent — no stray courtesy 73, no extra RR73.
+        assert_eq!(tx_text(&mut e, 9), None, "must not air anything after their 73");
     }
 
     #[test]
@@ -2083,7 +2221,10 @@ mod tests {
         let log = s.log.expect("FD answering logs on RR73 sent");
         assert_eq!(log.exchange_sent, "3A WI");
         assert_eq!(log.exchange_rcvd, "2B IL");
-        assert_eq!(e.state().phase, QsoPhase::Idle);
+        assert!(
+            matches!(e.state().phase, QsoPhase::InExchange { .. }),
+            "stays active to resend RR73 after a late resume pick-up"
+        );
     }
 
     #[test]
@@ -2803,7 +2944,7 @@ mod tests {
                 step: 2,
                 capture: Capture::Fd("2B".into(), Section("IL".into())),
                 log: LogWhen::OnSend,
-                settle: Settle::FinishOnSend(Finish::Idle),
+                settle: Settle::StayActive,
             })
         );
         assert_eq!(
@@ -2844,16 +2985,24 @@ mod tests {
     #[test]
     fn signoff_outcome_courtesy_and_fallback() {
         use Role::*;
-        // Answering side (either contest, any token): courtesy 73, finish idle, log rx.
-        for fd in [false, true] {
-            for k in [Signoff::Rrr, Signoff::Rr73, Signoff::Seven3] {
-                let o = signoff_outcome(Answering, fd, k);
-                assert_eq!(o.reply, Reply::Seven3);
-                assert_eq!(o.settle, Settle::FinishOnSend(Finish::Idle));
-                assert_eq!(o.log, LogWhen::OnReceive);
-                assert_eq!(o.step, 3);
-                assert_eq!(o.progress, Progress::Signoff);
-            }
+        // Standard answering side (any token): courtesy 73, finish idle, log rx — our
+        // terminal over *is* the 73.
+        for k in [Signoff::Rrr, Signoff::Rr73, Signoff::Seven3] {
+            let o = signoff_outcome(Answering, false, k);
+            assert_eq!(o.reply, Reply::Seven3);
+            assert_eq!(o.settle, Settle::FinishOnSend(Finish::Idle));
+            assert_eq!(o.log, LogWhen::OnReceive);
+            assert_eq!(o.step, 3);
+            assert_eq!(o.progress, Progress::Signoff);
+        }
+        // Field Day answering side (any token): NO courtesy — our terminal over was the
+        // RR73, so the partner's sign-off just ends the contact. Finish idle at once,
+        // sending nothing (otherwise we'd air a stray 73 after their courtesy 73).
+        for k in [Signoff::Rrr, Signoff::Rr73, Signoff::Seven3] {
+            let o = signoff_outcome(Answering, true, k);
+            assert_eq!(o.reply, Reply::None);
+            assert_eq!(o.settle, Settle::FinishNow(Finish::Idle));
+            assert_eq!(o.log, LogWhen::OnReceive);
         }
         // FD CQ side on a roger: courtesy 73, then *idle* — Field Day is human-initiated
         // only, so we do not auto-resume CQ; the operator re-arms to call CQ again.
@@ -2862,15 +3011,15 @@ mod tests {
             assert_eq!(o.reply, Reply::Seven3);
             assert_eq!(o.settle, Settle::FinishOnSend(Finish::Idle));
         }
-        // FD CQ side on a bare 73: no courtesy, resume CQ now.
+        // FD CQ side on a bare 73: no courtesy — finish idle (Field Day never auto-CQs).
         let o = signoff_outcome(CallingCq, true, Signoff::Seven3);
         assert_eq!(o.reply, Reply::None);
-        assert_eq!(o.settle, Settle::ResumeCqNow);
+        assert_eq!(o.settle, Settle::FinishNow(Finish::Idle));
         // Standard CQ side (already logged on send): no courtesy, resume CQ now.
         for k in [Signoff::Rrr, Signoff::Rr73, Signoff::Seven3] {
             let o = signoff_outcome(CallingCq, false, k);
             assert_eq!(o.reply, Reply::None);
-            assert_eq!(o.settle, Settle::ResumeCqNow);
+            assert_eq!(o.settle, Settle::FinishNow(Finish::ResumeCq));
         }
     }
 
