@@ -575,6 +575,40 @@ impl eframe::App for App {
 
         let dt = ctx.input(|i| i.stable_dt);
 
+        // -------- keyboard ownership: Tab + Enter are DM420's, never egui's --------
+        // Tab is exclusively the "lock frequency" hotkey and Enter exclusively
+        // "arm/disarm" (handled in the Digital panel's send row). Neither may drive
+        // egui's widget-focus system, which otherwise (a) consumes Tab/Shift-Tab/arrows
+        // to traverse focus and (b) treats Enter/Space as a click on the focused
+        // widget. Both are neutralized here, before any widget is drawn this frame:
+        //
+        //  (a) egui latches a focus-traversal direction from the raw Tab/arrow events
+        //      in `Context::begin_pass` — already run by the time `ui` is called — then
+        //      applies it lazily as focusable widgets register during the pass. So an
+        //      in-frame `events.retain(Tab)` can't stop it (the direction is already
+        //      latched); clearing the direction here, ahead of the top bar and panels,
+        //      can. Tab then never moves focus (e.g. onto the LOCK/EDIT posture switch),
+        //      deterministically — independent of what egui had focused, including a
+        //      station just clicked in the waterslide.
+        //
+        //  (b) In operate (locked) posture nothing on screen needs the keyboard caret
+        //      (the only TextEdits — top-bar call/grid and the contest form — are
+        //      unlocked-only), so release any focus a prior click parked: a waterslide
+        //      station target (`ws_select`), the LOCK/EDIT switch, the SEND key. A
+        //      focused clickable widget fires `.clicked()` on Enter, which would steal
+        //      the arm/disarm Enter or re-fire a station select. Dropping it each frame
+        //      makes the real chase workflow — click station, Tab to lock, Enter to
+        //      arm — resolve to select -> lock -> arm every time. Unlocked posture keeps
+        //      focus so the call/grid/contest fields stay typable (click-to-focus; Tab
+        //      still won't hop between them, per (a)).
+        let operate = !self.edit_mode;
+        ctx.memory_mut(|m| {
+            m.move_focus(egui::FocusDirection::None);
+            if operate && let Some(focused) = m.focused() {
+                m.surrender_focus(focused);
+            }
+        });
+
         // -------- top bar (fixed height) --------
         egui::Panel::top("topbar")
             .exact_size(pd::TOPBAR_H + pd::GROOVE_H)

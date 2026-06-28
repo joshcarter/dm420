@@ -279,7 +279,13 @@ pub fn segmented(
     // These are binary switches — a click registers on the currently inactive
     // cell. Interacted after the cells so it sits on top and owns the click; the
     // per-cell key_cell responses are discarded.
-    let track_resp = ui.interact(track, ui.id().with((id_src, "track")), egui::Sense::click());
+    //
+    // `Sense::CLICK` (not `click()`) so the track is pointer-only and never takes
+    // keyboard focus: these are mouse toggles, and a focusable LOCK/EDIT posture
+    // switch is how a stray Enter used to flip the whole app's posture. Defense in
+    // depth behind `App::ui`'s frame-level focus clear (which is what guarantees Tab
+    // can't land focus here in the first place).
+    let track_resp = ui.interact(track, ui.id().with((id_src, "track")), egui::Sense::CLICK);
     let clicks = cells
         .iter()
         .map(|(_, active)| track_resp.clicked() && !*active)
