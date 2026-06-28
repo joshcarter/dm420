@@ -16,6 +16,29 @@ use std::collections::HashSet;
 
 const MIN_SCORE: i32 = 10;
 const MAX_CANDIDATES: usize = 140;
+
+/// Minimum sync score, overridable for diagnostics via `DM420_MIN_SCORE`.
+fn min_score() -> i32 {
+    static N: OnceLock<i32> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("DM420_MIN_SCORE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(MIN_SCORE)
+    })
+}
+
+/// Candidate cap, overridable for diagnostics via `DM420_MAX_CANDIDATES`.
+fn max_candidates() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("DM420_MAX_CANDIDATES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(MAX_CANDIDATES)
+    })
+}
 const LDPC_ITERS: usize = 25;
 /// Run the OSD backstop only when belief-propagation got within this many parity
 /// errors (out of 83). Real near-misses leave a handful; pure noise plateaus much
@@ -213,6 +236,119 @@ fn noise_floor(wf: &Waterfall) -> f64 {
     10f64.powf(mag_db(med) as f64 / 10.0)
 }
 
+/// Per-frequency noise floor (in stored u8 magnitude units), one value per
+/// oversampled frequency column `freq_sub * num_bins + bin`. For each column we
+/// take a low percentile (≈30th) of the magnitude over every time block and
+/// time-sub, so the value tracks the *noise in that frequency lane* rather than the
+/// signals that occupy it only briefly. This is the per-frequency analog of
+/// [`noise_floor`] and the core of the crowded-band candidate-finder fix: it lets
+/// [`ft4_sync_score_baseline`] reference each Costas tone to the noise in its own
+/// lane (WSJT-X `getcandidates4` / `ft4_baseline` style) instead of to adjacent
+/// bins which, on a crowded band, hold *other signals* and collapse the contrast.
+fn per_freq_floor(wf: &Waterfall) -> Vec<u8> {
+    let ncols = wf.freq_osr * wf.num_bins;
+    let mut floor = vec![0u8; ncols];
+    if wf.num_blocks == 0 {
+        return floor;
+    }
+    let mut hist = [0u32; 256];
+    for (col, floor_val) in floor.iter_mut().enumerate() {
+        let freq_sub = col / wf.num_bins;
+        let bin = col % wf.num_bins;
+        hist.iter_mut().for_each(|h| *h = 0);
+        let mut count = 0u32;
+        for block in 0..wf.num_blocks {
+            for time_sub in 0..wf.time_osr {
+                let idx = block * wf.block_stride
+                    + (time_sub * wf.freq_osr + freq_sub) * wf.num_bins
+                    + bin;
+                hist[wf.mag[idx] as usize] += 1;
+                count += 1;
+            }
+        }
+        let target = count * 3 / 10; // 30th percentile of this lane's magnitudes
+        let mut acc = 0u32;
+        for (v, &h) in hist.iter().enumerate() {
+            acc += h;
+            if acc > target {
+                *floor_val = v as u8;
+                break;
+            }
+        }
+    }
+    floor
+}
+
+/// FT4 sync score referenced to the per-frequency noise floor instead of to
+/// adjacent bins. `floor` comes from [`per_freq_floor`]. For each Costas sync tone
+/// we add how far its magnitude rises *above the noise in its own lane*, averaged
+/// over all 16 sync tones. Unlike [`ft4_sync_score`] (which subtracts neighboring
+/// time/freq bins), a strong signal packed beside other signals still scores high —
+/// its Costas tones sit well above the lane noise regardless of the neighbors — so
+/// crowded-band strong signals get nominated instead of scoring ~0. This also
+/// sidesteps the u8 magnitude saturation (a tone pegged at 255 still scores high
+/// against a floor well below 255), so the shared `mag` scale needs no change.
+#[allow(clippy::needless_range_loop)]
+fn ft4_sync_score_baseline(wf: &Waterfall, c: &Candidate, floor: &[u8]) -> i32 {
+    let num_sync = wf.protocol.num_sync();
+    let length_sync = wf.protocol.length_sync();
+    let sync_offset = wf.protocol.sync_offset();
+    let mut score = 0i32;
+    let mut num = 0i32;
+    let nb = wf.num_blocks as i32;
+    for m in 0..num_sync {
+        for k in 0..length_sync {
+            let block = (1 + sync_offset * m + k) as i32;
+            let block_abs = c.time_offset + block;
+            if block_abs < 0 {
+                continue;
+            }
+            if block_abs >= nb {
+                break;
+            }
+            let sm = FT4_COSTAS[m][k] as i32;
+            let here = mag_at(wf, c, block_abs, sm) as i32;
+            let col = c.freq_sub * wf.num_bins + (c.freq_offset + sm) as usize;
+            score += here - floor[col] as i32;
+            num += 1;
+        }
+    }
+    if num > 0 { score / num } else { 0 }
+}
+
+/// FT8 sibling of [`ft4_sync_score_baseline`]: score each FT8 Costas tone against
+/// the per-frequency noise floor instead of its adjacent bins. Same rationale —
+/// the `wsjtx_ft8` corpus is also a busy 20m band where neighbor bins hold other
+/// signals. Whether this is a net win for FT8 is decided by measurement (see
+/// `FT8_BASELINE_DEFAULT`); the floor backstop is 787/16% on `sample_data/wsjtx_ft8`.
+#[allow(clippy::needless_range_loop)]
+fn ft8_sync_score_baseline(wf: &Waterfall, c: &Candidate, floor: &[u8]) -> i32 {
+    let num_sync = wf.protocol.num_sync();
+    let length_sync = wf.protocol.length_sync();
+    let sync_offset = wf.protocol.sync_offset();
+    let mut score = 0i32;
+    let mut num = 0i32;
+    let nb = wf.num_blocks as i32;
+    for m in 0..num_sync {
+        for k in 0..length_sync {
+            let block = (sync_offset * m + k) as i32;
+            let block_abs = c.time_offset + block;
+            if block_abs < 0 {
+                continue;
+            }
+            if block_abs >= nb {
+                break;
+            }
+            let sm = FT8_COSTAS[k] as i32;
+            let here = mag_at(wf, c, block_abs, sm) as i32;
+            let col = c.freq_sub * wf.num_bins + (c.freq_offset + sm) as usize;
+            score += here - floor[col] as i32;
+            num += 1;
+        }
+    }
+    if num > 0 { score / num } else { 0 }
+}
+
 /// Estimate SNR in dB (≈2500 Hz reference, WSJT-X convention) for a candidate.
 ///
 /// Takes the signal power at the known Costas **sync tones**, subtracts the
@@ -277,41 +413,120 @@ fn estimate_snr(wf: &Waterfall, c: &Candidate, noise: f64) -> f32 {
     (snr_db as f32).clamp(-28.0, 49.0)
 }
 
+/// Minimum noise-relative score for an additive "rescue" candidate, tunable via
+/// `DM420_RESCUE_SCORE`. The rescue pass is purely additive and CRC-gated, so this
+/// only trades decode work against how weak a crowded-masked signal it will try.
+const RESCUE_MIN_SCORE: i32 = 12;
+fn rescue_min_score() -> i32 {
+    static N: OnceLock<i32> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("DM420_RESCUE_SCORE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(RESCUE_MIN_SCORE)
+    })
+}
+
+/// Append noise-relative "rescue" candidates (already sorted strongest-first) onto
+/// the primary list, skipping any within (`FREQ_TOL`, `TIME_TOL`) of a candidate
+/// already present — collapsing each rescued signal's grid-point smear to one
+/// representative and avoiding redundant re-decode of what the primary finder
+/// already nominated. Adds at most `budget`. Tolerances are oversampled (half-bin /
+/// half-block) units; a frequency lane holds ≤1 signal per slot, so the time
+/// tolerance can be loose while the freq tolerance stays under the closest real
+/// signal spacing. Purely additive: it never reorders or drops a primary candidate.
+fn append_rescue(cands: &mut Vec<Candidate>, extra: &[Candidate], wf: &Waterfall, budget: usize) {
+    const FREQ_TOL: i32 = 2; // half-bins (≈ one base bin)
+    const TIME_TOL: i32 = 8; // half-blocks
+    let fkey = |c: &Candidate| c.freq_offset * wf.freq_osr as i32 + c.freq_sub as i32;
+    let tkey = |c: &Candidate| c.time_offset * wf.time_osr as i32 + c.time_sub as i32;
+    // Collapse each rescued signal's grid-point smear, but dedup ONLY among the
+    // rescue extras — NOT against the primary list. A strong crowded miss often sits
+    // a bin away from an unrelated primary candidate; checking against primary would
+    // wrongly drop exactly the signal we're trying to rescue. Primary/extra payload
+    // overlaps are harmless (the downstream `seen` set skips the re-decode).
+    let added_from = cands.len();
+    for c in extra {
+        if cands.len() - added_from >= budget {
+            break;
+        }
+        let (fk, tk) = (fkey(c), tkey(c));
+        let clash = cands[added_from..]
+            .iter()
+            .any(|k| (fk - fkey(k)).abs() <= FREQ_TOL && (tk - tkey(k)).abs() <= TIME_TOL);
+        if !clash {
+            cands.push(*c);
+        }
+    }
+}
+
 fn find_candidates(wf: &Waterfall) -> Vec<Candidate> {
     let num_tones = wf.protocol.num_tones() as i32;
-    let score_fn = if wf.protocol == Protocol::Ft4 {
-        ft4_sync_score
-    } else {
-        ft8_sync_score
-    };
     // Costas sync search spans the whole slot, not just a small offset window:
     // recordings/generated files aren't always tight to the slot start (FT4 in
     // particular sits ~25 symbols in), so bound the upper end by where the last
     // data symbol still fits rather than the reference's fixed +20.
     let total_symbols = wf.protocol.channel_symbols() as i32;
     let upper = (wf.num_blocks as i32 - total_symbols + 11).max(20);
-    let mut cands = Vec::new();
-    for time_sub in 0..wf.time_osr {
-        for freq_sub in 0..wf.freq_osr {
-            for time_offset in -10..upper {
-                for freq_offset in 0..(wf.num_bins as i32 - num_tones + 1) {
-                    let mut c = Candidate {
-                        score: 0,
-                        time_offset,
-                        freq_offset,
-                        time_sub,
-                        freq_sub,
-                    };
-                    c.score = score_fn(wf, &c);
-                    if c.score >= MIN_SCORE {
-                        cands.push(c);
+    let freq_hi = wf.num_bins as i32 - num_tones + 1;
+
+    // Scan the full (time-sub × freq-sub × time-offset × freq-offset) grid, scoring
+    // each point with `score` and keeping those at/above `thresh`.
+    let scan = |score: &dyn Fn(&Candidate) -> i32, thresh: i32| -> Vec<Candidate> {
+        let mut v = Vec::new();
+        for time_sub in 0..wf.time_osr {
+            for freq_sub in 0..wf.freq_osr {
+                for time_offset in -10..upper {
+                    for freq_offset in 0..freq_hi {
+                        let mut c = Candidate { score: 0, time_offset, freq_offset, time_sub, freq_sub };
+                        c.score = score(&c);
+                        if c.score >= thresh {
+                            v.push(c);
+                        }
                     }
                 }
             }
         }
-    }
+        v
+    };
+
+    // Primary finder: the original neighbor-contrast Costas score (ft8_lib heap),
+    // left exactly as-is — it is sharp/peaky and recovers the bulk of every corpus,
+    // so keeping it untouched is what guarantees FT8 and sparse-FT4 cannot regress.
+    let mut cands = if wf.protocol == Protocol::Ft4 {
+        scan(&|c| ft4_sync_score(wf, c), min_score())
+    } else {
+        scan(&|c| ft8_sync_score(wf, c), min_score())
+    };
     cands.sort_by_key(|c| std::cmp::Reverse(c.score)); // strongest first
-    cands.truncate(MAX_CANDIDATES);
+    cands.truncate(max_candidates());
+
+    // Additive crowded-band rescue: a strong signal packed beside other signals
+    // scores ~0 on neighbor-contrast (its neighbor bins hold those other signals, and
+    // the u8 mag saturates), so it is never nominated above. Re-score every grid point
+    // against the per-frequency noise floor (`per_freq_floor`), keep the strong peaks,
+    // then APPEND those the primary list doesn't already cover (`append_rescue`).
+    // Every decode is CRC-gated downstream, so this only ADDS decodes — it never drops
+    // or reorders a primary candidate, which is what keeps FT8/sparse-FT4 safe.
+    // Per-mode default in `baseline_enabled`; `DM420_BASELINE=0` disables it.
+    if baseline_enabled(wf.protocol) {
+        let floor = per_freq_floor(wf);
+        let mut extra = if wf.protocol == Protocol::Ft4 {
+            scan(&|c| ft4_sync_score_baseline(wf, c, &floor), rescue_min_score())
+        } else {
+            scan(&|c| ft8_sync_score_baseline(wf, c, &floor), rescue_min_score())
+        };
+        extra.sort_by_key(|c| std::cmp::Reverse(c.score));
+        append_rescue(&mut cands, &extra, wf, max_candidates());
+    }
+
+    if std::env::var("DM420_CAND_STATS").is_ok() {
+        eprintln!(
+            "cand-stats: {} candidates ({})",
+            cands.len(),
+            if baseline_enabled(wf.protocol) { "legacy + baseline-rescue" } else { "legacy only" },
+        );
+    }
     cands
 }
 
@@ -427,6 +642,33 @@ fn osd_enabled() -> bool {
 fn subtract_enabled() -> bool {
     static EN: OnceLock<bool> = OnceLock::new();
     *EN.get_or_init(|| std::env::var("DM420_SUBTRACT").map(|v| v != "0").unwrap_or(true))
+}
+
+/// Per-mode default for the noise-relative candidate scorer + local-max dedup
+/// (the crowded-band candidate-finder fix). FT4 wins decisively, so it's on by
+/// default; FT8's default is set by measurement on `sample_data/wsjtx_ft8` (see
+/// the A/B table in the handoff) — flip this if a future FT8 corpus changes the
+/// verdict. `DM420_BASELINE` overrides both modes for testing.
+const FT8_BASELINE_DEFAULT: bool = true;
+const FT4_BASELINE_DEFAULT: bool = true;
+
+/// Explicit `DM420_BASELINE` override, if set: `0` forces the legacy
+/// neighbor-contrast scorer for *both* modes, anything else forces the new scorer.
+/// `None` (unset) → use the per-mode compiled default above.
+fn baseline_override() -> Option<bool> {
+    static O: OnceLock<Option<bool>> = OnceLock::new();
+    *O.get_or_init(|| std::env::var("DM420_BASELINE").ok().map(|v| v != "0"))
+}
+
+/// Whether the noise-relative candidate scorer (`*_sync_score_baseline`) + dedup
+/// run for this protocol. `DM420_BASELINE=0` reverts to the legacy
+/// `ft8_sync_score`/`ft4_sync_score` for both modes — the A/B switch for the
+/// crowded-band fix and for testing FT8 each way.
+fn baseline_enabled(protocol: Protocol) -> bool {
+    baseline_override().unwrap_or(match protocol {
+        Protocol::Ft4 => FT4_BASELINE_DEFAULT,
+        Protocol::Ft8 => FT8_BASELINE_DEFAULT,
+    })
 }
 
 /// Whether the coherent front-end runs (default on). `DM420_COHERENT=0` falls
@@ -763,6 +1005,74 @@ mod tests {
             !as_ft8.iter().any(|d| d.message == "CQ K1ABC FN42"),
             "FT4 waveform should not decode under FT8: {:?}",
             as_ft8.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// The crowded-band fix in one assertion: when a signal's Costas tones AND their
+    /// neighbor bins are all loud (other signals packed alongside + u8 saturation),
+    /// the legacy neighbor-contrast scorer collapses to ~0 and the signal is never
+    /// nominated — while the noise-relative `*_baseline` scorer still scores it far
+    /// above threshold, because it references each tone to the quiet noise floor in
+    /// its own frequency lane. This is exactly the +13 dB FT4 miss on the Field Day
+    /// corpus, reproduced deterministically on a hand-built waterfall.
+    #[test]
+    #[allow(clippy::needless_range_loop)] // m/k drive the Costas block geometry
+    fn baseline_scorer_survives_hot_neighbors_that_kill_neighbor_contrast() {
+        let p = Protocol::Ft4;
+        let num_bins = 40usize;
+        let block_stride = TIME_OSR * FREQ_OSR * num_bins;
+        let num_blocks = 110usize; // covers FT4's last sync block (~103) + margin
+        let mut wf = Waterfall {
+            protocol: p,
+            time_osr: TIME_OSR,
+            freq_osr: FREQ_OSR,
+            num_bins,
+            block_stride,
+            num_blocks,
+            max_blocks: num_blocks,
+            min_bin: 0,
+            symbol_period: p.symbol_period(),
+            mag: vec![150u8; num_blocks * block_stride], // quiet noise floor everywhere
+        };
+        let c = Candidate { score: 0, time_offset: 0, freq_offset: 10, time_sub: 0, freq_sub: 0 };
+        let cell = |block: i32, tone: i32| -> usize {
+            block as usize * block_stride
+                + (c.time_sub * FREQ_OSR + c.freq_sub) * num_bins
+                + (c.freq_offset + tone) as usize
+        };
+        let (ns, ls, so) = (p.num_sync(), p.length_sync(), p.sync_offset());
+        // Pass 1: loud Costas sync tones (the real signal).
+        for m in 0..ns {
+            for k in 0..ls {
+                let block = (1 + so * m + k) as i32;
+                wf.mag[cell(block, FT4_COSTAS[m][k] as i32)] = 255;
+            }
+        }
+        // Pass 2: loud neighbors (the crowding/saturation), without lowering a tone.
+        for m in 0..ns {
+            for k in 0..ls {
+                let block = (1 + so * m + k) as i32;
+                let sm = FT4_COSTAS[m][k] as i32;
+                for (b, t) in [(block, sm - 1), (block, sm + 1), (block - 1, sm), (block + 1, sm)] {
+                    if (0..4).contains(&t) && b >= 0 && (b as usize) < num_blocks {
+                        let i = cell(b, t);
+                        if wf.mag[i] != 255 {
+                            wf.mag[i] = 250;
+                        }
+                    }
+                }
+            }
+        }
+        let legacy = ft4_sync_score(&wf, &c);
+        let floor = per_freq_floor(&wf);
+        let baseline = ft4_sync_score_baseline(&wf, &c, &floor);
+        assert!(
+            legacy < min_score(),
+            "neighbor-contrast should collapse under hot neighbors, got {legacy}"
+        );
+        assert!(
+            baseline > 3 * min_score(),
+            "noise-relative scorer should still nominate strongly, got {baseline}"
         );
     }
 
