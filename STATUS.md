@@ -2,6 +2,28 @@
 
 > Single source of truth for **open** work. Done work is **not** tracked here — `git log` is its record. The *why* behind architecture tasks lives in `ARCHITECTURE_REVIEW.md`; component specs in `docs/`; the multi-op protocol in `docs/networking.md`. Owners: **J** = Josh/N0JDC, **W** = Joel/W4LL, **—** = either. _Updated 2026-06-26._
 
+## Notes from Field Day
+
+Need to unlock TX offset on band/freq/mode change. Maybe also reset zoom.
+
+On send our text decode is sometimes not at the correct vertical position.
+
+Need to support rendering waterfall after alt-tab.
+
+Tab is still going to lock/unlock sometimes.
+
+Saw two cases where it didn't RR73 (ex: K0QIK, KI7OIY).
+
+Resending RR73 relogs the station (i.e. if he resent the R <section> message).
+
+FT4 working terribly when band is busy -- strong signals not decoded.
+
+FD: I start to transmit 73 and immediately stop.
+
+Feature: blacklist stations that never answer you.
+
+Bug: sometimes the reply does not happen in the correct time slot--it skips a time slot and then we're out of sync with the other station. Maybe decode doesn't finish in time, or we're not prepped to send the message at the start of the interval? Software was armed for TX and simply didn't.
+
 ## 🔴 Field Day blockers (June 27–28)
 
 > **The Field Day QSO machinery is built and now reachable.** The engine already sequences the full FD flow — `CQ FD …` → bare `<class> <section>` exchange → `R`-exchange → `RR73`/`73`, with the grid step skipped and the roger/`73` roles reversed (log-on-send vs. log-on-received) — plus the P1–P3 idiom fixes (give-up cap, any-sign-off completion, report-opener) and the class/section log columns. All of it is in `main` with characterization tests. **The runtime gate is now wired:** the unlocked Digital panel's CONTEST selector (`None` | `ARRL Field Day` + class/section) edits `Station`, persists to `[station]` in `config.toml`, and `to_qso_config()` pushes the chosen `ContestProfile` to the engine on re-lock. What remains is **on-air** validation, not code.
