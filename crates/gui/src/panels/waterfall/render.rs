@@ -121,9 +121,9 @@ impl Spectrogram {
         }
     }
 
-    /// Advance the scroll by the wall-clock time elapsed since the last frame, fill
-    /// the newly-exposed columns with `latest`, recolour through `cmap`, and blit
-    /// into `rect` (the right half).
+    /// Advance the scroll by the wall-clock time elapsed since the last frame, write
+    /// the newest column from `latest` (clearing any larger time gap rather than
+    /// smearing it), recolour through `cmap`, and blit into `rect` (the right half).
     ///
     /// The scroll is driven by absolute wall-clock (`now_ms`), not egui's frame
     /// `dt`: accumulating the true `(now_ms − last_now_ms)` delta telescopes exactly
@@ -172,10 +172,20 @@ impl Spectrogram {
                 self.intensity
                     .copy_within(base..base + (self.w - dx), base + dx);
             }
+            // Only column 0 (the NOW edge) genuinely corresponds to `latest`; any
+            // further exposed columns are a time gap we have no per-column data for.
+            // Normally there are none (dx is 0–1 per frame), but a fully-occluded
+            // window — macOS withholds frames from one that's covered, e.g. a
+            // fullscreen Space you tab away from — returns with a multi-second `dt`
+            // and a large `dx`. Replicating the single `latest` row across that gap
+            // smears one spectrum into a horizontal blur, so clear it instead: an
+            // honest "no data" rather than a fake streak. (The full fix reconstructs
+            // the gap from a timestamped ring — JOELS_ROADMAP.md "Waterslide freezes
+            // while backgrounded".)
             for c in 0..dx {
                 match latest {
-                    Some(row) => self.write_col(c, &row.mags),
-                    None => {
+                    Some(row) if c == 0 => self.write_col(0, &row.mags),
+                    _ => {
                         for r in 0..self.h {
                             self.intensity[r * self.w + c] = 0;
                         }
