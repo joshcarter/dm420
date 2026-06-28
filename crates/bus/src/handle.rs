@@ -43,7 +43,7 @@ use crate::topic::{DeliveryClass, Topic, TopicKind, TopicSelector};
 const LOSSY_CAP: usize = 256;
 /// Capacity of a `StreamLossless` per-subscriber mpsc queue. A subscriber that
 /// lets this fill is dropped (it's a broken subscriber), never blocking publish.
-const LOSSLESS_SUB_CAP: usize = 256;
+const LOSSLESS_SUB_CAP: usize = 1024;
 
 /// Retained replay-ring size for a `StreamLossless` topic, by kind.
 fn ring_capacity(kind: TopicKind) -> usize {
