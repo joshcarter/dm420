@@ -1,11 +1,11 @@
 # ARRL Field Day 2026 — N0JDC
 
-**Station:** N0JDC &nbsp;•&nbsp; **Class:** 2B &nbsp;•&nbsp; **Section:** CO (Colorado) &nbsp;•&nbsp; **Mode:** Digital (FT8 / FT4) &nbsp;•&nbsp; **Power:** QRP (≈5 W)
+**Station:** N0JDC &nbsp;•&nbsp; **Class:** 2B &nbsp;•&nbsp; **Section:** CO (Colorado) &nbsp;•&nbsp; **Modes:** Digital (FT8 / FT4) + Phone &nbsp;•&nbsp; **Power:** QRP (≈5 W)
 
 | | |
 |---|---|
 | Operating period | 2026-06-27 19:14Z → 2026-06-28 19:18Z |
-| Valid QSOs (claimed) | **438** (381 confirmed + 57 exchange-complete) |
+| Valid QSOs (claimed) | **439** — 438 digital + 1 phone |
 | Bands worked | 40 m, 20 m, 15 m, 10 m |
 | ARRL/RAC sections worked | 73 |
 | Software | DM420 ("Dingus Mangler 420") |
@@ -14,14 +14,14 @@
 
 ## 1. The Event
 
-N0JDC operated **ARRL Field Day 2026** as a **Class 2B** entry from Colorado (section **CO**), running QRP (about 5 watts) on the digital modes **FT8** and **FT4**. The station was a two-person, two-transmitter portable operation:
+N0JDC operated **ARRL Field Day 2026** as a **Class 2B** entry from Colorado (section **CO**), running QRP (about 5 watts), primarily on the digital modes **FT8** and **FT4** with a single **phone** contact. The station was a two-person, two-transmitter portable operation:
 
 - **Josh Carter — N0JDC** (the submitted station call)
 - **Joel Odom — W4LL**
 
 Both operators ran the project's own software, **DM420**, with the two transmitters active simultaneously on different bands — the multi-transmitter, multi-band style Field Day was built for. Because both stations transmitted under the single call **N0JDC**, the two operators' captures were merged into one station log and de-duplicated per the once-per-band-per-mode rule.
 
-Field Day 2026 ran **1800 UTC Saturday 27 June → 2059 UTC Sunday 28 June**. Setup began at 1800 UTC Saturday, which entitled the station to operate the full period (through ~2100 UTC Sunday). Setup and antenna work filled the first hour or so; the **first contact was logged at 1914Z on 27 June**, and the **last at 1918Z on 28 June**.
+Field Day 2026 ran **1800 UTC Saturday 27 June → 2059 UTC Sunday 28 June**. Setup began at 1800 UTC Saturday, which entitled the station to operate the full period (through ~2100 UTC Sunday). Setup and antenna work filled the first hour or so; the **first digital contact was logged at 1914Z on 27 June**, and the **last at 1918Z on 28 June**.
 
 Operation was essentially **around the clock**. With FT8/FT4 holding up well on 20 m and 40 m overnight, the station stayed active through every hour of the night rather than going dark — the hourly QSO counts below never fall to zero between the first and last contact.
 
@@ -33,16 +33,17 @@ Operation was essentially **around the clock**. With FT8/FT4 holding up well on 
 | 20m | Digital | 221 | 192 | 29 |
 | 15m | Digital | 96 | 83 | 13 |
 | 10m | Digital | 22 | 20 | 2 |
-| **Total** | | **438** | **381** | **57** |
+| 20m | Phone | 1 | 1 | 0 |
+| **Total** | | **439** | **382** | **57** |
 
-- **Mode split:** 194 QSOs FT8-only, 227 FT4-only, 17 on both sub-modes. All count as a single **Digital** mode for Field Day scoring and duplicate checking.
-- **Geographic reach:** **73 distinct ARRL/RAC sections**, including Canadian sections and a handful of DX. Top sections: WWA (20), OH (20), WI (19), MI (15), STX (14), SV (13), ID (13), SCV (13).
+- **Mode split:** 438 digital (194 FT8-only, 227 FT4-only, 17 both sub-modes) + 1 phone. FT8 and FT4 count as a single **Digital** mode for Field Day scoring and duplicate checking; phone is a separate mode.
+- **Geographic reach:** **73 distinct ARRL/RAC sections**, including Canadian sections and a handful of DX. Top sections: WWA (21), OH (20), WI (19), MI (15), STX (14), SV (13), ID (13), SCV (13).
 
-**Claimed QSO points.** Digital contacts are worth **2 points** each: 438 × 2 = **876 QSO points** before the power multiplier. Operating QRP at ≤5 W from a non-commercial power source earns a **×5** power multiplier, giving **4380 claimed QSO points** (or 1752 at ×2 if the ≤5 W / power-source conditions are not met). Bonus points (emergency power, public location, publicity, etc.) are **not** included here and are added separately on the entry form.
+**Claimed QSO points.** Digital contacts are worth **2 points** each and phone **1 point** each: 438 × 2 + 1 × 1 = **877 QSO points** before the power multiplier. Operating QRP at ≤5 W from a non-commercial power source earns a **×5** power multiplier, giving **4385 claimed QSO points** (or 1754 at ×2 if the ≤5 W / power-source conditions are not met). Bonus points (emergency power, public location, publicity, etc.) are **not** included here and are added separately on the entry form.
 
-> **Two figures are given throughout.** *Confirmed* QSOs (381) are those with explicit two-way confirmation. *Exchange-complete* QSOs (57) are ones where the full Field Day exchange went both ways but the final `RR73` was never decoded; they are counted because there is good reason to believe the contact completed (see §2). The conservative claim is **381**; the full claim is **438**.
+> **Two figures are given throughout.** *Confirmed* QSOs are those with explicit two-way confirmation. *Exchange-complete* QSOs are ones where the full Field Day exchange went both ways but the final `RR73` was never decoded; they are counted because there is good reason to believe the contact completed (see §2). The conservative claim is **382** (381 confirmed digital + 1 phone); the full claim is **439**.
 
-### Activity by hour (UTC)
+### Activity by hour (UTC) — digital
 
 ```
 06-27 19Z    7  ███████
@@ -76,7 +77,7 @@ Operation was essentially **around the clock**. With FT8/FT4 holding up well on 
 
 ## 2. How the Results Were Calculated
 
-DM420's live logger only commits a contact when it **decodes an `RR73`/`RRR`** (or, on the answering side, when it sends its own `RR73`). That is conservative and, under a Field Day pileup, it both **missed** good contacts and could not see contacts whose final acknowledgement was lost. So rather than trust the live log, the results above were rebuilt **from scratch out of the raw decode captures** that DM420 recorded for every cycle it heard or transmitted.
+DM420's live logger only commits a contact when it **decodes an `RR73`/`RRR`** (or, on the answering side, when it sends its own `RR73`). That is conservative and, under a Field Day pileup, it both **missed** good contacts and could not see contacts whose final acknowledgement was lost. So rather than trust the live log, the digital results were rebuilt **from scratch out of the raw decode captures** that DM420 recorded for every cycle it heard or transmitted. (The single phone contact was logged by hand and is carried separately — see the end of this section.)
 
 ### Source data
 
@@ -106,24 +107,32 @@ Because both operators transmitted as N0JDC, the two captures were **merged** an
 
 ### Verification (three independent checks)
 
+The **438 digital** QSOs were verified three ways:
+
 1. **Independent re-parse.** The QSO set was rebuilt a second time from the literal on-air **text strings** using a completely separate parser, instead of DM420's structured decode fields. The two methods agreed on **every one of the 438 contacts** — exact match, no differences.
 2. **Against DM420's own logbook.** The live logbook (which logs only on `RR73`) contains **372** de-duplicated QSOs. **Every one** appears in the reconstruction, with a **matching received class+section** (372/372, zero mismatches). The logbook contradicts the reconstruction nowhere.
 3. **Explaining the difference.** The reconstruction has 66 contacts the logbook lacks: **57** are the exchange-complete (lost-`RR73`) tier the logger cannot see by design, and **9** are *fully confirmed* QSOs (with `RR73`/`RRR` in the decodes) that the live logger **dropped under pileup load**. The reconstruction also removes ~33 duplicate entries that the raw logbook had recorded. Net: the decode-based count is **more** complete and **more** accurate than the live log, and the live log corroborates all of it.
+
+### Phone contact (1)
+
+The station made one **phone (SSB) contact**, which is outside the FT8/FT4 decode pipeline and so is not in the captures above. It is recorded by hand in `manual_qsos.csv` and folded into the totals and the Cabrillo log. Phone is a separate mode from digital, so it is creditable independent of any digital QSO with the same station, and it scores **1 point** (vs 2 for digital).
 
 ### Reproducing this
 
 | Script | Purpose |
 |--------|---------|
-| `fd_report.py` | Parse both captures → QSO totals + `fd_worked_stations.csv` |
-| `fd_crosscheck.py` | Independent raw-text re-parse; confirms the same 438 QSOs |
+| `fd_report.py` | Parse both captures → digital QSO totals + `fd_worked_stations.csv` |
+| `fd_crosscheck.py` | Independent raw-text re-parse; confirms the same digital QSOs |
 | `fd_logbook_check.py` | Compare against DM420's logbooks (`fd_logbook_comparison.txt`) |
-| `make_fd_writeup.py` | Generate this document from the verified CSV |
+| `make_cabrillo.py` | Emit the ARRL-FD Cabrillo log (`N0JDC_2026_FD.cbr`) |
+| `make_fd_writeup.py` | Generate this document from the verified data |
+| `manual_qsos.csv` | QSOs logged off the digital pipeline (the phone contact) |
 
 ---
 
 ## 3. Stations Worked — Dupe Sheet / Backing Log
 
-All **438** creditable contacts, grouped by band and listed alphabetically by call for duplicate checking. *Time* is the UTC time of the first exchange of the contact. *Status* is C = confirmed, X = exchange-complete (see §2). The received exchange (their class + section) is shown as logged.
+All **439** creditable contacts, grouped by band/mode and listed alphabetically by call for duplicate checking. *Time* is the UTC time of the first exchange of the contact. *Status* is C = confirmed, X = exchange-complete (see §2). The received exchange (their class + section) is shown as logged.
 
 ### 40m — Digital (99 QSOs)
 
@@ -583,6 +592,14 @@ All **438** creditable contacts, grouped by band and listed alphabetically by ca
 | 21 | W9LRC | 4A | WI | FT8 | 06-28 17:04 | C |
 | 22 | WJ0D | 1D | CO | FT8 | 06-27 20:00 | C |
 
+### Phone (1 QSO)
+
+| # | Call | Class | Section | Sub-mode | Band | Date/Time (UTC) | Status |
+|--:|------|-------|---------|----------|------|-----------------|:------:|
+| 1 | K7LED | 6A | WWA | SSB | 20m | 06-28 00:30 | C |
+
+Phone contact made at **6:30 PM MDT (0030 UTC, 28 Jun)** on **14.320 MHz**.
+
 ---
 
 ### Items to complete on the official entry (not derivable from the radio data)
@@ -592,4 +609,4 @@ All **438** creditable contacts, grouped by band and listed alphabetically by ca
 - Power-source description (sets the ×5 vs ×2 multiplier)
 - Claimed **bonus points** and their supporting documentation (emergency/alternate power, public location, media publicity, NTS traffic, etc.)
 
-*Generated from the raw DM420 decode captures by `make_fd_writeup.py`. QSO set verified by independent re-parse and against DM420's logbooks. Confirmed 381 / claimed 438.*
+*Generated from the raw DM420 decode captures (digital) and `manual_qsos.csv` (phone) by `make_fd_writeup.py`. Digital QSO set verified by independent re-parse and against DM420's logbooks. Confirmed 382 / claimed 439.*
