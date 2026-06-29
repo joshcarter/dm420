@@ -1,0 +1,45 @@
+==================================================================
+LOGBOOK CROSS-CHECK
+==================================================================
+  logbook-joel: 410 rows | contest={'ArrlFieldDay': 405, None: 5} | out-of-window=0
+  logbook-josh: 409 rows | contest={'ArrlFieldDay': 404, None: 5} | out-of-window=0
+
+  same QSO-id in both logbooks : 408
+  only in joel's logbook       : 2
+  only in josh's logbook       : 1
+
+  FD logbook rows in window (both files) ...... 809
+  distinct (call,band) logged QSOs ............ 372
+  (call,band) pairs logged more than once ..... 370 (e.g. [('W6DPM', '20m'), ('K0QIK', '20m'), ('KI7OIY', '20m'), ('W4TA', '15m'), ('N8ERL', '15m')])
+
+------------------------------------------------------------------
+LOGBOOK  vs  DECODE RECONSTRUCTION
+------------------------------------------------------------------
+  logbook distinct QSOs ............... 372
+  reconstruction ALL (conf+exch) ..... 438 (381 confirmed + 57 exchanged)
+  agree (in both) .................... 372
+  in logbook but NOT reconstructed ... 0
+  reconstructed but NOT in logbook ... 66
+
+  logbook vs CONFIRMED tier:
+    confirmed QSOs also in logbook ... 372 / 381
+    confirmed QSOs NOT in logbook .... 9
+  logbook vs EXCHANGED tier (lost-RR73):
+    exchanged QSOs in logbook ....... 0 / 57
+    exchanged QSOs NOT in logbook ... 57
+
+  Reconstructed-but-not-logged breakdown by tier: {'EXCHANGED': 57, 'CONFIRMED': 9}
+    CONFIRMED but unlogged (worth a look):
+       ('K8CAD', '15m')
+       ('K9BEL', '10m')
+       ('KC8VC', '15m')
+       ('KE5ZDZ', '20m')
+       ('KJ7MMU', '20m')
+       ('N0GF', '15m')
+       ('NA7SS', '20m')
+       ('W6EK', '20m')
+       ('W6EU', '15m')
+
+  Jaccard(logbook, reconstruction ALL): 84.9%
+  Jaccard(logbook, CONFIRMED tier):     97.6%
+==================================================================

@@ -1,0 +1,58 @@
+========================================================================
+ARRL FIELD DAY 2026  --  N0JDC submission data (derived from DM420 decodes)
+========================================================================
+
+Station call .......... N0JDC
+Entry class ........... 2B  (2 transmitters, Class B portable)
+ARRL/RAC section ...... CO  (Colorado)
+FD period ............. 2026-06-27 1800Z  ->  2026-06-28 2100Z
+                        (setup began 1800Z Sat -> full 24h+ period allowed)
+Source files .......... decodes-joel.json, decodes-josh.jsonl (merged, deduped)
+
+------------------------------------------------------------------------
+QSO TOTALS BY BAND AND MODE  (all contacts are Digital / FT8+FT4)
+------------------------------------------------------------------------
+Band    Digital QSOs    (Confirmed  + Exchanged)
+40m               99            86            13
+20m              221           192            29
+15m               96            83            13
+10m               22            20             2
+TOTAL            438           381            57
+
+Mode breakdown: Digital QSOs = 438 (Phone = 0, CW = 0)
+Digital QSO points = QSOs x 2 = 876  (before power multiplier)
+Power multiplier: x5 if all QSOs made at <=5 W from a non-commercial power
+  source (QRP); otherwise x2 for <=150 W. -> claimed QSO points =
+  4380 (x5 QRP)  or  1752 (x2).
+
+Confidence split:
+  CONFIRMED  (their RR73/RRR/73 or their 'R' copied) ... 381
+  EXCHANGED  (we sent R+exchange, their final RR73 not
+             decoded; counted per FD unadjudicated policy) 57
+
+------------------------------------------------------------------------
+DATA NOT DERIVABLE FROM DECODES -- fill in by hand at fdentry.php:
+------------------------------------------------------------------------
+  * Number of participants / list of operators (Joel W4LL, Josh ...)
+  * GOTA station call + GOTA QSO totals (if any)
+  * Claimed bonus points (100% emergency power, public location, media
+    publicity, NTS messages, alternate power, etc.) + documentation
+  * Power source description for the power multiplier above
+
+------------------------------------------------------------------------
+DIAGNOSTICS
+------------------------------------------------------------------------
+  Field-Day exchange messages involving N0JDC ......... 5864
+  Distinct (partner,band) pairs with any involvement ... 763
+  Creditable QSOs (Confirmed+Exchanged) ............... 438
+  Incomplete / not credited ........................... 325
+  In-band exchanges OUTSIDE the FD window (excluded) .. 0
+  Records dropped for null/unknown band ............... 0
+
+Incomplete breakdown (top reasons):
+   304  we sent ours; never copied their exchange
+    17  heard their exchange; we never sent ours
+     4  partial/one-sided
+
+Worked-stations list written to: fd_worked_stations.csv (438 rows)
+========================================================================
