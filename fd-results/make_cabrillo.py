@@ -79,12 +79,11 @@ out.append("SOAPBOX: Class/power/bonus are entered on the Field Day web form, no
 out.append("SOAPBOX: Digital frequencies are canonical band frequencies.")
 
 for t, freq, mode, call, cls, sec in qsos:
-    out.append(
-        "QSO: %5d %s %s %s %-8s %-3s %-4s %-8s %-3s %-4s" % (
-            freq, mode, t.strftime("%Y-%m-%d"), t.strftime("%H%M"),
-            MY_CALL, MY_CLASS, MY_SECTION, call, cls, sec,
-        )
+    line = "QSO: %5d %s %s %s %-8s %-3s %-4s %-8s %-3s %-4s" % (
+        freq, mode, t.strftime("%Y-%m-%d"), t.strftime("%H%M"),
+        MY_CALL, MY_CLASS, MY_SECTION, call, cls, sec,
     )
+    out.append(line.rstrip())   # no trailing whitespace
 out.append("END-OF-LOG:")
 
 path = os.path.join(HERE, "N0JDC_2026_FD.cbr")
