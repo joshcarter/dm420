@@ -16,17 +16,20 @@ pub enum BusError {
     #[error("a server is already registered for this command topic")]
     ServerExists,
 
-    /// A `StreamLossy` subscriber fell behind and the channel dropped `skipped`
-    /// messages before this `recv`. The subscriber is still live; keep reading.
-    #[error("lossy subscriber lagged, {skipped} message(s) skipped")]
+    /// A `StreamLossy` **or** `StreamLossless` subscriber fell behind the live tail
+    /// and the channel dropped `skipped` messages before this `recv`. The subscriber
+    /// is still live; keep reading. (Lossless overflow now *lags* the subscriber —
+    /// it is no longer disconnected for being slow; see `docs/bus-handoff.md`.)
+    #[error("subscriber lagged, {skipped} message(s) skipped")]
     Lagged {
         /// How many messages were dropped.
         skipped: u64,
     },
 
-    /// The subscription/channel is gone. For a `StreamLossless` subscriber this
-    /// means it was disconnected for being too slow — re-subscribe for a fresh
-    /// snapshot.
+    /// The subscription/channel is gone: every sender for the topic has been dropped
+    /// (or a Command responder was dropped without replying). A slow `StreamLossless`
+    /// subscriber is **no longer** closed for lagging — it now receives
+    /// [`BusError::Lagged`] and stays subscribed.
     #[error("channel closed")]
     Closed,
 

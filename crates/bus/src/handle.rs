@@ -3,7 +3,7 @@
 //! ## How delivery is type-erased
 //!
 //! The hot path never serializes. Each topic owns a concrete typed channel
-//! (`watch` / `broadcast` / per-subscriber `mpsc`) stored in a registry as
+//! (`watch` / `broadcast` / `mpsc`) stored in a registry as
 //! `Box<dyn Any + Send + Sync>`; publish/subscribe downcast back to the concrete
 //! payload type. The payload type for a topic is fixed by its first user; a later
 //! caller with a different type for the same (class-matching) topic gets
@@ -41,11 +41,15 @@ use crate::topic::{DeliveryClass, Topic, TopicKind, TopicSelector};
 
 /// Capacity of a `StreamLossy` broadcast channel (per topic and per wildcard kind).
 const LOSSY_CAP: usize = 256;
-/// Capacity of a `StreamLossless` per-subscriber mpsc queue. A subscriber that
-/// lets this fill is dropped (it's a broken subscriber), never blocking publish.
-const LOSSLESS_SUB_CAP: usize = 1024;
+/// Minimum live-tail depth for a `StreamLossless` broadcast channel, in messages.
+/// This is a **lag threshold, not an eviction cap**: a subscriber that falls this
+/// far behind the live tail is signalled `Lagged` on its next `recv` and *stays
+/// subscribed* — it never blocks or evicts the publisher. The retained replay ring
+/// (`ring_capacity`) is a separate, on-subscribe history snapshot.
+const LOSSLESS_MIN_LIVE_CAP: usize = 1024;
 
-/// Retained replay-ring size for a `StreamLossless` topic, by kind.
+/// Retained replay-ring size for a `StreamLossless` topic, by kind. This is the
+/// on-subscribe history snapshot depth, independent of the live-tail lag budget.
 fn ring_capacity(kind: TopicKind) -> usize {
     match kind {
         TopicKind::Decodes | TopicKind::DecodesEnriched => 16,
@@ -54,31 +58,47 @@ fn ring_capacity(kind: TopicKind) -> usize {
     }
 }
 
+/// Live-tail lag budget for a `StreamLossless` broadcast channel, by kind. At least
+/// `LOSSLESS_MIN_LIVE_CAP` so a bursty producer (e.g. the logbook's startup replay)
+/// can outrun a momentarily-stalled subscriber without forcing a `Lagged` — and it
+/// is never sized down to a small replay ring (e.g. Decodes' 16).
+fn lossless_live_cap(kind: TopicKind) -> usize {
+    ring_capacity(kind).max(LOSSLESS_MIN_LIVE_CAP)
+}
+
 /// The reply channel handed alongside a command request.
 type CmdMsg<Req, Rep> = (Req, oneshot::Sender<Rep>);
 
-/// Per-topic fan-out state for a `StreamLossless` channel: live per-subscriber
-/// queues plus a retained ring for late-join replay.
+/// Per-topic fan-out state for a `StreamLossless` channel: a shared `broadcast`
+/// live tail plus a retained ring for the on-subscribe history snapshot.
+///
+/// The live tail is a `broadcast` (one shared ring, per-subscriber cursor) rather
+/// than per-subscriber `mpsc` queues: a subscriber that falls behind the tail is
+/// signalled `Lagged` and stays subscribed, instead of being evicted. This keeps
+/// the "a slow subscriber never stalls the publisher" invariant while making
+/// overflow non-destructive — a bursty publisher (e.g. the logbook's startup
+/// replay) can no longer delete a healthy subscriber. See `docs/bus-handoff.md`.
 struct LosslessInner<M> {
-    subs: Vec<mpsc::Sender<M>>,
+    tx: broadcast::Sender<M>,
     ring: VecDeque<M>,
     ring_cap: usize,
 }
 
-impl<M> LosslessInner<M> {
-    fn new(ring_cap: usize) -> Self {
+impl<M: Clone> LosslessInner<M> {
+    fn new(ring_cap: usize, live_cap: usize) -> Self {
+        // Drop the initial receiver; each subscriber attaches its own via
+        // `tx.subscribe()`. (`broadcast::channel` requires a non-zero capacity.)
+        let (tx, _rx) = broadcast::channel(live_cap.max(1));
         Self {
-            subs: Vec::new(),
+            tx,
             ring: VecDeque::new(),
             ring_cap,
         }
     }
-}
 
-impl<M: Clone> LosslessInner<M> {
-    /// Retain `msg` in the ring and fan it out. A subscriber whose queue is full
-    /// (or whose receiver is gone) is dropped here — its next `recv` returns
-    /// `Closed`. The publisher never blocks.
+    /// Retain `msg` in the replay ring and push it onto the live tail. A subscriber
+    /// that has fallen behind is signalled `Lagged` on its next `recv` (it stays
+    /// subscribed); the publisher never blocks and never evicts anyone.
     fn push(&mut self, msg: M) {
         if self.ring_cap > 0 {
             if self.ring.len() >= self.ring_cap {
@@ -86,8 +106,9 @@ impl<M: Clone> LosslessInner<M> {
             }
             self.ring.push_back(msg.clone());
         }
-        self.subs
-            .retain(|tx| matches!(tx.try_send(msg.clone()), Ok(())));
+        // `send` errors only when there are no receivers — harmless: the ring above
+        // retains history for the next late-joiner. Never blocks, never evicts.
+        let _ = self.tx.send(msg);
     }
 }
 
@@ -299,8 +320,12 @@ impl BusHandle {
         let (exact, wild) = {
             let mut guard = self.inner.reg.lock().unwrap();
             let reg = &mut *guard;
-            let exact =
-                goc_lossless::<M, String>(&mut reg.exact, key.to_string(), ring_capacity(kind))?;
+            let exact = goc_lossless::<M, String>(
+                &mut reg.exact,
+                key.to_string(),
+                ring_capacity(kind),
+                lossless_live_cap(kind),
+            )?;
             let wild = match reg.wild.get(&kind) {
                 Some(Entry::Lossless(b)) => {
                     b.downcast_ref::<Arc<Mutex<LosslessInner<M>>>>().cloned()
@@ -378,7 +403,12 @@ impl BusHandle {
             (Some(key), DeliveryClass::StreamLossless) => {
                 let arc = {
                     let mut guard = self.inner.reg.lock().unwrap();
-                    goc_lossless::<M, String>(&mut guard.exact, key, ring_capacity(kind))?
+                    goc_lossless::<M, String>(
+                        &mut guard.exact,
+                        key,
+                        ring_capacity(kind),
+                        lossless_live_cap(kind),
+                    )?
                 };
                 lossless_subscription(&arc)
             }
@@ -427,7 +457,12 @@ impl BusHandle {
             (None, DeliveryClass::StreamLossless) => {
                 let arc = {
                     let mut guard = self.inner.reg.lock().unwrap();
-                    goc_lossless::<M, TopicKind>(&mut guard.wild, kind, ring_capacity(kind))?
+                    goc_lossless::<M, TopicKind>(
+                        &mut guard.wild,
+                        kind,
+                        ring_capacity(kind),
+                        lossless_live_cap(kind),
+                    )?
                 };
                 lossless_subscription(&arc)
             }
@@ -511,10 +546,11 @@ fn goc_lossless<M: BusMessage, K: Eq + Hash>(
     map: &mut HashMap<K, Entry>,
     key: K,
     ring_cap: usize,
+    live_cap: usize,
 ) -> Result<Arc<Mutex<LosslessInner<M>>>, BusError> {
     let entry = map.entry(key).or_insert_with(|| {
         Entry::Lossless(Box::new(Arc::new(Mutex::new(LosslessInner::<M>::new(
-            ring_cap,
+            ring_cap, live_cap,
         )))))
     });
     let Entry::Lossless(b) = entry else {
@@ -544,14 +580,30 @@ fn wild_broadcast_rx<M: BusMessage>(
         .subscribe())
 }
 
-/// Register a new subscriber on a lossless channel: snapshot the current ring,
-/// then attach a fresh per-subscriber queue for live delivery.
+/// Register a new subscriber on a lossless channel. Under the held lock, attach a
+/// live-tail receiver *first*, then snapshot the ring — so history (`snapshot`) and
+/// the live stream (`rx`) partition with no gap and no duplicate: any message a
+/// concurrent `push` adds is either already in the cloned ring or arrives on `rx`,
+/// never both and never neither (the same lock `push` takes serializes them). Never
+/// reverse this order (snapshot-then-subscribe would risk a *missed* message).
 fn lossless_subscription<M: BusMessage>(arc: &Arc<Mutex<LosslessInner<M>>>) -> SubInner<M> {
-    let mut g = arc.lock().unwrap();
+    let g = arc.lock().unwrap();
+    let rx = g.tx.subscribe();
     let snapshot = g.ring.clone();
-    let (tx, rx) = mpsc::channel::<M>(LOSSLESS_SUB_CAP);
-    g.subs.push(tx);
     SubInner::Lossless { snapshot, rx }
+}
+
+/// Receive from a `broadcast` live tail, mapping tokio's recv error to [`BusError`].
+/// Shared by every subscription whose live stream rides a `broadcast`: `StreamLossy`
+/// (exact + wildcard), wildcard `State` (after its prime), and `StreamLossless`
+/// (after its snapshot). A lagging subscriber gets `Lagged` and stays subscribed;
+/// `Closed` means every sender is gone.
+async fn recv_broadcast<M: Clone>(rx: &mut broadcast::Receiver<M>) -> Result<M, BusError> {
+    match rx.recv().await {
+        Ok(v) => Ok(v),
+        Err(broadcast::error::RecvError::Lagged(n)) => Err(BusError::Lagged { skipped: n }),
+        Err(broadcast::error::RecvError::Closed) => Err(BusError::Closed),
+    }
 }
 
 /// A live subscription. `recv` yields snapshot item(s) first (per class), then
@@ -579,15 +631,15 @@ enum SubInner<M> {
     },
     Lossless {
         snapshot: VecDeque<M>,
-        rx: mpsc::Receiver<M>,
+        rx: broadcast::Receiver<M>,
     },
 }
 
 impl<M: BusMessage> Subscription<M> {
-    /// Receive the next message. `Err(Lagged)` if a lossy subscriber fell behind
-    /// (still live — keep reading); `Err(Closed)` if a lossless subscription was
-    /// dropped for being too slow (re-subscribe for a fresh snapshot) or the
-    /// channel is otherwise gone.
+    /// Receive the next message. `Err(Lagged { skipped })` if the subscriber fell
+    /// behind the live tail — for **both** `StreamLossy` and `StreamLossless`: the
+    /// subscription stays live, so keep reading (the `skipped` messages are gone).
+    /// `Err(Closed)` means the channel is gone (every sender dropped).
     pub async fn recv(&mut self) -> Result<M, BusError> {
         match &mut self.inner {
             SubInner::State { rx, primed } => {
@@ -604,11 +656,7 @@ impl<M: BusMessage> Subscription<M> {
                     }
                 }
             }
-            SubInner::Stream { rx } => match rx.recv().await {
-                Ok(v) => Ok(v),
-                Err(broadcast::error::RecvError::Lagged(n)) => Err(BusError::Lagged { skipped: n }),
-                Err(broadcast::error::RecvError::Closed) => Err(BusError::Closed),
-            },
+            SubInner::Stream { rx } => recv_broadcast(rx).await,
             // Drain the primed backlog (existing exact values at subscribe time)
             // before reading live broadcast updates. See `SubInner::WildcardState`
             // for the at-least-once / possible-duplicate semantics.
@@ -616,22 +664,16 @@ impl<M: BusMessage> Subscription<M> {
                 if let Some(v) = backlog.pop_front() {
                     return Ok(v);
                 }
-                match rx.recv().await {
-                    Ok(v) => Ok(v),
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        Err(BusError::Lagged { skipped: n })
-                    }
-                    Err(broadcast::error::RecvError::Closed) => Err(BusError::Closed),
-                }
+                recv_broadcast(rx).await
             }
+            // Drain the on-subscribe ring snapshot first, then the live tail. A
+            // subscriber that overflows the tail is signalled `Lagged` and stays
+            // subscribed (lag-not-evict) — identical live-recv path to the arms above.
             SubInner::Lossless { snapshot, rx } => {
                 if let Some(v) = snapshot.pop_front() {
                     return Ok(v);
                 }
-                match rx.recv().await {
-                    Some(v) => Ok(v),
-                    None => Err(BusError::Closed),
-                }
+                recv_broadcast(rx).await
             }
         }
     }

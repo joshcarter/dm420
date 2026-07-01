@@ -235,10 +235,15 @@ async fn lossy_lagged_and_isolation() {
     assert_eq!(healthy.recv().await.unwrap().t.0, 12345);
 }
 
-// ------------------------------------------------- #6 Lossless slow → disconnected
+// --------------------------------------------- #6 Lossless overflow → lag, not evict
 
+/// The lossless overflow contract is **lag-not-evict**: a subscriber that stops
+/// draining and overflows the live tail is signalled `Lagged` and STAYS subscribed,
+/// never disconnected. This asserts the exact opposite of the old policy (which
+/// returned `Closed` and deleted the subscriber here), so it is the regression guard
+/// for the reversed contract. See `docs/bus-handoff.md` (acceptance #6).
 #[tokio::test]
-async fn lossless_slow_subscriber_disconnected() {
+async fn lossless_overflow_lags_not_disconnects() {
     let bus = BusHandle::new();
     let id = RadioId("k1".into());
     let topic = Topic::Decodes(id.clone());
@@ -246,43 +251,69 @@ async fn lossless_slow_subscriber_disconnected() {
     let mut slow = bus
         .subscribe::<Decode>(TopicSelector::Exact(topic.clone()))
         .unwrap();
-    // Flood past the per-subscriber queue cap without draining. Publisher keeps going.
-    for i in 0..1000 {
-        assert!(bus.publish(&topic, decode(&id, i)).is_ok());
+
+    // The Decodes live-tail lag budget is lossless_live_cap = ring_capacity(16).max(1024) = 1024.
+    const LIVE_CAP: u64 = 1024;
+    let n = LIVE_CAP + 500;
+
+    // (1) The publisher never blocks or fails, even flooded far past the live tail
+    //     with nobody draining: every publish returns Ok. (Under the OLD policy the
+    //     subscriber was deleted mid-flood, so the publisher returning Ok didn't
+    //     catch it — the drain in (2) is what distinguishes the contracts.)
+    for i in 0..n {
+        assert!(
+            bus.publish(&topic, decode(&id, i)).is_ok(),
+            "publisher must never block or fail on lossless overflow"
+        );
     }
-    // The stalled subscriber is disconnected: after draining what was buffered,
-    // recv returns Closed.
-    let mut closed = false;
-    for _ in 0..2000 {
+
+    // (2) Draining now yields a Lagged signal, and NEVER Closed. This is the
+    //     reversed contract: v1 disconnected the overflowing subscriber (→ Closed).
+    //     (tokio surfaces the lag on the first recv, ahead of the retained tail, so
+    //     we don't require an Ok strictly *before* the Lagged — see the Ok proof below.)
+    let mut saw_lag = false;
+    for _ in 0..n {
         match slow.recv().await {
             Ok(_) => {}
-            Err(BusError::Closed) => {
-                closed = true;
+            Err(BusError::Lagged { skipped }) => {
+                assert!(skipped > 0, "Lagged must report a positive skip count");
+                saw_lag = true;
                 break;
+            }
+            Err(BusError::Closed) => {
+                panic!("lossless overflow must not disconnect the subscriber (got Closed)")
             }
             Err(e) => panic!("unexpected error: {e:?}"),
         }
     }
-    assert!(
-        closed,
-        "a stalled lossless subscriber should be disconnected"
-    );
+    assert!(saw_lag, "overflow must surface as Lagged, not eviction");
 
-    // Re-subscribing yields a fresh snapshot (retained ring) plus live messages.
-    let mut fresh = bus
-        .subscribe::<Decode>(TopicSelector::Exact(topic.clone()))
-        .unwrap();
-    bus.publish(&topic, decode(&id, 7777)).unwrap();
+    // (3) The clincher: the SAME handle — never re-subscribed — still receives a
+    //     brand-new live message. Proof it was lagged, not evicted. Draining past the
+    //     retained backlog also proves real messages (Ok) still flow, not only lag.
+    bus.publish(&topic, decode(&id, 999_999)).unwrap();
     let mut got_live = false;
-    for _ in 0..100 {
-        if slot_of(&fresh.recv().await.unwrap()) == 7777 {
-            got_live = true;
-            break;
+    let mut saw_ok = false;
+    for _ in 0..(2 * n) {
+        match slow.recv().await {
+            Ok(d) => {
+                saw_ok = true;
+                if slot_of(&d) == 999_999 {
+                    got_live = true;
+                    break;
+                }
+            }
+            Err(BusError::Lagged { .. }) => {}
+            Err(e) => panic!("unexpected error after lag: {e:?}"),
         }
     }
     assert!(
         got_live,
-        "re-subscribe should resume receiving live messages"
+        "a lagged lossless subscriber stays subscribed and receives new live messages"
+    );
+    assert!(
+        saw_ok,
+        "lossless delivery still yields real messages (Ok), not only lag signals"
     );
 }
 
@@ -423,8 +454,8 @@ async fn concurrency_smoke() {
         t.await.unwrap();
     }
 
-    // Lossless: every message is delivered (total < per-subscriber cap, so nothing
-    // is dropped) with no deadlock.
+    // Lossless: every message is delivered (total < the live-tail lag budget, so
+    // nothing is dropped) with no deadlock.
     let total = n_pub * per;
     let mut count = 0u64;
     while count < total {

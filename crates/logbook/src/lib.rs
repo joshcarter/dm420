@@ -16,6 +16,13 @@
 //! never re-appended. (This requires `QsoId`s to be unique per contact across
 //! sessions — see `qso::shell`, which seeds the sequence from the wall clock.)
 //!
+//! The startup republish is **overflow-safe** under the lag-not-evict lossless
+//! contract: a big on-disk log can burst past the bus's live-tail budget, and our
+//! own loopback subscription simply gets a `Lagged` on `recv` (it is no longer
+//! evicted, which previously killed the writer mid-replay and stopped persisting new
+//! contacts). A skipped replay is harmless — the disk-built `seen` set already holds
+//! every replayed id, so dedup absorbs both re-delivered and skipped replays.
+//!
 //! Not yet built: ADIF import/export and the G-set merge that folds in gossiped
 //! peer contacts. An ADIF exporter can read the same store later.
 //!
@@ -70,7 +77,10 @@ async fn run(bus: BusHandle, path: PathBuf) {
                     tracing::warn!("logbook: append to {} failed: {e}", path.display());
                 }
             }
-            // Lossless stream, but be exhaustive: a closed channel ends the task.
+            // A self-loopback `Lagged` during the startup replay burst is expected
+            // and harmless: the live tail can overflow while we drain, but the
+            // disk-built `seen` set already holds every replayed id, so a skipped
+            // replay changes nothing. Keep going (a closed channel ends the task).
             Err(BusError::Lagged { .. }) => continue,
             Err(_) => break,
         }

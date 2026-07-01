@@ -57,12 +57,16 @@ by the topic*, not chosen ad hoc at the call site.
 |---|---|---|---|
 | `State` | `tokio::sync::watch` | latest-wins; only the most recent value matters | receives current value immediately |
 | `StreamLossy` | `tokio::sync::broadcast` | bounded; drop-oldest under pressure; a lagging subscriber is told it lagged, never blocks the publisher | none (just starts receiving) |
-| `StreamLossless` | per-subscriber bounded `mpsc` | every message, in order; **a full queue = a broken subscriber → disconnect it; never block the publisher** | replays a retained ring, then live |
+| `StreamLossless` | shared `broadcast` live tail + retained ring | every message in order to a subscriber that keeps up; **overflow lags the subscriber (`Lagged`), never blocks the publisher, never disconnects it** | replays a retained ring, then live |
 | `Command` | request/reply | reliable, one server per topic, ack/error, timeout | n/a |
 
 The non-negotiable invariant across all of this: **a slow or absent subscriber must never stall a
-publisher.** For lossless topics this is enforced by dropping the subscriber when its queue is full
-(its next `recv` returns `Closed`; it is expected to re-subscribe and get a fresh snapshot).
+publisher.** For lossless topics this is enforced by backing the live tail with a `broadcast`: a
+subscriber that falls behind gets a `Lagged { skipped }` on its next `recv` and **stays subscribed**
+(it is *not* disconnected). The retained ring still serves the on-subscribe snapshot.
+*(v1 disconnected an overflowing lossless subscriber — that eviction was reversed under Phase 4 "bus
+hardening"; a bursty publisher must not be able to delete a healthy subscriber. See
+`ARCHITECTURE_REVIEW.md`.)*
 
 ## Transport-layer types to implement
 
@@ -126,8 +130,8 @@ pub enum BusError {
     Timeout,
     NoHandler,            // request to a Command topic with no server
     ServerExists,         // second serve() on a Command topic
-    Lagged { skipped: u64 }, // StreamLossy subscriber fell behind
-    Closed,               // channel/subscription gone (e.g. lossless subscriber was dropped)
+    Lagged { skipped: u64 }, // a StreamLossy OR StreamLossless subscriber fell behind (still live)
+    Closed,               // channel/subscription gone (every sender dropped)
     Serialization(String),
     BadTopic(String),
     ClassMismatch,        // payload CLASS disagrees with topic.delivery_class()
@@ -168,8 +172,8 @@ impl BusHandle {
 
 pub struct Subscription<M> { /* .. */ }
 impl<M: BusMessage> Subscription<M> {
-    /// Snapshot item(s) first (per class), then live. `Err(Lagged)` on lossy fall-behind;
-    /// `Err(Closed)` if a lossless subscription was dropped for being too slow (re-subscribe).
+    /// Snapshot item(s) first (per class), then live. `Err(Lagged)` on any (lossy or lossless)
+    /// fall-behind — still subscribed, keep reading; `Err(Closed)` if the channel is gone.
     pub async fn recv(&mut self) -> Result<M, BusError>;
 }
 
@@ -192,8 +196,9 @@ pub async fn replay(bus: &BusHandle, path: &Path, speed: f32) -> Result<(), BusE
 - Keep a registry of per-topic channels created lazily on first publish/subscribe. For the hot path,
   store concrete typed channels (type-erase with `Any` + downcast) so live delivery does **not**
   serialize. Serialize only at the recorder tap and (future) network boundary.
-- `State` = `watch::channel`; `StreamLossy` = `broadcast::channel(cap)`; `StreamLossless` = a fan-out
-  of per-subscriber `mpsc::channel(cap)` plus a retained `VecDeque` ring per topic for replay.
+- `State` = `watch::channel`; `StreamLossy` = `broadcast::channel(cap)`; `StreamLossless` = a shared
+  `broadcast::channel(live_cap)` live tail plus a retained `VecDeque` ring per topic for the
+  on-subscribe snapshot (a lagging subscriber is signalled `Lagged`, not evicted).
 - Retention (replay ring) sizes are per-topic config with sane defaults: decodes ≈ last 10 slots,
   `logbook/entries` ≈ a few thousand, others as needed. Make it a small config struct.
 - `request`/`serve`: correlation id from an `AtomicU64`. In-process, map id → `oneshot::Sender<Rep>`;
@@ -237,9 +242,10 @@ the real rig manager and decoder. The replay path means the UI can be built with
    messages continue with no gaps or reordering.
 5. **Lossy under load**: a slow lossy subscriber gets `Err(Lagged)` and the publisher never blocks;
    a second healthy subscriber on the same topic is unaffected.
-6. **Lossless slow subscriber never stalls the publisher**: a subscriber that stops draining is
-   disconnected (its next `recv` → `Closed`); the publisher keeps going; a re-subscribe yields a
-   fresh snapshot.
+6. **Lossless slow subscriber never stalls the publisher**: a subscriber that stops draining and
+   overflows the live tail gets `Err(Lagged)` on its next `recv` — **not** `Closed` — and stays
+   subscribed; the publisher keeps going. (Reversed from the v1 "disconnect it" contract under
+   Phase 4 bus hardening; see the delivery-class table and `ARCHITECTURE_REVIEW.md`.)
 7. **Request/reply**: `request` returns the served reply; `Timeout` when no reply arrives in time;
    `NoHandler` when no server is registered; second `serve` on a topic → `ServerExists`.
 8. **Record → replay golden test**: record a scripted session, `replay` at high speed onto a fresh

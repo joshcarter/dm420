@@ -17,9 +17,10 @@ pub enum DeliveryClass {
     /// Bounded; drop-oldest under pressure (`tokio::sync::broadcast`). A lagging
     /// subscriber is told it lagged and never blocks the publisher. No late-join.
     StreamLossy,
-    /// Every message, in order (per-subscriber `mpsc`). A full queue means a
-    /// broken subscriber → it is disconnected; the publisher never blocks. Late
-    /// joiners replay a retained ring, then live.
+    /// Every message, in order, to a subscriber that keeps up (`broadcast` live
+    /// tail + a retained ring). A subscriber that overflows the tail is signalled
+    /// `Lagged` and **stays subscribed** — never disconnected; the publisher never
+    /// blocks. Late joiners replay the retained ring, then live.
     StreamLossless,
     /// Reliable request/reply with one server per topic, ack/error, and timeout.
     Command,
