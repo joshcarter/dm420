@@ -568,6 +568,16 @@ pub struct QsoState {
     /// Whether the TX offset is locked (the operator froze it). Mirrors the engine's
     /// owned lock so the UI renders the LOCKED state and the engine alone enforces it.
     pub offset_locked: bool,
+    /// Monotonically-increasing count of operator **Stop** (`QsoCommand::Abort`)
+    /// commands the engine has processed. The audio-TX carrier-abort watcher keys on
+    /// *advances* of this counter to cut an in-flight over, so a normal completion
+    /// that also lands in `phase: Idle` (a received final sign-off → `FinishNow(Idle)`,
+    /// a Field-Day-answering `RR73` resend, a cap give-up) no longer self-aborts the
+    /// over. Interim signal — see `core::tx::spawn_abort_watcher` and
+    /// `ARCHITECTURE_REVIEW.md` driver #1 for the explicit-abort (`Granter::revoke`)
+    /// replacement. `#[serde(default)]` keeps pre-field bus recordings replayable.
+    #[serde(default)]
+    pub abort_seq: u64,
 }
 
 /// Phase of an in-progress contact.
@@ -1382,6 +1392,7 @@ mod tests {
             next_tx: Some(sample_outgoing()),
             tx_offset: Some(OffsetHz(1500.0)),
             offset_locked: true,
+            abort_seq: 3,
         });
     }
 

@@ -524,6 +524,12 @@ pub struct Engine {
     /// heard — re-send `RR73` *without logging the QSO a second time*. Cleared when any
     /// new contact is committed ([`Self::open_at`]), so a genuine re-work still logs.
     last_logged_partner: Option<Callsign>,
+    /// Count of operator **Stop** ([`QsoCommand::Abort`]) commands processed,
+    /// surfaced on [`QsoState::abort_seq`]. The audio-TX carrier-abort watcher cuts
+    /// an in-flight over only when this *advances* — so a normal completion that also
+    /// reaches [`State::Idle`] (a received sign-off, an FD-answering `RR73` resend, a
+    /// cap give-up) leaves it untouched and the final over plays out.
+    abort_seq: u64,
 }
 
 impl Engine {
@@ -541,6 +547,7 @@ impl Engine {
             offset_locked: false,
             selected: None,
             last_logged_partner: None,
+            abort_seq: 0,
         }
     }
 
@@ -635,6 +642,14 @@ impl Engine {
             QsoCommand::Abort => {
                 tracing::info!("qso engine: abort → idle");
                 self.state = State::Idle;
+                // Operator Stop: advance the abort sequence so the audio-TX watcher
+                // cuts any in-flight carrier (the only `State::Idle` transition that
+                // should). Every *other* path to Idle (a received sign-off, an
+                // FD-answering `RR73` resend, a cap give-up) leaves `abort_seq`
+                // unchanged, so the final over plays out. Interim mechanism — the
+                // explicit-abort/`Granter::revoke` fix is ARCHITECTURE_REVIEW.md
+                // driver #1.
+                self.abort_seq += 1;
                 None
             }
             // The engine owns the TX offset; this is the one place the lock is
@@ -1301,6 +1316,7 @@ impl Engine {
                 next_tx: None,
                 tx_offset: Some(self.tx_offset()),
                 offset_locked: self.offset_locked,
+                abort_seq: self.abort_seq,
             };
         }
         let (phase, partner, next_tx) = match &self.state {
@@ -1326,6 +1342,7 @@ impl Engine {
             // render the TX lane before a QSO and track an auto-QSY hop it didn't set.
             tx_offset: Some(self.tx_offset()),
             offset_locked: self.offset_locked,
+            abort_seq: self.abort_seq,
         }
     }
 
@@ -2136,6 +2153,29 @@ mod tests {
         e.step(Event::Command(QsoCommand::CallCq));
         let s = e.step(Event::Command(QsoCommand::Abort));
         assert_eq!(s.state.phase, QsoPhase::Idle);
+    }
+
+    /// Only an operator **Stop** ([`QsoCommand::Abort`]) advances
+    /// [`QsoState::abort_seq`] — the signal `core::tx`'s carrier-abort watcher keys
+    /// on. Other commands that change state leave it untouched; and because
+    /// `abort_seq` is written *only* in the `Abort` arm, every non-`Abort` path to
+    /// `Idle` (a received sign-off, an FD-answering `RR73` resend, a cap give-up)
+    /// leaves it unchanged too — so a normally-completed final over isn't cut short.
+    #[test]
+    fn only_operator_stop_advances_abort_seq() {
+        let mut e = engine(ContestProfile::Standard);
+        assert_eq!(e.state().abort_seq, 0, "starts at zero");
+        // A non-abort command that still changes state must not advance it.
+        let s = e.step(Event::Command(QsoCommand::CallCq));
+        assert_eq!(s.state.abort_seq, 0, "CallCq is not a Stop");
+        // Operator Stop advances it by one (and drops to Idle).
+        let s = e.step(Event::Command(QsoCommand::Abort));
+        assert_eq!(s.state.phase, QsoPhase::Idle);
+        assert_eq!(s.state.abort_seq, 1, "Stop advances the abort sequence");
+        // A second Stop advances it again — exactly one bump per Stop.
+        e.step(Event::Command(QsoCommand::CallCq));
+        let s = e.step(Event::Command(QsoCommand::Abort));
+        assert_eq!(s.state.abort_seq, 2, "each Stop advances exactly once");
     }
 
     #[test]
