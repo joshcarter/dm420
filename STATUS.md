@@ -16,10 +16,6 @@ Saw two cases where it didn't RR73 (ex: K0QIK, KI7OIY).
 
 Resending RR73 relogs the station (i.e. if he resent the R <section> message). [Note: I think Joel fixed this.]
 
-FT4 working terribly when band is busy -- strong signals not decoded.
-
-FD: I start to transmit 73 and immediately stop. [Note: I think Joel fixed this, but I haven't verified.]
-
 Feature: blacklist stations that never answer you.
 
 Bug: sometimes the reply does not happen in the correct time slot--it skips a time slot and then we're out of sync with the other station. Maybe decode doesn't finish in time, or we're not prepped to send the message at the start of the interval? Software was armed for TX and simply didn't.
@@ -63,15 +59,6 @@ Refuse to arm on WV4F.
 Don't repeat RR73 if other station goes back to CQ.
 
 
-
-## 🔴 Field Day blockers (June 27–28)
-
-> **The Field Day QSO machinery is built and now reachable.** The engine already sequences the full FD flow — `CQ FD …` → bare `<class> <section>` exchange → `R`-exchange → `RR73`/`73`, with the grid step skipped and the roger/`73` roles reversed (log-on-send vs. log-on-received) — plus the P1–P3 idiom fixes (give-up cap, any-sign-off completion, report-opener) and the class/section log columns. All of it is in `main` with characterization tests. **The runtime gate is now wired:** the unlocked Digital panel's CONTEST selector (`None` | `ARRL Field Day` + class/section) edits `Station`, persists to `[station]` in `config.toml`, and `to_qso_config()` pushes the chosen `ContestProfile` to the engine on re-lock. What remains is **on-air** validation, not code.
->
-> _Cleared since last update — now in `main`, evaluated and **no longer blockers** (need **on-air** validation, not code): per-`(call,band)` dupe tracking via the single-owner `WorkedStatus` producer, with mode **deliberately collapsed** (the ARRL-correct digital rule — 20 m FT8 ⇒ dupe on 20 m FT4; supersedes the old "per-band/per-**mode**" framing); the "CQ answered with a report, not grid" drop (P3, `engine.rs:353`, correctly gated **off** in FD); the class/section log columns (`engine.rs:1191`; generic `SNT`/`RCV` columns already render the exchange string); the **Contest-mode setup UI gate** itself (CONTEST selector → `Station` → `[station]` persistence → `to_qso_config()`); and **the FD exchange encode/decode itself** — the `modes` packer now implements the ARRL-FD message type (i3 = 0.3/0.4) in `crates/modes/src/arrl_fd.rs` + `message.rs`, **validated byte-for-byte against the WSJT-X source** (`lib/77bit/packjt77.f90`): three golden-vector tests assert payload byte-identity with `ft8code`, and WSJT-X's `jt9` decodes our synthesized FD signal end-to-end in **FT8 and FT4** (our decoder reads it back to `FieldDay{class,section}`). The earlier "i3=3 / 0-based isec" framing was wrong — it is i3 = 0.3/0.4 with a **1-based** section index into the 86-entry `csec` table._
-
-- [ ] **Log entries carry no FD-vs-normal tag** — — — `LogEntry` has no contest/exchange-kind field; `3A WI` vs. `-07` is only inferable by parsing the exchange string (the stored `Section` is a weak proxy). Add an explicit tag (serde-default for back-compat), set from `is_field_day()` at construction. Cheap; matters for clean export/scoring.
-
 ## Field Day Desired
 
 - [ ] **Multi-caller auto-pick (pileups)** — J — the FD norm is several stations answering one CQ slot; auto-select the highest-SNR non-dupe, exclude calls a peer is working, highlight all answerers, and allow number-key override (`docs/qso_flow.md` §6). Not started.
@@ -79,8 +66,6 @@ Don't repeat RR73 if other station goes back to CQ.
 - [ ] Tri-state control for clear QSY/follow station/lock offset. In "Clear" mode it would always attempt to find a clear part of the audio passband. In "Follow" it would behave as it does today--following the offset of whatever station we are answering, or using the current offset for CQ. In "Lock" it would lock to the current offset.
 
 - [ ] Selection during scanning needs to be disabled--map and/or decode panel
-
-- [ ] Band scan needs to publish results to network
 
 - [ ] Reply to non-participating stations who send an answer to CQ using a non-participating / standard message format.
 
@@ -108,7 +93,6 @@ Don't repeat RR73 if other station goes back to CQ.
 - [ ] Origin prerequisites: `origin: Mine|Peer` on the GUI `HeardEntry` / `MapSpot`; the worked producer emits `WorkedByNetwork`
 - [ ] Working-intent (Step 3): the deconfliction overlay shipped; remaining = auto-pick exclusion of peers' offsets
 - [ ] Heard/band aggregation (Step 4): peers' heard-stations + band-activity into the local views — `core::band_status` already merges peer `StationSnapshot.heard` (now carrying `mode`), and the LAN beacon **now populates `heard`** from the local enriched-decode stream (recency-bounded + datagram-trimmed), so peer heard **counts** now reach the band-status panel. Remaining: GUI **map** dots for peer heard (needs `origin` on `MapSpot`/`HeardEntry`, per Origin prerequisites above); `band_activity` still empty (next line)
-- [ ] Shared band-scan: beacon `band_activity`; show peers' scan results
 
 **Decoder** — see `docs/decoder_*.md` (W's lane):
 - [ ] Sensitivity Phase 3.1 fit + profiling
@@ -122,9 +106,8 @@ Don't repeat RR73 if other station goes back to CQ.
 - [ ] Brightness scale hardcoded (`COL_DB_FLOOR`/`CEIL`) — add a reference-level control / AGC
 
 ## Backlog / under consideration
-- [ ] **Field Day log reset** — J — no clear/truncate path exists (no `SessionCommand::ClearLog`; logbook is append-only; `ARCHITECTURE_REVIEW.md:271` flags `scanner.worked` growing unbounded). Needed so practice/prior QSOs don't count as dupes at contest start. Hook: a reset command → logbook archives-then-zeros + republishes an empty `logbook/entries` → the `WorkedStatus` producer and every consumer fall to empty automatically (single-owner pays off here).
+
 - General QSO optimization. If a station calls us before we start CQ again, instead of directly answering the station we call CQ then (hopefully) they call us after that. We could just call them directly instead of calling CQ.
-- Map: grid squares drawn in the wrong places
 - Map: highlight a station that answers my CQ
 - Map: show peers' heard stations as dots — peer heard data already reaches the GUI (`pump_peers` holds each peer's `StationSnapshot.heard`) and band-status counts already merge it, but the map's `heard_spots()` (`bus_view.rs:567`) builds `MapSpot`s from the *local* `heard` map only. Fold peers' `heard` into the map's heard layer with `origin = Peer` (placed from each `HeardStation.grid`), add `origin` to `MapSpot`, render peer dots distinctly (CLAUDE.md invariant). Receive-side GUI wiring only — no beacon/net change. Limits from `HeardStation`: no CQ-triangle / click-to-tune / slot; FD-section-only peers (no grid) can't be placed; dedup mine-wins. (The "GUI map dots" half of the Multi-op heard-aggregation item above.)
 - RX clipping indicator (audio level)
@@ -132,5 +115,4 @@ Don't repeat RR73 if other station goes back to CQ.
 - Band-scanner enhancements: per-offset sweep, FD-only filter, SNR floor, configurable dwell
 - Band Status panel polish: tune the six-band grid + header SCAN-button placement once eyeballed; populate it in pure-mock mode (the producers run in real/WAV `core::spawn` only, so mock mode shows empty); rename the now-misnamed `BANDSCAN_H` constant
 - Decode-archive analytics: querying, logbook recovery, whole-QSO view, SQLite, origin stamping
-- Waterfall render gap on refocus (the App-Nap *unkey* is already fixed; spectrogram-freeze-on-refocus remains)
 - _Design calls to settle:_ wait-for-CQ vs answer-immediately (`docs/joel/joels-notes.md`); jump on a station after their RR73; behavior when clicking another station (decode or map) while armed / mid-QSO; drop SNR from own transmissions
