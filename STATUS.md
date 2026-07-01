@@ -6,23 +6,63 @@
 
 Need to unlock TX offset on band/freq/mode change. Maybe also reset zoom.
 
-On send our text decode is sometimes not at the correct vertical position.
+On send our text decode is sometimes not at the correct vertical position. There may also be other garbage in the decode slot. Similarly, we have a SNR indicator and calling-CQ indicator next to our traffic which needs to go away.
 
-Need to support rendering waterfall after alt-tab.
+Need to support rendering waterfall when the app is running full-screen and you alt-tab away, then back.
 
 Tab is still going to lock/unlock sometimes.
 
 Saw two cases where it didn't RR73 (ex: K0QIK, KI7OIY).
 
-Resending RR73 relogs the station (i.e. if he resent the R <section> message).
+Resending RR73 relogs the station (i.e. if he resent the R <section> message). [Note: I think Joel fixed this.]
 
 FT4 working terribly when band is busy -- strong signals not decoded.
 
-FD: I start to transmit 73 and immediately stop.
+FD: I start to transmit 73 and immediately stop. [Note: I think Joel fixed this, but I haven't verified.]
 
 Feature: blacklist stations that never answer you.
 
 Bug: sometimes the reply does not happen in the correct time slot--it skips a time slot and then we're out of sync with the other station. Maybe decode doesn't finish in time, or we're not prepped to send the message at the start of the interval? Software was armed for TX and simply didn't.
+
+Need to be able to move offset while armed--drag or click.
+
+Should be able to lock/unlock while armed.
+
+Switch station while armed for another station.
+
+Double click to select station and arm.
+
+Need some way for QSO engine to not lose its mind when non-Field Day traffic answers Field Day CQ.
+
+Idea: when text column over-full, drop other-to-other traffic, starting from lowest SNR or nearest the crowded spots.
+
+After unlock it takes several seconds for click-to-offset to work again.
+
+Select station while offset locked, unlock, select station again -> should move to station's offset.
+
+Should be able to lock while armed and transmitting.
+
+When other station is selected and our offset is locked, highlight their offset in the spectrogram.
+
+If answering another station, then they answer a third station, disengage and let me select a different station to chase.
+
+On FT4/FT8 switch, blank the decode and spectrogram--not valid anymore.
+
+Critical: starts TX and then stops transmitting after about half a second.
+
+Number assignments on decodes: track which grid squares are working well, prefer stations near those.
+
+After a station has been selected, but isn't working, we need a way to go back to CQ without disarming, unlocking, clicking the spectrogram again. --> can click while locked and it'll go back to CQ
+
+Dim the decode text of already worked stations.
+
+Idea: heat map overlay on map based on rx signal reports.
+
+Refuse to arm on WV4F.
+
+Don't repeat RR73 if other station goes back to CQ.
+
+
 
 ## 🔴 Field Day blockers (June 27–28)
 
