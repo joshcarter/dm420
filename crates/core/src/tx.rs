@@ -51,9 +51,12 @@ pub fn spawn(bus: &BusHandle, radio: t::RadioId, tx: Arc<crate::control::TxContr
             return;
         }
     };
-    // Bumped whenever the QSO engine drops to Idle (the operator's Stop, seen via
-    // the engine's published state). A transmit baselines it and aborts the over
-    // the instant it changes — so Stop kills the carrier mid-message.
+    // Bumped on an explicit operator Stop, observed via advances of the engine's
+    // `QsoState.abort_seq` (set only by `QsoCommand::Abort`). A transmit baselines
+    // it and aborts the over the instant it changes — so Stop kills the carrier
+    // mid-message, while a *normal* completion that also lands in `QsoPhase::Idle`
+    // does not. (Interim signal; the proper fix makes abort a property of the PTT
+    // interlock — `Granter::revoke` — per ARCHITECTURE_REVIEW.md driver #1.)
     let abort_gen = Arc::new(AtomicU64::new(0));
     spawn_abort_watcher(bus, radio.clone(), abort_gen.clone());
 
@@ -144,11 +147,22 @@ pub fn spawn(bus: &BusHandle, radio: t::RadioId, tx: Arc<crate::control::TxContr
     });
 }
 
-/// Watch the QSO engine's published state and bump `abort_gen` each time it drops
-/// into Idle (the operator's Stop, or a finished QSO). A transmit baselines the
-/// counter at the start of an over, so an Idle that *precedes* the over (e.g. the
-/// engine going Idle as it queues a courtesy 73) is captured in the baseline and
-/// won't abort it — only an Idle that lands *during* the over does.
+/// Watch the QSO engine's published state and bump `abort_gen` on an explicit
+/// operator **Stop** — observed as an *advance* of [`QsoState::abort_seq`], which the
+/// engine increments only on `QsoCommand::Abort`. A transmit baselines the counter at
+/// key-up, so a Stop that lands *during* an over cuts its carrier; one that preceded
+/// the over is captured in the baseline and won't abort it.
+///
+/// This keys on `abort_seq`, **not** the `QsoPhase::Idle` edge it used to. A normal
+/// completion also drops to `Idle` (a received final sign-off → `FinishNow(Idle)`, an
+/// FD-answering `RR73` resend, a cap give-up), and inferring abort from that edge cut
+/// the legitimate final over short — the bug `3a76d03` exposed once the FD-answering
+/// side stayed active to resend `RR73`. Keying on the operator-Stop counter fires only
+/// on the one transition that should abort.
+///
+/// Interim mechanism. The forward-compatible fix makes abort a property of the PTT
+/// interlock (`Granter::revoke(token)`), which also retires the deferred
+/// final-state-publish hack in `qso::shell` — ARCHITECTURE_REVIEW.md driver #1 (step 0b).
 fn spawn_abort_watcher(bus: &BusHandle, radio: t::RadioId, abort_gen: Arc<AtomicU64>) {
     let mut sub = match bus.subscribe::<t::QsoState>(TopicSelector::Exact(Topic::QsoState(radio))) {
         Ok(s) => s,
@@ -158,15 +172,20 @@ fn spawn_abort_watcher(bus: &BusHandle, radio: t::RadioId, abort_gen: Arc<Atomic
         }
     };
     tokio::spawn(async move {
-        let mut prev_idle = true; // the engine starts Idle
+        // `None` until the first state seeds the baseline, so the first value observed
+        // never counts as an abort. `QsoState` is a State (watch) topic — coalescing —
+        // but `abort_seq` is monotonic, so a missed intermediate still reads as a change.
+        let mut prev: Option<u64> = None;
         loop {
             match sub.recv().await {
                 Ok(state) => {
-                    let idle = matches!(state.phase, t::QsoPhase::Idle);
-                    if idle && !prev_idle {
+                    if let Some(p) = prev
+                        && state.abort_seq != p
+                    {
+                        // Operator hit Stop since the last state: cut any in-flight over.
                         abort_gen.fetch_add(1, Ordering::Release);
                     }
-                    prev_idle = idle;
+                    prev = Some(state.abort_seq);
                 }
                 Err(BusError::Lagged { .. }) => continue,
                 Err(_) => break,
@@ -338,7 +357,7 @@ async fn wait_done(
     let tick = Duration::from_millis(200);
     let mut elapsed = Duration::ZERO;
     while !out.is_done() && elapsed < max_tx {
-        if abort_gen.load(Ordering::Acquire) != base {
+        if aborted(abort_gen, base) {
             tracing::debug!("audio-tx: Stop detected mid-over; aborting carrier");
             return true; // operator hit Stop — abort the over now
         }
@@ -346,6 +365,15 @@ async fn wait_done(
         elapsed += tick;
     }
     false
+}
+
+/// Whether the carrier-abort generation has advanced past an over's `base`line —
+/// i.e. an operator Stop landed since key-up. The single predicate [`wait_done`] acts
+/// on; factored out so the abort decision can be exercised directly in tests (the live
+/// path is otherwise gated behind a real audio device that can't open headless).
+#[inline]
+fn aborted(abort_gen: &AtomicU64, base: u64) -> bool {
+    abort_gen.load(Ordering::Acquire) != base
 }
 
 /// Issue one `PttRequest` over the rig command topic.
@@ -433,5 +461,106 @@ fn slot_period_ms(mode: t::OverAirMode) -> i64 {
     match mode {
         t::OverAirMode::Ft4 => 7_500,
         _ => 15_000,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The `shell ↔ tx` abort seam: does the real `spawn_abort_watcher` translate
+    //! the engine's published `QsoState` into a carrier abort (`abort_gen`) only on an
+    //! operator Stop? `wait_done`'s live path is gated behind an audio device that
+    //! can't open headless, so we drive the watcher over a real bus and assert on its
+    //! decision via the same predicate `wait_done` uses ([`aborted`]).
+
+    use super::*;
+
+    fn radio() -> t::RadioId {
+        t::RadioId("rig0".into())
+    }
+
+    /// A `QsoState` carrying just `phase` + `abort_seq`; the watcher reads only
+    /// `abort_seq`, so the other fields are inert here.
+    fn state(phase: t::QsoPhase, abort_seq: u64) -> t::QsoState {
+        t::QsoState {
+            radio: radio(),
+            phase,
+            partner: None,
+            next_tx: None,
+            tx_offset: Some(t::OffsetHz(1500.0)),
+            offset_locked: false,
+            abort_seq,
+        }
+    }
+
+    fn publish(bus: &BusHandle, s: t::QsoState) {
+        bus.publish(&Topic::QsoState(radio()), s)
+            .expect("publish QsoState");
+    }
+
+    /// Let the spawned watcher drain the coalescing `watch` topic and return to its
+    /// `recv().await` before the next publish, so it observes each intermediate state
+    /// (in production they're seconds apart). Generous vs the watcher's ~µs of work.
+    async fn settle() {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    /// Regression for the `3a76d03` premature-unkey bug. A normal completion that
+    /// drops to `QsoPhase::Idle` *without* an operator Stop — the FD-answering endgame,
+    /// where the partner's courtesy sign-off decodes mid-over and the engine takes
+    /// `FinishNow(Idle)` while an `RR73` over is still in flight — must NOT advance
+    /// `abort_gen`, so `wait_done` lets the carrier play to the end. Fails against the
+    /// old phase-edge watcher (which bumped on any non-idle→idle edge); passes once the
+    /// watcher keys on `abort_seq`.
+    #[tokio::test]
+    async fn normal_completion_does_not_abort_in_flight_over() {
+        let bus = BusHandle::new();
+        let abort_gen = Arc::new(AtomicU64::new(0));
+        spawn_abort_watcher(&bus, radio(), abort_gen.clone());
+
+        // Engine starts Idle (abort_seq 0); seed the watcher's baseline.
+        publish(&bus, state(t::QsoPhase::Idle, 0));
+        settle().await;
+
+        // An over is in flight: the FD-answering side is mid-`RR73`, so the engine is
+        // Active. Baseline the abort generation at key-up, as `transmit` does.
+        publish(&bus, state(t::QsoPhase::InExchange { step: 2 }, 0));
+        settle().await;
+        let base = abort_gen.load(Ordering::Acquire);
+
+        // The partner's courtesy sign-off decodes mid-over: a normal completion, so
+        // the engine drops to Idle with the SAME abort_seq (no operator Stop).
+        publish(&bus, state(t::QsoPhase::Idle, 0));
+        settle().await;
+
+        assert!(
+            !aborted(&abort_gen, base),
+            "normal completion (FinishNow(Idle)) must not abort the in-flight over",
+        );
+    }
+
+    /// The operator's Stop must STILL cut an in-flight carrier: `QsoCommand::Abort`
+    /// advances `QsoState.abort_seq`, which the watcher turns into an `abort_gen` bump
+    /// so `wait_done` aborts. (Passes before and after the fix — it pins the behavior
+    /// the fix must preserve.)
+    #[tokio::test]
+    async fn operator_stop_aborts_in_flight_over() {
+        let bus = BusHandle::new();
+        let abort_gen = Arc::new(AtomicU64::new(0));
+        spawn_abort_watcher(&bus, radio(), abort_gen.clone());
+
+        publish(&bus, state(t::QsoPhase::Idle, 0));
+        settle().await;
+        publish(&bus, state(t::QsoPhase::InExchange { step: 2 }, 0)); // over in flight
+        settle().await;
+        let base = abort_gen.load(Ordering::Acquire);
+
+        // Operator hits Stop: abort_seq advances (the engine also drops to Idle).
+        publish(&bus, state(t::QsoPhase::Idle, 1));
+        settle().await;
+
+        assert!(
+            aborted(&abort_gen, base),
+            "operator Stop (QsoCommand::Abort) must still abort the in-flight over",
+        );
     }
 }

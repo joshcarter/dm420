@@ -48,6 +48,7 @@ async fn beacon_carries_working_target() {
                 next_tx: None,
                 tx_offset: Some(OffsetHz(1234.0)),
                 offset_locked: false,
+                abort_seq: 0,
             },
         )
         .unwrap();

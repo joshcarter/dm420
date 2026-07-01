@@ -864,6 +864,7 @@ mod tests {
             next_tx: None,
             tx_offset: offset.map(OffsetHz),
             offset_locked: false,
+            abort_seq: 0,
         }
     }
 
